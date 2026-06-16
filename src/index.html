@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Categorizer</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="api.js" defer></script>
+    <script src="renderer.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span>Image Categorizer</span>
+          <button class="icon-button settings-icon" id="settings-button" type="button" title="Settings">⚙</button>
+        </div>
+
+        <button class="nav-item active" id="all-tab" type="button">
+          <span>All Images</span>
+          <span class="count-pill" id="all-count">0</span>
+        </button>
+        <button class="nav-item" id="unclassified-tab" type="button">
+          <span>Unclassified</span>
+          <span class="count-pill" id="unclassified-count">0</span>
+        </button>
+
+        <div class="section-title">
+          <span>Categories</span>
+          <button class="icon-button" id="add-category-button" type="button" title="Add category">+</button>
+        </div>
+        <div class="category-list" id="category-list"></div>
+
+        <div class="section-title">
+          <span>Source Folders</span>
+          <button class="icon-button" id="add-source-folder-button" type="button" title="Add source folder">+</button>
+        </div>
+        <div class="source-folder-list" id="source-folder-list"></div>
+
+        <div class="sidebar-footer">
+          <div class="folder-block">
+            <div class="folder-label">Root Folder</div>
+            <button class="folder-path" id="root-folder-button" type="button"></button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="title-block">
+            <h1 id="view-title">All Images</h1>
+            <div class="path-line" id="view-subtitle"></div>
+          </div>
+          <div class="top-actions">
+            <input id="search-input" class="search-input" type="search" placeholder="Search images">
+            <select id="sort-select" class="sort-select" title="Sort images">
+              <option value="newest">Newest</option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+            </select>
+            <button id="refresh-button" class="button" type="button">Rescan</button>
+            <button id="open-folder-button" class="button secondary" type="button">Open Root</button>
+          </div>
+        </header>
+
+        <section class="drop-target" id="main-drop-target">
+          <div class="image-grid" id="image-grid"></div>
+          <div class="empty-state" id="empty-state"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="dialog" id="category-dialog">
+      <form method="dialog" id="category-form">
+        <h2>Add Category</h2>
+        <input id="category-name-input" class="dialog-input" autocomplete="off" placeholder="Category name">
+        <div class="dialog-actions">
+          <button class="button secondary" value="cancel" type="button" id="cancel-category-button">Cancel</button>
+          <button class="button" value="default" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="category-rename-dialog">
+      <form method="dialog" id="category-rename-form">
+        <h2>Rename Category</h2>
+        <input id="category-rename-input" class="dialog-input" autocomplete="off">
+        <div class="dialog-actions">
+          <button class="button secondary" value="cancel" type="button" id="cancel-category-rename-button">Cancel</button>
+          <button class="button" value="default" type="submit">Rename</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="move-dialog">
+      <form method="dialog" id="move-form">
+        <h2>Move Image on Disk</h2>
+        <p class="dialog-hint">Physically moves the file. This is independent from its virtual category.</p>
+        <select id="move-folder-select" class="dialog-input"></select>
+        <input id="move-new-folder-input" class="dialog-input" autocomplete="off" placeholder="Or type a new folder name">
+        <div class="dialog-actions">
+          <button class="button secondary" value="cancel" type="button" id="cancel-move-button">Cancel</button>
+          <button class="button" value="default" type="submit">Move</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog settings-dialog" id="settings-dialog">
+      <form method="dialog" id="settings-form">
+        <h2>Settings</h2>
+
+        <div class="settings-row">
+          <div>
+            <label class="settings-label">Root Folder</label>
+            <div class="settings-value" id="settings-root-folder"></div>
+          </div>
+          <button class="button secondary" id="settings-root-button" type="button">Change</button>
+        </div>
+
+        <label class="settings-stack">
+          <span class="settings-label">Monthly Source Folder Pattern</span>
+          <select id="source-pattern-preset" class="dialog-input">
+            <option value="">Custom (use regex below)</option>
+            <option value="YYYY-MM">YYYY-MM (e.g. 2026-06)</option>
+            <option value="YYYY_MM">YYYY_MM (e.g. 2026_06)</option>
+            <option value="MM-YYYY">MM-YYYY (e.g. 06-2026)</option>
+            <option value="Month YYYY">Month YYYY (e.g. June 2026)</option>
+          </select>
+          <input id="source-pattern-regex" class="dialog-input" autocomplete="off" placeholder="Regex matched against folder name, e.g. ^\\d{4}-\\d{2}$">
+        </label>
+
+        <label class="settings-stack">
+          <span class="settings-label">Manual Source Folders</span>
+          <div class="manual-folder-list" id="manual-folder-list"></div>
+        </label>
+
+        <label class="settings-stack">
+          <span class="settings-label">Tile Size</span>
+          <div class="range-row">
+            <input id="tile-size-input" type="range" min="96" max="280" step="12">
+            <span id="tile-size-value"></span>
+          </div>
+        </label>
+
+        <label class="check-row">
+          <input id="dark-mode-input" type="checkbox">
+          <span>Dark mode</span>
+        </label>
+
+        <div class="dialog-actions">
+          <button class="button" value="default" type="submit">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
