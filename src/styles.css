@@ -217,10 +217,27 @@ body.light-mode .count-pill {
 .source-folder-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   padding: 6px 10px;
   border-radius: 7px;
   color: var(--muted-strong);
+}
+
+.source-folder-row .category-name {
+  flex: 1;
+}
+
+.source-folder-include {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.source-folder-include input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .category-name {
@@ -261,8 +278,9 @@ body.light-mode .count-pill {
   width: 100%;
   min-height: 32px;
   padding: 6px 8px;
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: transparent;
+  background: var(--panel);
   color: var(--muted-strong);
   overflow: hidden;
   text-align: left;
@@ -313,6 +331,48 @@ h1 {
   gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.analysis-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.analysis-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.analysis-type-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.analysis-type-check:hover {
+  background: var(--panel-raised);
+}
+
+.analysis-type-check input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
 }
 
 .search-input,
@@ -371,6 +431,22 @@ h1 {
   min-height: 30px;
   padding: 0 10px;
   font-size: 12px;
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.status-message {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 280px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .drop-target {
@@ -475,6 +551,33 @@ body.pointer-dragging {
   white-space: nowrap;
   color: var(--muted);
   font-size: 11px;
+}
+
+.analysis-summary {
+  height: 78px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  font-size: 10.5px;
+  line-height: 1.25;
+  cursor: text;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.analysis-summary::-webkit-scrollbar {
+  width: 7px;
+}
+
+.analysis-summary::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--border-strong);
 }
 
 .card-controls {
@@ -598,6 +701,29 @@ body.pointer-dragging {
   color: var(--text);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-row .dialog-hint {
+  margin: 0;
+}
+
+.download-report {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--muted-strong);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .manual-folder-list {

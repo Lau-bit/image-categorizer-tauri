@@ -10,6 +10,15 @@ const state = {
   pendingCategoryRenameName: null,
   pendingMoveHash: null,
   pointerDrag: null,
+  virtualImages: null,
+  virtualStart: 0,
+  virtualEnd: 0,
+  cardHeight: null,
+  scrollFrameRequested: false,
+  // Analysis state
+  analyzing: false,
+  analysisQueue: [],   // [{type: 'text'|'nsfw', force: bool}]
+  analysisRunning: null, // 'text' | 'nsfw' | null
 };
 
 const els = {
@@ -21,15 +30,22 @@ const els = {
   addCategoryButton: document.getElementById('add-category-button'),
   sourceFolderList: document.getElementById('source-folder-list'),
   addSourceFolderButton: document.getElementById('add-source-folder-button'),
-  rootFolderButton: document.getElementById('root-folder-button'),
+  rootFolderSelect: document.getElementById('root-folder-select'),
   viewTitle: document.getElementById('view-title'),
   viewSubtitle: document.getElementById('view-subtitle'),
   imageGrid: document.getElementById('image-grid'),
   emptyState: document.getElementById('empty-state'),
   mainDropTarget: document.getElementById('main-drop-target'),
   searchInput: document.getElementById('search-input'),
+  statusMessage: document.getElementById('status-message'),
   sortSelect: document.getElementById('sort-select'),
   refreshButton: document.getElementById('refresh-button'),
+  analyzeButton: document.getElementById('analyze-button'),
+  reanalyzeButton: document.getElementById('reanalyze-button'),
+  cancelAnalysisButton: document.getElementById('cancel-analysis-button'),
+  analyzeTextCheck: document.getElementById('analyze-text-check'),
+  analyzeNsfwCheck: document.getElementById('analyze-nsfw-check'),
+  analyzeNsfwCheckLabel: document.getElementById('analyze-nsfw-check-label'),
   openFolderButton: document.getElementById('open-folder-button'),
   settingsButton: document.getElementById('settings-button'),
   categoryDialog: document.getElementById('category-dialog'),
@@ -55,6 +71,15 @@ const els = {
   tileSizeInput: document.getElementById('tile-size-input'),
   tileSizeValue: document.getElementById('tile-size-value'),
   darkModeInput: document.getElementById('dark-mode-input'),
+  ocrWordThresholdInput: document.getElementById('ocr-word-threshold-input'),
+  ocrWordThresholdValue: document.getElementById('ocr-word-threshold-value'),
+  ocrAreaThresholdInput: document.getElementById('ocr-area-threshold-input'),
+  ocrAreaThresholdValue: document.getElementById('ocr-area-threshold-value'),
+  nsfwThresholdInput: document.getElementById('nsfw-threshold-input'),
+  nsfwThresholdValue: document.getElementById('nsfw-threshold-value'),
+  nsfwModelHint: document.getElementById('nsfw-model-hint'),
+  downloadNsfwModelButton: document.getElementById('download-nsfw-model-button'),
+  nsfwModelReport: document.getElementById('nsfw-model-report'),
   toast: document.getElementById('toast'),
 };
 
@@ -63,6 +88,18 @@ function showToast(message) {
   els.toast.classList.add('visible');
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => els.toast.classList.remove('visible'), 2400);
+}
+
+function setStatus(message) {
+  els.statusMessage.textContent = message || '';
+  els.statusMessage.title = message || '';
+  clearTimeout(setStatus.timer);
+  if (message) {
+    setStatus.timer = setTimeout(() => {
+      els.statusMessage.textContent = '';
+      els.statusMessage.title = '';
+    }, 5000);
+  }
 }
 
 function errorText(error) {
@@ -99,6 +136,10 @@ function formatDate(ms) {
   }).format(new Date(ms));
 }
 
+function imageCountLabel(count) {
+  return `${count} image${count === 1 ? '' : 's'}`;
+}
+
 function tileSize() {
   return Number(state.settings?.tileSize || 168);
 }
@@ -121,7 +162,78 @@ function syncSettingsDialog() {
   els.darkModeInput.checked = settings.darkMode;
   els.sourcePatternPreset.value = library?.sourcePatternPreset || '';
   els.sourcePatternRegex.value = library?.sourcePatternRegex || '';
+  const wordThreshold = library?.ocrWordThreshold ?? 35;
+  const areaThresholdPercent = Math.round((library?.ocrAreaThreshold ?? 0.05) * 100);
+  els.ocrWordThresholdInput.value = String(wordThreshold);
+  els.ocrWordThresholdValue.textContent = `${wordThreshold} words`;
+  els.ocrAreaThresholdInput.value = String(areaThresholdPercent);
+  els.ocrAreaThresholdValue.textContent = `${areaThresholdPercent}%`;
+  const nsfwPct = Math.round((library?.nsfwScoreThreshold ?? 0.45) * 100);
+  els.nsfwThresholdInput.value = String(nsfwPct);
+  els.nsfwThresholdValue.textContent = `${nsfwPct}%`;
   renderManualFolderList();
+}
+
+async function syncNsfwModelHint() {
+  try {
+    const info = await window.categorizerAPI.getNsfwModelInfo();
+    if (info.exists) {
+      els.nsfwModelHint.textContent = `Model loaded: ${info.path}`;
+      els.nsfwModelHint.style.color = '';
+      els.downloadNsfwModelButton.classList.add('hidden');
+    } else {
+      els.nsfwModelHint.textContent =
+        `Model not installed. Press Download Model to install 320n.onnx to: ${info.path}`;
+      els.nsfwModelHint.style.color = 'var(--danger)';
+      els.downloadNsfwModelButton.classList.remove('hidden');
+      els.downloadNsfwModelButton.disabled = false;
+    }
+    els.analyzeNsfwCheckLabel.title = info.exists
+      ? 'Run NudeNet explicit content detection, classifying images as Safe / Explicit'
+      : `NudeNet model not found — download 320n.onnx to: ${info.path}`;
+  } catch {
+    // non-fatal
+  }
+}
+
+async function downloadNsfwModel() {
+  els.downloadNsfwModelButton.disabled = true;
+  els.nsfwModelHint.textContent = 'Downloading NudeNet package from PyPI...';
+  els.nsfwModelHint.style.color = '';
+  els.nsfwModelReport.textContent = [
+    'Download started.',
+    'Source: NudeNet 3.4.2 PyPI wheel',
+    'Next: extract bundled nudenet/320n.onnx',
+  ].join('\n');
+  els.nsfwModelReport.classList.remove('hidden');
+  try {
+    const result = await window.categorizerAPI.downloadNsfwModel();
+    const info = result.info;
+    els.nsfwModelHint.textContent = `Model loaded: ${info.path}`;
+    els.downloadNsfwModelButton.classList.add('hidden');
+    els.nsfwModelReport.textContent = [
+      'Download complete.',
+      `Package: ${formatBytes(result.downloadedBytes)}`,
+      `Model: ${formatBytes(result.modelBytes)}`,
+      `Installed: ${info.path}`,
+      `Source: ${result.sourceUrl}`,
+      '',
+      ...(result.report || []),
+    ].join('\n');
+    showToast('NudeNet model installed.');
+  } catch (error) {
+    els.downloadNsfwModelButton.disabled = false;
+    const message = errorText(error);
+    els.nsfwModelHint.textContent = 'Download failed. See report below.';
+    els.nsfwModelHint.style.color = 'var(--danger)';
+    els.nsfwModelReport.textContent = [
+      'Download failed.',
+      message,
+      '',
+      'No model was installed. You can try Download Model again.',
+    ].join('\n');
+    showToast(message);
+  }
 }
 
 function renderManualFolderList() {
@@ -150,11 +262,36 @@ function renderManualFolderList() {
   }
 }
 
+function includedSourceFolderNames() {
+  const folders = state.library?.sourceFolders || [];
+  if (!folders.length) return null;
+  return new Set(folders.filter(folder => folder.includedInAnalysis).map(folder => folder.name));
+}
+
+function imagesInIncludedSourceFolders(images = state.library?.images || []) {
+  const included = includedSourceFolderNames();
+  if (!included) return images;
+  return images.filter(image => included.has(image.sourceFolder));
+}
+
+function categoryCountsForIncludedSources() {
+  const counts = new Map();
+  let unclassified = 0;
+  for (const image of imagesInIncludedSourceFolders()) {
+    if (image.category) {
+      counts.set(image.category, (counts.get(image.category) || 0) + 1);
+    } else {
+      unclassified += 1;
+    }
+  }
+  return { counts, unclassified };
+}
+
 function visibleImages() {
   const library = state.library;
   if (!library) return [];
 
-  let images = library.images;
+  let images = imagesInIncludedSourceFolders(library.images);
   if (state.currentView === 'unclassified') {
     images = images.filter(image => !image.category);
   } else if (state.currentView === 'category') {
@@ -180,19 +317,44 @@ function visibleImages() {
   return images;
 }
 
+function renderRootFolderSelect() {
+  const knownRoots = state.settings?.knownRoots || [];
+  const currentRoot = state.library?.root || state.settings?.lastRoot || '';
+
+  els.rootFolderSelect.innerHTML = '';
+  if (!knownRoots.length) {
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = 'No folder chosen';
+    els.rootFolderSelect.append(empty);
+  }
+  for (const entry of knownRoots) {
+    const option = document.createElement('option');
+    option.value = entry.path;
+    option.textContent = entry.exists ? shortPath(entry.path) : `${shortPath(entry.path)} (not found)`;
+    els.rootFolderSelect.append(option);
+  }
+  const addOption = document.createElement('option');
+  addOption.value = '__add__';
+  addOption.textContent = '+ Add Folder...';
+  els.rootFolderSelect.append(addOption);
+
+  els.rootFolderSelect.value = currentRoot;
+}
+
 function renderSettings() {
   if (!state.settings) return;
   applyUiSettings();
-  const library = state.library;
-  els.rootFolderButton.textContent = library?.root ? shortPath(library.root) : 'Choose folder...';
-  els.rootFolderButton.title = library?.root ? `Change root folder\n${library.root}` : 'Choose a root folder';
+  renderRootFolderSelect();
   syncSettingsDialog();
 }
 
 function renderSidebar() {
   const library = state.library;
-  const allCount = library?.images.length || 0;
-  const unclassifiedCount = library?.unclassifiedCount || 0;
+  const includedImages = imagesInIncludedSourceFolders();
+  const { counts: categoryCounts, unclassified } = categoryCountsForIncludedSources();
+  const allCount = includedImages.length;
+  const unclassifiedCount = unclassified;
 
   els.allCount.textContent = String(allCount);
   els.unclassifiedCount.textContent = String(unclassifiedCount);
@@ -206,6 +368,7 @@ function renderSidebar() {
     empty.className = 'category-empty';
     empty.type = 'button';
     empty.textContent = 'Add your first category';
+    empty.disabled = state.analyzing;
     empty.addEventListener('click', openCategoryDialog);
     els.categoryList.append(empty);
   } else {
@@ -220,7 +383,7 @@ function renderSidebar() {
       button.classList.toggle('active', state.currentView === 'category' && state.currentCategory === category.name);
       button.innerHTML = '<span class="category-name"></span><span class="count-pill"></span>';
       button.querySelector('.category-name').textContent = category.name;
-      button.querySelector('.count-pill').textContent = String(category.count);
+      button.querySelector('.count-pill').textContent = String(categoryCounts.get(category.name) || 0);
       button.addEventListener('click', () => selectCategory(category.name));
 
       const renameButton = document.createElement('button');
@@ -228,6 +391,7 @@ function renderSidebar() {
       renameButton.className = 'category-rename-button';
       renameButton.title = `Rename ${category.name}`;
       renameButton.textContent = 'Rename';
+      renameButton.disabled = state.analyzing;
       renameButton.addEventListener('click', event => {
         event.stopPropagation();
         openCategoryRenameDialog(category.name);
@@ -238,6 +402,7 @@ function renderSidebar() {
       deleteButton.className = 'category-rename-button';
       deleteButton.title = `Delete ${category.name}`;
       deleteButton.textContent = 'Delete';
+      deleteButton.disabled = state.analyzing;
       deleteButton.addEventListener('click', event => {
         event.stopPropagation();
         deleteCategoryConfirm(category.name);
@@ -259,7 +424,17 @@ function renderSidebar() {
     for (const folder of sourceFolders) {
       const row = document.createElement('div');
       row.className = 'source-folder-row';
-      row.innerHTML = '<span class="category-name"></span><span class="count-pill"></span>';
+      row.innerHTML = `
+        <label class="source-folder-include" title="Include this folder in browsing and analysis">
+          <input type="checkbox" class="source-folder-checkbox">
+        </label>
+        <span class="category-name"></span>
+        <span class="count-pill"></span>
+      `;
+      const checkbox = row.querySelector('.source-folder-checkbox');
+      checkbox.checked = folder.includedInAnalysis;
+      checkbox.disabled = state.analyzing;
+      checkbox.addEventListener('change', () => setFolderAnalysisIncluded(folder.name, checkbox.checked));
       row.querySelector('.category-name').textContent = folder.name;
       row.querySelector('.count-pill').textContent = String(folder.imageCount);
       els.sourceFolderList.append(row);
@@ -289,12 +464,167 @@ function categoryOptionsHtml(selected) {
   return html;
 }
 
+function percent(value) {
+  if (value == null || Number.isNaN(Number(value))) return null;
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function analysisSummary(image) {
+  const lines = [];
+  if (image.nsfwScore != null) {
+    const threshold = state.library?.nsfwScoreThreshold ?? 0.45;
+    const status = image.nsfwScore >= threshold ? 'Explicit' : 'Below explicit threshold';
+    const labels = Array.isArray(image.nsfwLabels) && image.nsfwLabels.length
+      ? image.nsfwLabels.join(' · ')
+      : 'No NudeNet labels recorded';
+    lines.push(`NudeNet: ${status} (${percent(image.nsfwScore)}; threshold ${percent(threshold)})`);
+    lines.push(labels);
+  } else {
+    lines.push('NudeNet: not analyzed');
+  }
+
+  if (image.ocrWordCount != null && image.ocrTextAreaRatio != null) {
+    lines.push(`Text: ${image.ocrWordCount} words · ${percent(image.ocrTextAreaRatio)} area`);
+  } else {
+    lines.push('Text: not analyzed');
+  }
+
+  if (image.classifiedBy) {
+    lines.push(`Classification: ${image.category || 'Unclassified'} (${image.classifiedBy})`);
+  }
+
+  return lines;
+}
+
+function buildImageCard(image) {
+  const card = document.createElement('article');
+  card.className = 'image-card';
+  card.dataset.hash = image.hash;
+  card.dataset.path = image.path;
+  card.dataset.name = image.name;
+  card.innerHTML = `
+    <div class="thumbnail">
+      <img class="thumb-image" alt="" loading="lazy">
+    </div>
+    <div class="card-main">
+      <div class="file-title"></div>
+      <div class="file-meta"></div>
+      <div class="analysis-summary"></div>
+      <div class="card-controls">
+        <select class="category-select"></select>
+        <button class="button compact secondary move-button" type="button">Move</button>
+      </div>
+      <div class="card-actions">
+        <button class="button compact ghost open-button" type="button">Open</button>
+        <button class="button compact ghost reveal-button" type="button">Show</button>
+      </div>
+    </div>
+  `;
+
+  card.querySelector('.thumb-image').src = window.categorizerAPI.getFileUrl(image.thumbnailPath || image.path);
+  card.querySelector('.file-title').textContent = image.name;
+  const folderText = image.sourceFolder ? ` · ${image.sourceFolder}` : '';
+  const classifiedBy = image.classifiedBy;
+  const badge = classifiedBy === 'manual' ? ' · manual'
+    : (classifiedBy === 'auto' || classifiedBy === 'auto-nsfw') ? ' · auto'
+    : '';
+  const nsfwBadge = image.nsfwScore != null
+    ? ` · ${Math.round(image.nsfwScore * 100)}% explicit`
+    : '';
+  card.querySelector('.file-meta').textContent =
+    `${formatDate(image.modifiedMs)} · ${formatBytes(image.size)}${folderText}${nsfwBadge}${badge}`;
+  const summaryLines = analysisSummary(image);
+  const summary = card.querySelector('.analysis-summary');
+  summary.textContent = summaryLines.join('\n');
+  summary.title = summaryLines.join('\n');
+
+  const select = card.querySelector('.category-select');
+  select.innerHTML = categoryOptionsHtml(image.category);
+  select.disabled = state.analyzing;
+  select.addEventListener('change', () => assignCategory(image.hash, select.value || null));
+
+  const moveButton = card.querySelector('.move-button');
+  moveButton.disabled = state.analyzing;
+  moveButton.addEventListener('click', () => openMoveDialog(image));
+  card.querySelector('.open-button').addEventListener('click', () => openImage(image.path));
+  card.querySelector('.reveal-button').addEventListener('click', () => revealImage(image.path));
+  card.addEventListener('pointerdown', event => startPointerDrag(event, card));
+
+  return card;
+}
+
+const GRID_ROW_GAP = 14;
+const VIRTUAL_BUFFER_ROWS = 3;
+
+function estimatedCardHeight() {
+  return state.cardHeight || tileSize() + 92;
+}
+
+function computeGridColumns() {
+  const gridWidth = els.imageGrid.clientWidth || els.mainDropTarget.clientWidth;
+  const tile = tileSize();
+  return Math.max(1, Math.floor((gridWidth + GRID_ROW_GAP) / (tile + GRID_ROW_GAP)));
+}
+
+function computeVirtualWindow(totalImages) {
+  const columns = computeGridColumns();
+  const rowHeight = estimatedCardHeight() + GRID_ROW_GAP;
+  const totalRows = Math.ceil(totalImages / columns);
+  const scrollTop = els.mainDropTarget.scrollTop;
+  const viewportHeight = els.mainDropTarget.clientHeight;
+  const bufferPx = rowHeight * VIRTUAL_BUFFER_ROWS;
+
+  const startRow = Math.max(0, Math.floor((scrollTop - bufferPx) / rowHeight));
+  const endRow = Math.min(totalRows, Math.ceil((scrollTop + viewportHeight + bufferPx) / rowHeight));
+
+  return {
+    startIndex: startRow * columns,
+    endIndex: Math.min(totalImages, endRow * columns),
+    topPadding: startRow * rowHeight,
+    bottomPadding: (totalRows - endRow) * rowHeight,
+  };
+}
+
+function renderVirtualWindow(images, window_) {
+  state.virtualImages = images;
+  state.virtualStart = window_.startIndex;
+  state.virtualEnd = window_.endIndex;
+  els.imageGrid.style.paddingTop = `${window_.topPadding}px`;
+  els.imageGrid.style.paddingBottom = `${window_.bottomPadding}px`;
+  els.imageGrid.innerHTML = '';
+
+  for (const image of images.slice(window_.startIndex, window_.endIndex)) {
+    els.imageGrid.append(buildImageCard(image));
+  }
+
+  if (!state.cardHeight) {
+    const firstCard = els.imageGrid.querySelector('.image-card');
+    if (firstCard) state.cardHeight = firstCard.getBoundingClientRect().height;
+  }
+}
+
+function onGridScroll() {
+  if (state.scrollFrameRequested) return;
+  state.scrollFrameRequested = true;
+  requestAnimationFrame(() => {
+    state.scrollFrameRequested = false;
+    const images = state.virtualImages;
+    if (!images || !images.length) return;
+    const window_ = computeVirtualWindow(images.length);
+    if (window_.startIndex === state.virtualStart && window_.endIndex === state.virtualEnd) return;
+    renderVirtualWindow(images, window_);
+  });
+}
+
 function renderImages() {
   const images = visibleImages();
-  els.imageGrid.innerHTML = '';
   els.emptyState.classList.toggle('visible', images.length === 0);
 
   if (!images.length) {
+    state.virtualImages = null;
+    els.imageGrid.style.paddingTop = '0px';
+    els.imageGrid.style.paddingBottom = '0px';
+    els.imageGrid.innerHTML = '';
     if (!state.library?.root) {
       els.emptyState.innerHTML = '';
       const button = document.createElement('button');
@@ -311,47 +641,7 @@ function renderImages() {
     return;
   }
 
-  for (const image of images) {
-    const card = document.createElement('article');
-    card.className = 'image-card';
-    card.dataset.hash = image.hash;
-    card.dataset.path = image.path;
-    card.dataset.name = image.name;
-    card.innerHTML = `
-      <div class="thumbnail">
-        <img class="thumb-image" alt="" loading="lazy">
-      </div>
-      <div class="card-main">
-        <div class="file-title"></div>
-        <div class="file-meta"></div>
-        <div class="card-controls">
-          <select class="category-select"></select>
-          <button class="button compact secondary move-button" type="button">Move</button>
-        </div>
-        <div class="card-actions">
-          <button class="button compact ghost open-button" type="button">Open</button>
-          <button class="button compact ghost reveal-button" type="button">Show</button>
-        </div>
-      </div>
-    `;
-
-    card.querySelector('.thumb-image').src = window.categorizerAPI.getFileUrl(image.path);
-    card.querySelector('.file-title').textContent = image.name;
-    const folderText = image.sourceFolder ? ` · ${image.sourceFolder}` : '';
-    const badge = image.classifiedBy === 'auto' ? ' · auto' : image.classifiedBy === 'manual' ? ' · manual' : '';
-    card.querySelector('.file-meta').textContent = `${formatDate(image.modifiedMs)} · ${formatBytes(image.size)}${folderText}${badge}`;
-
-    const select = card.querySelector('.category-select');
-    select.innerHTML = categoryOptionsHtml(image.category);
-    select.addEventListener('change', () => assignCategory(image.hash, select.value || null));
-
-    card.querySelector('.move-button').addEventListener('click', () => openMoveDialog(image));
-    card.querySelector('.open-button').addEventListener('click', () => openImage(image.path));
-    card.querySelector('.reveal-button').addEventListener('click', () => revealImage(image.path));
-    card.addEventListener('pointerdown', event => startPointerDrag(event, card));
-
-    els.imageGrid.append(card);
-  }
+  renderVirtualWindow(images, computeVirtualWindow(images.length));
 }
 
 function render() {
@@ -379,6 +669,7 @@ async function refreshLibrary() {
 }
 
 async function refreshAll() {
+  setStatus('Scanning for new, moved, or deleted images…');
   await loadSettings();
   await refreshLibrary();
   if (state.currentView === 'category' && !(state.library?.categories || []).some(c => c.name === state.currentCategory)) {
@@ -386,6 +677,13 @@ async function refreshAll() {
     state.currentCategory = null;
   }
   render();
+  if (state.library) {
+    setStatus(`Up to date — ${imageCountLabel(state.library.images.length)}.`);
+  } else if (state.settings?.lastRoot) {
+    setStatus('Could not load the selected folder.');
+  } else {
+    setStatus('');
+  }
 }
 
 function selectAll() {
@@ -463,7 +761,7 @@ function closeCategoryRenameDialog() {
 
 function openMoveDialog(image) {
   state.pendingMoveHash = image.hash;
-  const folders = state.library?.sourceFolders || [];
+  const folders = (state.library?.sourceFolders || []).filter(folder => folder.name !== 'Root');
   els.moveFolderSelect.innerHTML = folders
     .map(folder => `<option value="${folder.name}" ${folder.name === image.sourceFolder ? 'selected' : ''}>${folder.name}</option>`)
     .join('');
@@ -492,6 +790,7 @@ async function submitMove() {
 
 function openSettingsDialog() {
   syncSettingsDialog();
+  syncNsfwModelHint();
   els.settingsDialog.showModal();
 }
 
@@ -582,6 +881,184 @@ async function saveSourcePattern() {
   }
 }
 
+function syncTextThresholdLabels() {
+  els.ocrWordThresholdValue.textContent = `${els.ocrWordThresholdInput.value} words`;
+  els.ocrAreaThresholdValue.textContent = `${els.ocrAreaThresholdInput.value}%`;
+}
+
+function syncNsfwThresholdLabel() {
+  els.nsfwThresholdValue.textContent = `${els.nsfwThresholdInput.value}%`;
+}
+
+async function saveTextThresholds() {
+  if (!state.library) return;
+  const wordThreshold = Number(els.ocrWordThresholdInput.value);
+  const areaThreshold = Number(els.ocrAreaThresholdInput.value) / 100;
+  try {
+    state.library = await window.categorizerAPI.setTextThresholds(state.library.root, wordThreshold, areaThreshold);
+    render();
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function saveNsfwThreshold() {
+  if (!state.library) return;
+  const threshold = Number(els.nsfwThresholdInput.value) / 100;
+  try {
+    state.library = await window.categorizerAPI.setNsfwThreshold(state.library.root, threshold);
+    render();
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function setFolderAnalysisIncluded(folderName, included) {
+  if (!state.library) return;
+  try {
+    state.library = await window.categorizerAPI.setFolderAnalysisIncluded(state.library.root, folderName, included);
+    render();
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+// ==============================
+// Unified analysis queue
+// ==============================
+
+function setInteractionsLocked(locked) {
+  state.analyzing = locked;
+  els.addCategoryButton.disabled = locked;
+  els.addSourceFolderButton.disabled = locked;
+  els.rootFolderSelect.disabled = locked;
+  els.refreshButton.disabled = locked;
+  els.openFolderButton.disabled = locked;
+  els.settingsButton.disabled = locked;
+  els.analyzeButton.classList.toggle('hidden', locked);
+  els.reanalyzeButton.classList.toggle('hidden', locked);
+  els.cancelAnalysisButton.classList.toggle('hidden', !locked);
+  render();
+}
+
+function analysisTypeLabel(type) {
+  return type === 'nsfw' ? 'Explicit' : 'Text';
+}
+
+async function runNextInQueue() {
+  if (!state.analysisQueue.length) {
+    // All done — refresh and unlock
+    state.analysisRunning = null;
+    setInteractionsLocked(false);
+    if (state.library) {
+      try {
+        setStatus('Refreshing library…');
+        state.library = await window.categorizerAPI.scanLibrary(state.library.root);
+        render();
+        setStatus('Analysis complete.');
+      } catch (error) {
+        setStatus('');
+        showToast(errorText(error));
+      }
+    }
+    return;
+  }
+
+  const { type, force } = state.analysisQueue.shift();
+  state.analysisRunning = type;
+  const verb = force ? 'Re-analyzing' : 'Analyzing';
+  setStatus(`${verb} (${analysisTypeLabel(type)})…`);
+
+  try {
+    if (type === 'text') {
+      await window.categorizerAPI.analyzeText(state.library.root, force);
+    } else {
+      await window.categorizerAPI.analyzeNsfw(state.library.root, force);
+    }
+  } catch (error) {
+    showToast(errorText(error));
+    // Skip to next
+    await runNextInQueue();
+  }
+}
+
+async function startAnalysis(force) {
+  if (!state.library) {
+    showToast('Choose a root folder first.');
+    return;
+  }
+  const wantText = els.analyzeTextCheck.checked;
+  const wantNsfw = els.analyzeNsfwCheck.checked;
+  if (!wantText && !wantNsfw) {
+    showToast('Select at least one analysis type.');
+    return;
+  }
+
+  state.analysisQueue = [];
+  if (wantNsfw) state.analysisQueue.push({ type: 'nsfw', force });
+  if (wantText) state.analysisQueue.push({ type: 'text', force });
+
+  setInteractionsLocked(true);
+  await runNextInQueue();
+}
+
+async function cancelCurrentAnalysis() {
+  // Cancel the running one; the queue will be drained when the finished event fires
+  state.analysisQueue = [];
+  try {
+    if (state.analysisRunning === 'text') {
+      await window.categorizerAPI.cancelTextAnalysis();
+    } else if (state.analysisRunning === 'nsfw') {
+      await window.categorizerAPI.cancelNsfwAnalysis();
+    }
+    setStatus('Cancelling…');
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function onAnalysisFinished(type, { status, message }) {
+  if (state.analysisRunning !== type) return; // stale event
+
+  if (status === 'error') {
+    state.analysisQueue = [];
+    state.analysisRunning = null;
+    setInteractionsLocked(false);
+    setStatus('');
+    showToast(message || `${analysisTypeLabel(type)} analysis failed`);
+    // Still refresh so partial results are visible
+    if (state.library) {
+      try {
+        state.library = await window.categorizerAPI.scanLibrary(state.library.root);
+        render();
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  if (status === 'cancelled') {
+    state.analysisQueue = [];
+    state.analysisRunning = null;
+    setInteractionsLocked(false);
+    const summary = `${analysisTypeLabel(type)} analysis cancelled.`;
+    showToast(summary);
+    if (state.library) {
+      try {
+        state.library = await window.categorizerAPI.scanLibrary(state.library.root);
+        render();
+        setStatus(summary);
+      } catch { setStatus(''); }
+    } else {
+      setStatus(summary);
+    }
+    return;
+  }
+
+  if (message) showToast(message);
+  // Move to next item in queue
+  await runNextInQueue();
+}
+
 async function saveUiSettingsNow() {
   if (!state.settings) return;
   const tileSizeValue = Number(els.tileSizeInput.value);
@@ -600,19 +1077,44 @@ function applyPendingUiSettings() {
   state.settings.tileSize = Number(els.tileSizeInput.value);
   state.settings.darkMode = els.darkModeInput.checked;
   applyUiSettings();
+  state.cardHeight = null;
+  renderImages();
 }
 
 async function changeRootFolder() {
+  setStatus('Loading folder…');
   try {
     const library = await window.categorizerAPI.chooseRootFolder(state.library?.root);
-    if (!library) return;
+    if (!library) {
+      setStatus('');
+      return;
+    }
     state.library = library;
     state.settings = await window.categorizerAPI.getSettings();
     state.currentView = 'all';
     state.currentCategory = null;
     render();
+    setStatus(`Loaded ${imageCountLabel(state.library.images.length)}.`);
   } catch (error) {
+    setStatus('');
     showToast(errorText(error));
+  }
+}
+
+async function selectRootFolder(rootPath) {
+  if (!rootPath || rootPath === state.library?.root) return;
+  setStatus('Loading folder…');
+  try {
+    state.library = await window.categorizerAPI.selectRootFolder(rootPath);
+    state.settings = await window.categorizerAPI.getSettings();
+    state.currentView = 'all';
+    state.currentCategory = null;
+    render();
+    setStatus(`Loaded ${imageCountLabel(state.library.images.length)}.`);
+  } catch (error) {
+    setStatus('');
+    showToast(errorText(error));
+    renderRootFolderSelect();
   }
 }
 
@@ -642,7 +1144,7 @@ function categoryDropTargetFromPoint(x, y) {
 }
 
 function startPointerDrag(event, card) {
-  if (event.button !== 0 || event.target.closest('button, select')) return;
+  if (state.analyzing || event.button !== 0 || event.target.closest('button, select, .analysis-summary')) return;
 
   state.pointerDrag = {
     card,
@@ -733,9 +1235,20 @@ function installEvents() {
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
   els.addCategoryButton.addEventListener('click', openCategoryDialog);
   els.addSourceFolderButton.addEventListener('click', addManualSourceFolder);
-  els.rootFolderButton.addEventListener('click', changeRootFolder);
+  els.rootFolderSelect.addEventListener('change', () => {
+    const value = els.rootFolderSelect.value;
+    if (value === '__add__') {
+      renderRootFolderSelect();
+      changeRootFolder();
+      return;
+    }
+    selectRootFolder(value);
+  });
   els.settingsButton.addEventListener('click', openSettingsDialog);
   els.refreshButton.addEventListener('click', refreshAll);
+  els.analyzeButton.addEventListener('click', () => startAnalysis(false));
+  els.reanalyzeButton.addEventListener('click', () => startAnalysis(true));
+  els.cancelAnalysisButton.addEventListener('click', cancelCurrentAnalysis);
   els.openFolderButton.addEventListener('click', openCurrentRootFolder);
   els.searchInput.addEventListener('input', () => {
     state.search = els.searchInput.value;
@@ -744,6 +1257,14 @@ function installEvents() {
   els.sortSelect.addEventListener('change', () => {
     state.sort = els.sortSelect.value;
     renderImages();
+  });
+  els.mainDropTarget.addEventListener('scroll', onGridScroll, { passive: true });
+  window.addEventListener('resize', () => {
+    clearTimeout(installEvents.resizeTimer);
+    installEvents.resizeTimer = setTimeout(() => {
+      state.cardHeight = null;
+      renderImages();
+    }, 120);
   });
 
   els.categoryForm.addEventListener('submit', event => {
@@ -786,6 +1307,13 @@ function installEvents() {
   els.sourcePatternRegex.addEventListener('change', saveSourcePattern);
   els.tileSizeInput.addEventListener('input', applyPendingUiSettings);
   els.darkModeInput.addEventListener('change', applyPendingUiSettings);
+  els.ocrWordThresholdInput.addEventListener('input', syncTextThresholdLabels);
+  els.ocrWordThresholdInput.addEventListener('change', saveTextThresholds);
+  els.ocrAreaThresholdInput.addEventListener('input', syncTextThresholdLabels);
+  els.ocrAreaThresholdInput.addEventListener('change', saveTextThresholds);
+  els.nsfwThresholdInput.addEventListener('input', syncNsfwThresholdLabel);
+  els.nsfwThresholdInput.addEventListener('change', saveNsfwThreshold);
+  els.downloadNsfwModelButton.addEventListener('click', downloadNsfwModel);
 
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
@@ -803,6 +1331,17 @@ function installEvents() {
 
 async function init() {
   installEvents();
+
+  await window.categorizerAPI.onTextAnalysisProgress(({ processed, total, currentName }) => {
+    setStatus(`Text: ${processed}/${total} — ${currentName}`);
+  });
+  await window.categorizerAPI.onTextAnalysisFinished(payload => onAnalysisFinished('text', payload));
+
+  await window.categorizerAPI.onNsfwAnalysisProgress(({ processed, total, currentName }) => {
+    setStatus(`Explicit: ${processed}/${total} — ${currentName}`);
+  });
+  await window.categorizerAPI.onNsfwAnalysisFinished(payload => onAnalysisFinished('nsfw', payload));
+
   await refreshAll();
 }
 

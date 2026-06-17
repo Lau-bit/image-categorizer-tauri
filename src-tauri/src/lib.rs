@@ -4,17 +4,41 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     fs::{self, File},
     hash::{Hash, Hasher},
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use rayon::prelude::*;
+use tauri::{AppHandle, Emitter, Manager};
+
+mod nsfw;
+use nsfw::{analyze_image_nsfw, create_session};
+
+mod ocr;
+use ocr::analyze_image_text;
+
+mod thumbnails;
+use thumbnails::{ensure_thumbnail, THUMBNAIL_DIR_NAME};
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "heic", "heif"];
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const MAX_SCAN_DEPTH: usize = 4;
 const HASH_SAMPLE_BYTES: usize = 65536;
+
+const DEFAULT_OCR_WORD_THRESHOLD: u32 = 35;
+const DEFAULT_OCR_AREA_THRESHOLD: f32 = 0.05;
+const LOW_TEXT_CATEGORY: &str = "Low Text";
+const HIGH_TEXT_CATEGORY: &str = "High Text";
+
+const DEFAULT_NSFW_THRESHOLD: f32 = 0.45;
+const EXPLICIT_CATEGORY: &str = "Explicit";
+const ROOT_SOURCE_FOLDER: &str = "Root";
+const NUDENET_MODEL_DOWNLOAD_URL: &str =
+    "https://files.pythonhosted.org/packages/1c/ee/1aa02d44ba958cc77e16ff1e41a0aac5e721037db7bf62b9c9d124917f87/nudenet-3.4.2-py3-none-any.whl";
+const NUDENET_MODEL_DOWNLOAD_FILENAME: &str = "320n.onnx";
+const NUDENET_MODEL_FILENAMES: &[&str] = &["320n.onnx", "nudenet-320n.onnx", "nudenet.onnx"];
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +46,8 @@ struct AppSettings {
     last_root: Option<String>,
     tile_size: Option<u32>,
     dark_mode: Option<bool>,
+    #[serde(default)]
+    known_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -31,6 +57,12 @@ struct ImageRecord {
     category: Option<String>,
     classified_by: Option<String>,
     classified_at: Option<String>,
+    ocr_word_count: Option<u32>,
+    ocr_text_area_ratio: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nsfw_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nsfw_labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -46,6 +78,12 @@ struct LibraryConfig {
     categories: Vec<String>,
     #[serde(default)]
     images: HashMap<String, ImageRecord>,
+    ocr_word_threshold: Option<u32>,
+    ocr_area_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nsfw_score_threshold: Option<f32>,
+    #[serde(default)]
+    excluded_analysis_folders: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +93,14 @@ struct AppSettingsView {
     last_root_exists: bool,
     tile_size: u32,
     dark_mode: bool,
+    known_roots: Vec<KnownRootView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownRootView {
+    path: String,
+    exists: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +110,7 @@ struct SourceFolderView {
     relative_path: String,
     is_manual: bool,
     image_count: usize,
+    included_in_analysis: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +125,7 @@ struct CategoryView {
 struct ImageView {
     hash: String,
     path: String,
+    thumbnail_path: Option<String>,
     relative_path: String,
     name: String,
     source_folder: String,
@@ -86,6 +134,10 @@ struct ImageView {
     category: Option<String>,
     classified_by: Option<String>,
     classified_at: Option<String>,
+    ocr_word_count: Option<u32>,
+    ocr_text_area_ratio: Option<f32>,
+    nsfw_score: Option<f32>,
+    nsfw_labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,10 +146,40 @@ struct LibraryView {
     root: String,
     source_pattern_preset: Option<String>,
     source_pattern_regex: Option<String>,
+    ocr_word_threshold: u32,
+    ocr_area_threshold: f32,
+    nsfw_score_threshold: f32,
     source_folders: Vec<SourceFolderView>,
     categories: Vec<CategoryView>,
     unclassified_count: usize,
     images: Vec<ImageView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextAnalysisProgress {
+    processed: usize,
+    total: usize,
+    current_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextAnalysisFinished {
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Default)]
+struct AnalysisControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
+struct NsfwControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
 }
 
 const DEFAULT_TILE_SIZE: u32 = 168;
@@ -142,12 +224,26 @@ fn app_settings_view(app: &AppHandle) -> AppSettingsView {
         .as_ref()
         .map(|root| Path::new(root).is_dir())
         .unwrap_or(false);
+    let known_roots = settings
+        .known_roots
+        .iter()
+        .map(|path| KnownRootView {
+            path: path.clone(),
+            exists: Path::new(path).is_dir(),
+        })
+        .collect();
     AppSettingsView {
         last_root: settings.last_root,
         last_root_exists,
         tile_size: clamp_tile_size(settings.tile_size.unwrap_or(DEFAULT_TILE_SIZE)),
         dark_mode: settings.dark_mode.unwrap_or(true),
+        known_roots,
     }
+}
+
+fn remember_known_root(settings: &mut AppSettings, root: &str) {
+    settings.known_roots.retain(|item| item != root);
+    settings.known_roots.insert(0, root.to_string());
 }
 
 fn sidecar_path(root: &Path) -> PathBuf {
@@ -357,14 +453,119 @@ fn collect_images_in_folder(
     Ok(())
 }
 
+fn collect_direct_images_in_folder(
+    root: &Path,
+    source_folder: &str,
+    folder: &Path,
+    images: &mut Vec<ScannedImage>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path_name(&path);
+        if name.starts_with('.') || !path.is_file() || !is_image_path(&path) {
+            continue;
+        }
+        let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
+        let size = metadata.len();
+        let hash = hash_file(&path, size)?;
+        let relative_path = path
+            .strip_prefix(root)
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| name.clone());
+        images.push(ScannedImage {
+            relative_path,
+            absolute_path: path,
+            name,
+            source_folder: source_folder.to_string(),
+            size,
+            modified_ms: metadata.modified().map(system_time_ms).unwrap_or_default(),
+            hash,
+        });
+    }
+    Ok(())
+}
+
+fn ocr_thresholds(config: &LibraryConfig) -> (u32, f32) {
+    (
+        config.ocr_word_threshold.unwrap_or(DEFAULT_OCR_WORD_THRESHOLD),
+        config.ocr_area_threshold.unwrap_or(DEFAULT_OCR_AREA_THRESHOLD),
+    )
+}
+
+fn ensure_category(config: &mut LibraryConfig, name: &str) {
+    if !config.categories.iter().any(|item| item == name) {
+        config.categories.push(name.to_string());
+    }
+}
+
+fn ensure_analysis_categories(config: &mut LibraryConfig) {
+    if config.images.values().any(|record| record.nsfw_score.is_some()) {
+        ensure_category(config, EXPLICIT_CATEGORY);
+    }
+    if config.images.values().any(|record| record.ocr_word_count.is_some()) {
+        ensure_category(config, LOW_TEXT_CATEGORY);
+        ensure_category(config, HIGH_TEXT_CATEGORY);
+    }
+}
+
+fn reclassify_text_categories(config: &mut LibraryConfig) {
+    let any_analyzed = config.images.values().any(|record| record.ocr_word_count.is_some());
+    if !any_analyzed {
+        return;
+    }
+
+    let nsfw_min = nsfw_threshold(config);
+    let (word_threshold, area_threshold) = ocr_thresholds(config);
+    ensure_category(config, LOW_TEXT_CATEGORY);
+    ensure_category(config, HIGH_TEXT_CATEGORY);
+
+    for record in config.images.values_mut() {
+        if record.classified_by.as_deref() == Some("manual") {
+            continue;
+        }
+        if record.nsfw_score.map_or(false, |s| s >= nsfw_min) {
+            if record.category.as_deref() != Some(EXPLICIT_CATEGORY) {
+                record.category = Some(EXPLICIT_CATEGORY.to_string());
+                record.classified_by = Some("auto-nsfw".to_string());
+                record.classified_at = Some(now_iso());
+            }
+            record.ocr_word_count = None;
+            record.ocr_text_area_ratio = None;
+            continue;
+        }
+        let (Some(word_count), Some(area_ratio)) = (record.ocr_word_count, record.ocr_text_area_ratio) else {
+            continue;
+        };
+        let is_low_text = word_count <= word_threshold && area_ratio <= area_threshold;
+        let category = if is_low_text { LOW_TEXT_CATEGORY } else { HIGH_TEXT_CATEGORY };
+        if record.category.as_deref() != Some(category) {
+            record.category = Some(category.to_string());
+            record.classified_by = Some("auto".to_string());
+            record.classified_at = Some(now_iso());
+        }
+    }
+}
+
 fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     let mut config = load_library_config(root);
     let source_folders = detect_source_folders(root, &config)?;
 
     let mut all_images: Vec<ScannedImage> = Vec::new();
+    collect_direct_images_in_folder(root, ROOT_SOURCE_FOLDER, root, &mut all_images)?;
     for (folder_name, _) in &source_folders {
         collect_images_in_folder(root, folder_name, &root.join(folder_name), 0, &mut all_images)?;
     }
+
+    let thumb_dir = root.join(THUMBNAIL_DIR_NAME);
+    let _ = fs::create_dir_all(&thumb_dir);
+    let thumbnail_paths: HashMap<String, String> = all_images
+        .par_iter()
+        .filter_map(|image| {
+            ensure_thumbnail(&thumb_dir, &image.hash, &image.absolute_path)
+                .map(|path| (image.hash.clone(), path.to_string_lossy().to_string()))
+        })
+        .collect();
 
     let mut seen_hashes = std::collections::HashSet::new();
     for image in &all_images {
@@ -374,11 +575,18 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
             category: None,
             classified_by: None,
             classified_at: None,
+            ocr_word_count: None,
+            ocr_text_area_ratio: None,
+            nsfw_score: None,
+            nsfw_labels: None,
         });
         record.last_known_path = image.relative_path.clone();
     }
     config.images.retain(|hash, _| seen_hashes.contains(hash));
 
+    reclassify_nsfw_categories(&mut config);
+    reclassify_text_categories(&mut config);
+    ensure_analysis_categories(&mut config);
     let valid_categories: std::collections::HashSet<String> = config.categories.iter().cloned().collect();
     for record in config.images.values_mut() {
         if let Some(category) = record.category.clone() {
@@ -405,6 +613,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         image_views.push(ImageView {
             hash: image.hash.clone(),
             path: image.absolute_path.to_string_lossy().to_string(),
+            thumbnail_path: thumbnail_paths.get(&image.hash).cloned(),
             relative_path: image.relative_path.clone(),
             name: image.name.clone(),
             source_folder: image.source_folder.clone(),
@@ -413,6 +622,10 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
             category: record.category,
             classified_by: record.classified_by,
             classified_at: record.classified_at,
+            ocr_word_count: record.ocr_word_count,
+            ocr_text_area_ratio: record.ocr_text_area_ratio,
+            nsfw_score: record.nsfw_score,
+            nsfw_labels: record.nsfw_labels,
         });
     }
 
@@ -423,15 +636,26 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         *folder_counts.entry(image.source_folder.clone()).or_insert(0) += 1;
     }
 
-    let source_folder_views = source_folders
-        .into_iter()
-        .map(|(name, is_manual)| SourceFolderView {
+    let mut source_folder_views: Vec<SourceFolderView> = Vec::new();
+    if folder_counts.get(ROOT_SOURCE_FOLDER).copied().unwrap_or(0) > 0 {
+        source_folder_views.push(SourceFolderView {
+            relative_path: ".".to_string(),
+            image_count: folder_counts.get(ROOT_SOURCE_FOLDER).copied().unwrap_or(0),
+            included_in_analysis: !config
+                .excluded_analysis_folders
+                .iter()
+                .any(|excluded| excluded == ROOT_SOURCE_FOLDER),
+            name: ROOT_SOURCE_FOLDER.to_string(),
+            is_manual: false,
+        });
+    }
+    source_folder_views.extend(source_folders.into_iter().map(|(name, is_manual)| SourceFolderView {
             relative_path: name.clone(),
             image_count: folder_counts.get(&name).copied().unwrap_or(0),
+            included_in_analysis: !config.excluded_analysis_folders.iter().any(|excluded| excluded == &name),
             name,
             is_manual,
-        })
-        .collect();
+        }));
 
     let mut categories: Vec<CategoryView> = config
         .categories
@@ -443,10 +667,16 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         .collect();
     categories.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
+    let (ocr_word_threshold, ocr_area_threshold) = ocr_thresholds(&config);
+    let nsfw_score_threshold = nsfw_threshold(&config);
+
     Ok(LibraryView {
         root: root.to_string_lossy().to_string(),
         source_pattern_preset: config.source_pattern_preset.clone(),
         source_pattern_regex: config.source_pattern_regex.clone(),
+        ocr_word_threshold,
+        ocr_area_threshold,
+        nsfw_score_threshold,
         source_folders: source_folder_views,
         categories,
         unclassified_count,
@@ -509,10 +739,23 @@ fn set_dark_mode(app: AppHandle, dark_mode: bool) -> Result<AppSettingsView, Str
 #[tauri::command]
 fn choose_root_folder(app: AppHandle, folder_path: String) -> Result<LibraryView, String> {
     let root = root_path(&folder_path)?;
+    let root_str = root.to_string_lossy().to_string();
     let mut settings = load_app_settings(&app);
-    settings.last_root = Some(root.to_string_lossy().to_string());
+    settings.last_root = Some(root_str.clone());
+    remember_known_root(&mut settings, &root_str);
     save_app_settings(&app, &settings)?;
     scan_and_reconcile(&root)
+}
+
+#[tauri::command]
+fn select_root_folder(app: AppHandle, root: String) -> Result<LibraryView, String> {
+    let root_buf = root_path(&root)?;
+    let root_str = root_buf.to_string_lossy().to_string();
+    let mut settings = load_app_settings(&app);
+    settings.last_root = Some(root_str.clone());
+    remember_known_root(&mut settings, &root_str);
+    save_app_settings(&app, &settings)?;
+    scan_and_reconcile(&root_buf)
 }
 
 #[tauri::command]
@@ -533,6 +776,139 @@ fn set_source_pattern(
     config.source_pattern_regex = regex.filter(|value| !value.trim().is_empty());
     save_library_config(&root, &config)?;
     scan_and_reconcile(&root)
+}
+
+#[tauri::command]
+fn analyze_text(app: AppHandle, control: tauri::State<'_, AnalysisControl>, root: String, force: bool) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Text analysis is already running.".to_string());
+    }
+
+    let root_buf = match root_path(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        run_text_analysis(&app_handle, &root_buf, force);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_text_analysis(control: tauri::State<'_, AnalysisControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No text analysis is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+// Runs on a detached background thread so `analyze_text` returns immediately and the UI stays
+// responsive. Only the images present at scan time are ever touched: anything added to the
+// library mid-run is picked up by the next scan, never by this one.
+fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+    let control = app.state::<AnalysisControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let view = scan_and_reconcile(root_buf)?;
+        let mut config = load_library_config(root_buf);
+        let excluded_folders: std::collections::HashSet<String> =
+            config.excluded_analysis_folders.iter().cloned().collect();
+
+        let included_folder_exists = view
+            .source_folders
+            .iter()
+            .any(|folder| !excluded_folders.contains(&folder.name));
+        if !view.source_folders.is_empty() && !included_folder_exists {
+            return Ok(("completed", Some("No source folders are included in analysis.".to_string())));
+        }
+
+        let pending: Vec<(String, String, String)> = view
+            .images
+            .iter()
+            .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| {
+                config
+                    .images
+                    .get(&image.hash)
+                    .and_then(|record| record.nsfw_score)
+                    .map(|score| score < nsfw_threshold(&config))
+                    .unwrap_or(true)
+            })
+            .filter(|image| {
+                force
+                    || config
+                        .images
+                        .get(&image.hash)
+                        .map(|record| record.ocr_word_count.is_none())
+                        .unwrap_or(true)
+            })
+            .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
+            .collect();
+
+        let total = pending.len();
+        let mut cancelled = false;
+
+        for (index, (hash, path, name)) in pending.iter().enumerate() {
+            if control.cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+
+            match analyze_image_text(Path::new(path)) {
+                Ok(stats) => {
+                    if let Some(record) = config.images.get_mut(hash) {
+                        record.ocr_word_count = Some(stats.word_count);
+                        record.ocr_text_area_ratio = Some(stats.text_area_ratio);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("OCR failed for {path}: {error}");
+                }
+            }
+
+            let _ = app.emit(
+                "text-analysis-progress",
+                TextAnalysisProgress {
+                    processed: index + 1,
+                    total,
+                    current_name: name.clone(),
+                },
+            );
+        }
+
+        reclassify_text_categories(&mut config);
+        save_library_config(root_buf, &config)?;
+
+        let message = if total == 0 { Some("No images needed analysis.".to_string()) } else { None };
+        Ok((if cancelled { "cancelled" } else { "completed" }, message))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("text-analysis-finished", TextAnalysisFinished { status, message });
+}
+
+#[tauri::command]
+fn set_text_thresholds(root: String, word_threshold: u32, area_threshold: f32) -> Result<LibraryView, String> {
+    let root_buf = root_path(&root)?;
+    let mut config = load_library_config(&root_buf);
+    config.ocr_word_threshold = Some(word_threshold);
+    config.ocr_area_threshold = Some(area_threshold.clamp(0.0, 1.0));
+    reclassify_text_categories(&mut config);
+    save_library_config(&root_buf, &config)?;
+    scan_and_reconcile(&root_buf)
 }
 
 #[tauri::command]
@@ -565,6 +941,18 @@ fn remove_manual_source_folder(root: String, folder_name: String) -> Result<Libr
     let root = root_path(&root)?;
     let mut config = load_library_config(&root);
     config.manual_source_folders.retain(|item| item != &folder_name);
+    save_library_config(&root, &config)?;
+    scan_and_reconcile(&root)
+}
+
+#[tauri::command]
+fn set_folder_analysis_included(root: String, folder_name: String, included: bool) -> Result<LibraryView, String> {
+    let root = root_path(&root)?;
+    let mut config = load_library_config(&root);
+    config.excluded_analysis_folders.retain(|item| item != &folder_name);
+    if !included {
+        config.excluded_analysis_folders.push(folder_name);
+    }
     save_library_config(&root, &config)?;
     scan_and_reconcile(&root)
 }
@@ -735,17 +1123,355 @@ fn open_root_folder(root: String) -> Result<(), String> {
     launch_path(&path)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NsfwModelInfo {
+    path: String,
+    exists: bool,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NsfwModelDownloadReport {
+    info: NsfwModelInfo,
+    source_url: String,
+    downloaded_bytes: u64,
+    model_bytes: u64,
+    report: Vec<String>,
+}
+
+#[tauri::command]
+fn get_nsfw_model_info(app: AppHandle) -> Result<NsfwModelInfo, String> {
+    nsfw_model_info(&app)
+}
+
+#[tauri::command]
+fn download_nsfw_model(app: AppHandle) -> Result<NsfwModelDownloadReport, String> {
+    if nsfw_model_path(&app).is_some() {
+        return Ok(NsfwModelDownloadReport {
+            info: nsfw_model_info(&app)?,
+            source_url: NUDENET_MODEL_DOWNLOAD_URL.to_string(),
+            downloaded_bytes: 0,
+            model_bytes: 0,
+            report: vec!["Model already exists; no download needed.".to_string()],
+        });
+    }
+
+    let (downloaded_bytes, model_bytes, mut report) = download_nsfw_model_file(&app)?;
+    report.push("Model installed and ready for explicit analysis.".to_string());
+    Ok(NsfwModelDownloadReport {
+        info: nsfw_model_info(&app)?,
+        source_url: NUDENET_MODEL_DOWNLOAD_URL.to_string(),
+        downloaded_bytes,
+        model_bytes,
+        report,
+    })
+}
+
+fn download_nsfw_model_file(app: &AppHandle) -> Result<(u64, u64, Vec<String>), String> {
+    let target = nsfw_model_download_path(app)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create model directory: {error}"))?;
+    }
+
+    let wheel_path = target.with_extension("whl.download");
+    let model_temp_path = target.with_extension("onnx.download");
+    let mut report = vec![
+        "Source: NudeNet 3.4.2 PyPI wheel.".to_string(),
+        format!("Destination: {}", target.display()),
+    ];
+
+    let response = ureq::get(NUDENET_MODEL_DOWNLOAD_URL)
+        .set("User-Agent", "Image-Categorizer/1.0")
+        .call()
+        .map_err(|error| format!("Failed to download NudeNet package: {error}"))?;
+    let status = response.status();
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("unknown")
+        .to_string();
+    report.push(format!("HTTP status: {status}; content-type: {content_type}"));
+
+    let mut reader = response.into_reader();
+    let mut file = File::create(&wheel_path)
+        .map_err(|error| format!("Failed to create temporary package file: {error}"))?;
+    let bytes = io::copy(&mut reader, &mut file)
+        .map_err(|error| format!("Failed to save NudeNet package: {error}"))?;
+    drop(file);
+    report.push(format!("Downloaded package: {bytes} bytes"));
+
+    if bytes < 1_000_000 {
+        let preview = fs::read(&wheel_path)
+            .ok()
+            .map(|data| String::from_utf8_lossy(&data[..data.len().min(240)]).to_string())
+            .unwrap_or_default();
+        let _ = fs::remove_file(&wheel_path);
+        return Err(format!(
+            "Downloaded NudeNet package was unexpectedly small ({bytes} bytes). HTTP status: {status}; content-type: {content_type}. Response preview: {preview}"
+        ));
+    }
+
+    let wheel_file = File::open(&wheel_path)
+        .map_err(|error| format!("Failed to open downloaded NudeNet package: {error}"))?;
+    let mut archive = zip::ZipArchive::new(wheel_file)
+        .map_err(|error| format!("Downloaded NudeNet package is not a valid wheel archive: {error}"))?;
+    let mut model_entry = archive
+        .by_name("nudenet/320n.onnx")
+        .map_err(|error| format!("NudeNet package did not contain nudenet/320n.onnx: {error}"))?;
+    let mut model_file = File::create(&model_temp_path)
+        .map_err(|error| format!("Failed to create temporary model file: {error}"))?;
+    let model_bytes = io::copy(&mut model_entry, &mut model_file)
+        .map_err(|error| format!("Failed to extract NudeNet model: {error}"))?;
+    drop(model_file);
+    drop(model_entry);
+    drop(archive);
+    report.push(format!("Extracted model: {model_bytes} bytes"));
+
+    if model_bytes < 1_000_000 {
+        let _ = fs::remove_file(&model_temp_path);
+        let _ = fs::remove_file(&wheel_path);
+        return Err(format!("Extracted NudeNet model was unexpectedly small ({model_bytes} bytes)."));
+    }
+
+    fs::rename(&model_temp_path, &target)
+        .map_err(|error| format!("Failed to install NudeNet model: {error}"))?;
+    let _ = fs::remove_file(&wheel_path);
+    Ok((bytes, model_bytes, report))
+}
+
+fn nsfw_model_info(app: &AppHandle) -> Result<NsfwModelInfo, String> {
+    let candidates = nsfw_model_candidates(app)?;
+    let path = nsfw_model_path(app).unwrap_or_else(|| candidates[0].clone());
+    Ok(NsfwModelInfo {
+        exists: path.is_file(),
+        path: path.to_string_lossy().to_string(),
+        candidates: candidates
+            .into_iter()
+            .map(|candidate| candidate.to_string_lossy().to_string())
+            .collect(),
+    })
+}
+
+fn nsfw_model_download_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?
+        .join(NUDENET_MODEL_DOWNLOAD_FILENAME))
+}
+
+fn nsfw_model_candidates(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+
+    let mut dirs = vec![app_data_dir];
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        dirs.push(resource_dir);
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            dirs.push(exe_dir.to_path_buf());
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for dir in dirs {
+        for filename in NUDENET_MODEL_FILENAMES {
+            candidates.push(dir.join(filename));
+        }
+    }
+    Ok(candidates)
+}
+
+fn nsfw_model_path(app: &AppHandle) -> Option<PathBuf> {
+    nsfw_model_candidates(app)
+        .ok()?
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn nsfw_threshold(config: &LibraryConfig) -> f32 {
+    config.nsfw_score_threshold.unwrap_or(DEFAULT_NSFW_THRESHOLD)
+}
+
+fn reclassify_nsfw_categories(config: &mut LibraryConfig) {
+    let any_analyzed = config.images.values().any(|r| r.nsfw_score.is_some());
+    if !any_analyzed {
+        return;
+    }
+    let threshold = nsfw_threshold(config);
+    ensure_category(config, EXPLICIT_CATEGORY);
+
+    for record in config.images.values_mut() {
+        if record.classified_by.as_deref() == Some("manual") {
+            continue;
+        }
+        let Some(score) = record.nsfw_score else {
+            continue;
+        };
+        if score >= threshold {
+            if record.category.as_deref() != Some(EXPLICIT_CATEGORY) {
+                record.category = Some(EXPLICIT_CATEGORY.to_string());
+                record.classified_by = Some("auto-nsfw".to_string());
+                record.classified_at = Some(now_iso());
+            }
+        } else if record.classified_by.as_deref() == Some("auto-nsfw") {
+            // Threshold was raised and image is now below it — release back to auto pipeline
+            record.category = None;
+            record.classified_by = None;
+            record.classified_at = None;
+        }
+    }
+}
+
+fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+    let control = app.state::<NsfwControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let Some(model_path) = nsfw_model_path(app) else {
+            let target = nsfw_model_download_path(app)?;
+            return Ok((
+                "error",
+                Some(format!(
+                    "NudeNet model is not installed. Open Settings, press Download Model, then run explicit analysis again. Target path: {}",
+                    target.display()
+                )),
+            ));
+        };
+
+        let mut session = create_session(&model_path)?;
+        let view = scan_and_reconcile(root_buf)?;
+        let mut config = load_library_config(root_buf);
+        ensure_category(&mut config, EXPLICIT_CATEGORY);
+        let excluded_folders: std::collections::HashSet<String> =
+            config.excluded_analysis_folders.iter().cloned().collect();
+
+        let pending: Vec<(String, String, String)> = view
+            .images
+            .iter()
+            .filter(|img| !excluded_folders.contains(&img.source_folder))
+            .filter(|img| {
+                force
+                    || config
+                        .images
+                        .get(&img.hash)
+                        .map(|r| r.nsfw_score.is_none())
+                        .unwrap_or(true)
+            })
+            .map(|img| (img.hash.clone(), img.path.clone(), img.name.clone()))
+            .collect();
+
+        let total = pending.len();
+        let mut cancelled = false;
+
+        for (index, (hash, path, name)) in pending.iter().enumerate() {
+            if control.cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            match analyze_image_nsfw(&mut session, Path::new(path)) {
+                Ok(stats) => {
+                    if let Some(record) = config.images.get_mut(hash) {
+                        record.nsfw_score = Some(stats.score);
+                        record.nsfw_labels = Some(stats.labels);
+                    }
+                }
+                Err(e) => {
+                    if let Some(record) = config.images.get_mut(hash) {
+                        record.nsfw_score = Some(0.0);
+                        record.nsfw_labels = Some(vec![format!("NSFW analysis error: {e}")]);
+                    }
+                    eprintln!("NSFW analysis failed for {path}: {e}");
+                }
+            }
+            let _ = app.emit(
+                "nsfw-analysis-progress",
+                TextAnalysisProgress {
+                    processed: index + 1,
+                    total,
+                    current_name: name.clone(),
+                },
+            );
+        }
+
+        reclassify_nsfw_categories(&mut config);
+        reclassify_text_categories(&mut config);
+        save_library_config(root_buf, &config)?;
+
+        let message = if total == 0 { Some("No images needed NSFW analysis.".to_string()) } else { None };
+        Ok((if cancelled { "cancelled" } else { "completed" }, message))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+
+    let (status, message) = match result {
+        Ok((s, m)) => (s.to_string(), m),
+        Err(e) => ("error".to_string(), Some(e)),
+    };
+    let _ = app.emit("nsfw-analysis-finished", TextAnalysisFinished { status, message });
+}
+
+#[tauri::command]
+fn analyze_nsfw(app: AppHandle, control: tauri::State<'_, NsfwControl>, root: String, force: bool) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("NSFW analysis is already running.".to_string());
+    }
+    let root_buf = match root_path(&root) {
+        Ok(p) => p,
+        Err(e) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+    let app_handle = app.clone();
+    std::thread::spawn(move || run_nsfw_analysis(&app_handle, &root_buf, force));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_nsfw_analysis(control: tauri::State<'_, NsfwControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No NSFW analysis is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_nsfw_threshold(root: String, threshold: f32) -> Result<LibraryView, String> {
+    let root_buf = root_path(&root)?;
+    let mut config = load_library_config(&root_buf);
+    config.nsfw_score_threshold = Some(threshold.clamp(0.0, 1.0));
+    reclassify_nsfw_categories(&mut config);
+    reclassify_text_categories(&mut config);
+    save_library_config(&root_buf, &config)?;
+    scan_and_reconcile(&root_buf)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(AnalysisControl::default())
+        .manage(NsfwControl::default())
         .invoke_handler(tauri::generate_handler![
             add_manual_source_folder,
+            analyze_nsfw,
+            analyze_text,
             assign_category,
+            cancel_nsfw_analysis,
+            cancel_text_analysis,
             choose_root_folder,
             create_category,
             delete_category,
+            download_nsfw_model,
             get_app_settings,
+            get_nsfw_model_info,
             move_image,
             open_image,
             open_root_folder,
@@ -753,8 +1479,12 @@ pub fn run() {
             rename_category,
             reveal_image,
             scan_library,
+            select_root_folder,
             set_dark_mode,
+            set_folder_analysis_included,
+            set_nsfw_threshold,
             set_source_pattern,
+            set_text_thresholds,
             set_tile_size
         ])
         .run(tauri::generate_context!())

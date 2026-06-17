@@ -41,7 +41,7 @@
         <div class="sidebar-footer">
           <div class="folder-block">
             <div class="folder-label">Root Folder</div>
-            <button class="folder-path" id="root-folder-button" type="button"></button>
+            <select class="folder-path" id="root-folder-select" title="Switch or add a root folder"></select>
           </div>
         </div>
       </aside>
@@ -54,12 +54,46 @@
           </div>
           <div class="top-actions">
             <input id="search-input" class="search-input" type="search" placeholder="Search images">
+            <span id="status-message" class="status-message"></span>
             <select id="sort-select" class="sort-select" title="Sort images">
               <option value="newest">Newest</option>
               <option value="name">Name</option>
               <option value="size">Size</option>
             </select>
-            <button id="refresh-button" class="button" type="button">Rescan</button>
+            <div class="analysis-controls" id="analysis-controls">
+              <span class="analysis-label">Analyze:</span>
+              <label class="analysis-type-check" title="Run OCR text analysis, classifying images as Low Text / High Text">
+                <input type="checkbox" id="analyze-text-check" checked>
+                <span>Text</span>
+              </label>
+              <label class="analysis-type-check" id="analyze-nsfw-check-label" title="Run NudeNet explicit content detection, classifying images as Safe / Explicit">
+                <input type="checkbox" id="analyze-nsfw-check" checked>
+                <span>Explicit</span>
+              </label>
+              <button
+                id="analyze-button"
+                class="button secondary"
+                type="button"
+                title="Analyze images not yet analyzed (for selected types and included folders)"
+              >Analyze New</button>
+              <button
+                id="reanalyze-button"
+                class="button secondary"
+                type="button"
+                title="Re-analyze all images even if already analyzed (for selected types and included folders)"
+              >Re-analyze All</button>
+              <button
+                id="cancel-analysis-button"
+                class="button secondary hidden"
+                type="button"
+              >Cancel</button>
+            </div>
+            <button
+              id="refresh-button"
+              class="button"
+              type="button"
+              title="Rescan: looks for new, moved, or deleted images and refreshes thumbnails. Does not run analysis."
+            >Rescan</button>
             <button id="open-folder-button" class="button secondary" type="button">Open Root</button>
           </div>
         </header>
@@ -134,6 +168,40 @@
           <span class="settings-label">Manual Source Folders</span>
           <div class="manual-folder-list" id="manual-folder-list"></div>
         </label>
+
+        <div class="settings-stack">
+          <span class="settings-label">Text Analysis Thresholds</span>
+          <p class="dialog-hint">
+            Images at or under both thresholds are classified "Low Text"; anything above either
+            threshold is "High Text". Use "Analyze New" with Text checked to apply OCR.
+          </p>
+          <div class="range-row">
+            <input id="ocr-word-threshold-input" type="range" min="0" max="150" step="1">
+            <span id="ocr-word-threshold-value"></span>
+          </div>
+          <div class="range-row">
+            <input id="ocr-area-threshold-input" type="range" min="0" max="50" step="1">
+            <span id="ocr-area-threshold-value"></span>
+          </div>
+        </div>
+
+        <div class="settings-stack">
+          <span class="settings-label">Explicit Analysis Threshold</span>
+          <p class="dialog-hint">
+            Images whose max explicit-content confidence score meets or exceeds this value are
+            classified "Explicit"; all others become "Safe". Lower = more sensitive.
+            Re-classify without re-running by moving the slider — no inference needed.
+          </p>
+          <div class="range-row">
+            <input id="nsfw-threshold-input" type="range" min="15" max="90" step="5">
+            <span id="nsfw-threshold-value"></span>
+          </div>
+          <div class="model-row">
+            <p class="dialog-hint" id="nsfw-model-hint"></p>
+            <button class="button compact secondary hidden" id="download-nsfw-model-button" type="button">Download Model</button>
+          </div>
+          <pre class="download-report hidden" id="nsfw-model-report"></pre>
+        </div>
 
         <label class="settings-stack">
           <span class="settings-label">Tile Size</span>
