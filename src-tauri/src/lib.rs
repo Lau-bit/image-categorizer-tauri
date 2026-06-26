@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use rayon::prelude::*;
 use tauri::{AppHandle, Emitter, Manager};
@@ -1459,6 +1459,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AnalysisControl::default())
         .manage(NsfwControl::default())
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             add_manual_source_folder,
             analyze_nsfw,

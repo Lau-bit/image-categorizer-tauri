@@ -5,12 +5,15 @@ const invoke = tauri?.core?.invoke;
 const dialog = tauri?.dialog;
 const convertFileSrc = tauri?.core?.convertFileSrc;
 const event = tauri?.event;
+const tauriWindow = tauri?.window;
 
-if (!invoke || !dialog || !convertFileSrc || !event) {
+if (!invoke || !dialog || !convertFileSrc || !event || !tauriWindow) {
   console.error('Tauri API is not available.');
 }
 
 window.categorizerAPI = {
+  showWindow: () => tauriWindow?.getCurrentWindow?.()?.show?.(),
+
   getSettings: () => invoke('get_app_settings'),
   setTileSize: tileSize => invoke('set_tile_size', { tileSize }),
   setDarkMode: darkMode => invoke('set_dark_mode', { darkMode }),

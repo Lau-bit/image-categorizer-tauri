@@ -19,7 +19,7 @@
         "decorations": true,
         "backgroundColor": "#101114",
         "resizable": true,
-        "visible": true
+        "visible": false
       }
     ],
     "security": {

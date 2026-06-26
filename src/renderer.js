@@ -670,8 +670,20 @@ async function refreshLibrary() {
 
 async function refreshAll() {
   setStatus('Scanning for new, moved, or deleted images…');
-  await loadSettings();
-  await refreshLibrary();
+  try {
+    await loadSettings();
+    await refreshLibrary();
+  } catch (error) {
+    showToast(errorText(error));
+    state.settings = {
+      lastRoot: null,
+      lastRootExists: false,
+      tileSize: 168,
+      darkMode: true,
+      knownRoots: [],
+    };
+    state.library = null;
+  }
   if (state.currentView === 'category' && !(state.library?.categories || []).some(c => c.name === state.currentCategory)) {
     state.currentView = 'all';
     state.currentCategory = null;
@@ -1329,20 +1341,56 @@ function installEvents() {
   });
 }
 
+let windowShown = false;
+
+function showWindowAfterPaint() {
+  if (windowShown) return;
+  windowShown = true;
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      window.categorizerAPI.showWindow?.()?.catch?.(error => {
+        console.warn('Failed to show main window:', error);
+      });
+    });
+  });
+}
+
+async function installAnalysisListeners() {
+  const listeners = [
+    window.categorizerAPI.onTextAnalysisProgress(({ processed, total, currentName }) => {
+      setStatus(`Text: ${processed}/${total} — ${currentName}`);
+    }),
+    window.categorizerAPI.onTextAnalysisFinished(payload => onAnalysisFinished('text', payload)),
+    window.categorizerAPI.onNsfwAnalysisProgress(({ processed, total, currentName }) => {
+      setStatus(`Explicit: ${processed}/${total} — ${currentName}`);
+    }),
+    window.categorizerAPI.onNsfwAnalysisFinished(payload => onAnalysisFinished('nsfw', payload)),
+  ];
+
+  const results = await Promise.allSettled(listeners);
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.warn('Failed to install analysis listener:', result.reason);
+    }
+  }
+}
+
 async function init() {
-  installEvents();
+  try {
+    installEvents();
+    render();
+    showWindowAfterPaint();
 
-  await window.categorizerAPI.onTextAnalysisProgress(({ processed, total, currentName }) => {
-    setStatus(`Text: ${processed}/${total} — ${currentName}`);
-  });
-  await window.categorizerAPI.onTextAnalysisFinished(payload => onAnalysisFinished('text', payload));
-
-  await window.categorizerAPI.onNsfwAnalysisProgress(({ processed, total, currentName }) => {
-    setStatus(`Explicit: ${processed}/${total} — ${currentName}`);
-  });
-  await window.categorizerAPI.onNsfwAnalysisFinished(payload => onAnalysisFinished('nsfw', payload));
-
-  await refreshAll();
+    await installAnalysisListeners();
+    await refreshAll();
+  } catch (error) {
+    console.error('Startup failed:', error);
+    setStatus('Startup hit an error. Choose or rescan a folder to retry.');
+    showToast(errorText(error));
+    render();
+    showWindowAfterPaint();
+  }
 }
 
 init();
