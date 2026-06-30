@@ -45,6 +45,7 @@ const els = {
   cancelAnalysisButton: document.getElementById('cancel-analysis-button'),
   analyzeTextCheck: document.getElementById('analyze-text-check'),
   analyzeNsfwCheck: document.getElementById('analyze-nsfw-check'),
+  extractTextCheck: document.getElementById('extract-text-check'),
   analyzeNsfwCheckLabel: document.getElementById('analyze-nsfw-check-label'),
   openFolderButton: document.getElementById('open-folder-button'),
   settingsButton: document.getElementById('settings-button'),
@@ -487,6 +488,12 @@ function analysisSummary(image) {
     lines.push(`Text: ${image.ocrWordCount} words · ${percent(image.ocrTextAreaRatio)} area`);
   } else {
     lines.push('Text: not analyzed');
+  }
+
+  if (image.ocrTextChars != null) {
+    lines.push(image.ocrTextChars > 0
+      ? `Extracted text: ${image.ocrTextChars} chars saved`
+      : 'Extracted text: no text found');
   }
 
   if (image.classifiedBy) {
@@ -954,7 +961,9 @@ function setInteractionsLocked(locked) {
 }
 
 function analysisTypeLabel(type) {
-  return type === 'nsfw' ? 'Explicit' : 'Text';
+  if (type === 'nsfw') return 'Explicit';
+  if (type === 'ocr') return 'Extract Text';
+  return 'Text';
 }
 
 async function runNextInQueue() {
@@ -984,6 +993,8 @@ async function runNextInQueue() {
   try {
     if (type === 'text') {
       await window.categorizerAPI.analyzeText(state.library.root, force);
+    } else if (type === 'ocr') {
+      await window.categorizerAPI.extractText(state.library.root, force);
     } else {
       await window.categorizerAPI.analyzeNsfw(state.library.root, force);
     }
@@ -1001,7 +1012,8 @@ async function startAnalysis(force) {
   }
   const wantText = els.analyzeTextCheck.checked;
   const wantNsfw = els.analyzeNsfwCheck.checked;
-  if (!wantText && !wantNsfw) {
+  const wantOcr = els.extractTextCheck.checked;
+  if (!wantText && !wantNsfw && !wantOcr) {
     showToast('Select at least one analysis type.');
     return;
   }
@@ -1009,6 +1021,7 @@ async function startAnalysis(force) {
   state.analysisQueue = [];
   if (wantNsfw) state.analysisQueue.push({ type: 'nsfw', force });
   if (wantText) state.analysisQueue.push({ type: 'text', force });
+  if (wantOcr) state.analysisQueue.push({ type: 'ocr', force });
 
   setInteractionsLocked(true);
   await runNextInQueue();
@@ -1022,6 +1035,8 @@ async function cancelCurrentAnalysis() {
       await window.categorizerAPI.cancelTextAnalysis();
     } else if (state.analysisRunning === 'nsfw') {
       await window.categorizerAPI.cancelNsfwAnalysis();
+    } else if (state.analysisRunning === 'ocr') {
+      await window.categorizerAPI.cancelTextExtraction();
     }
     setStatus('Cancelling…');
   } catch (error) {
@@ -1366,6 +1381,10 @@ async function installAnalysisListeners() {
       setStatus(`Explicit: ${processed}/${total} — ${currentName}`);
     }),
     window.categorizerAPI.onNsfwAnalysisFinished(payload => onAnalysisFinished('nsfw', payload)),
+    window.categorizerAPI.onTextExtractionProgress(({ processed, total, currentName }) => {
+      setStatus(`Extract Text: ${processed}/${total} — ${currentName}`);
+    }),
+    window.categorizerAPI.onTextExtractionFinished(payload => onAnalysisFinished('ocr', payload)),
   ];
 
   const results = await Promise.allSettled(listeners);

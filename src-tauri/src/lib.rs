@@ -17,7 +17,7 @@ mod nsfw;
 use nsfw::{analyze_image_nsfw, create_session};
 
 mod ocr;
-use ocr::analyze_image_text;
+use ocr::{analyze_image_text, extract_image_text};
 
 mod thumbnails;
 use thumbnails::{ensure_thumbnail, THUMBNAIL_DIR_NAME};
@@ -26,6 +26,10 @@ const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const MAX_SCAN_DEPTH: usize = 4;
 const HASH_SAMPLE_BYTES: usize = 65536;
+
+// Extracted OCR text is written here, one `<hash>.txt` per image, so the folder stays stable
+// across renames/moves and dedupes identical images — same keying scheme as the thumbnail cache.
+const OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
 
 const DEFAULT_OCR_WORD_THRESHOLD: u32 = 35;
 const DEFAULT_OCR_AREA_THRESHOLD: f32 = 0.05;
@@ -59,6 +63,11 @@ struct ImageRecord {
     classified_at: Option<String>,
     ocr_word_count: Option<u32>,
     ocr_text_area_ratio: Option<f32>,
+    // Number of characters of OCR text extracted to the sidecar text folder. `Some` (including
+    // `Some(0)` for images with no text) marks the image as already extracted; `None` means it
+    // still needs an extraction pass — mirrors the "already done" gating of the other scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ocr_text_chars: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nsfw_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +145,7 @@ struct ImageView {
     classified_at: Option<String>,
     ocr_word_count: Option<u32>,
     ocr_text_area_ratio: Option<f32>,
+    ocr_text_chars: Option<u32>,
     nsfw_score: Option<f32>,
     nsfw_labels: Option<Vec<String>>,
 }
@@ -178,6 +188,12 @@ struct AnalysisControl {
 
 #[derive(Default)]
 struct NsfwControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
+struct OcrTextControl {
     running: AtomicBool,
     cancel: AtomicBool,
 }
@@ -577,6 +593,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
             classified_at: None,
             ocr_word_count: None,
             ocr_text_area_ratio: None,
+            ocr_text_chars: None,
             nsfw_score: None,
             nsfw_labels: None,
         });
@@ -624,6 +641,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
             classified_at: record.classified_at,
             ocr_word_count: record.ocr_word_count,
             ocr_text_area_ratio: record.ocr_text_area_ratio,
+            ocr_text_chars: record.ocr_text_chars,
             nsfw_score: record.nsfw_score,
             nsfw_labels: record.nsfw_labels,
         });
@@ -909,6 +927,129 @@ fn set_text_thresholds(root: String, word_threshold: u32, area_threshold: f32) -
     reclassify_text_categories(&mut config);
     save_library_config(&root_buf, &config)?;
     scan_and_reconcile(&root_buf)
+}
+
+#[tauri::command]
+fn extract_text(app: AppHandle, control: tauri::State<'_, OcrTextControl>, root: String, force: bool) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Text extraction is already running.".to_string());
+    }
+
+    let root_buf = match root_path(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        run_text_extraction(&app_handle, &root_buf, force);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_text_extraction(control: tauri::State<'_, OcrTextControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No text extraction is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+// Runs on a detached background thread, mirroring `run_text_analysis`/`run_nsfw_analysis`: it only
+// touches the images present at scan time, skips already-extracted images unless `force`, honours
+// excluded folders, and reports progress through the `text-extraction-*` events. Each image's
+// recognized text is written to `<root>/.image-categorizer-ocr-text/<hash>.txt`.
+fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
+    let control = app.state::<OcrTextControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let view = scan_and_reconcile(root_buf)?;
+        let mut config = load_library_config(root_buf);
+        let excluded_folders: std::collections::HashSet<String> =
+            config.excluded_analysis_folders.iter().cloned().collect();
+
+        let text_dir = root_buf.join(OCR_TEXT_DIR_NAME);
+        fs::create_dir_all(&text_dir)
+            .map_err(|error| format!("Failed to create text folder: {error}"))?;
+
+        let included_folder_exists = view
+            .source_folders
+            .iter()
+            .any(|folder| !excluded_folders.contains(&folder.name));
+        if !view.source_folders.is_empty() && !included_folder_exists {
+            return Ok(("completed", Some("No source folders are included in extraction.".to_string())));
+        }
+
+        let pending: Vec<(String, String, String)> = view
+            .images
+            .iter()
+            .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| {
+                force
+                    || config
+                        .images
+                        .get(&image.hash)
+                        .map(|record| record.ocr_text_chars.is_none())
+                        .unwrap_or(true)
+            })
+            .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
+            .collect();
+
+        let total = pending.len();
+        let mut cancelled = false;
+
+        for (index, (hash, path, name)) in pending.iter().enumerate() {
+            if control.cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+
+            match extract_image_text(Path::new(path)) {
+                Ok(text) => {
+                    let text_path = text_dir.join(format!("{hash}.txt"));
+                    match fs::write(&text_path, &text) {
+                        Ok(()) => {
+                            if let Some(record) = config.images.get_mut(hash) {
+                                record.ocr_text_chars = Some(text.chars().count() as u32);
+                            }
+                        }
+                        Err(error) => eprintln!("Failed to save OCR text for {path}: {error}"),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Text extraction failed for {path}: {error}");
+                }
+            }
+
+            let _ = app.emit(
+                "text-extraction-progress",
+                TextAnalysisProgress {
+                    processed: index + 1,
+                    total,
+                    current_name: name.clone(),
+                },
+            );
+        }
+
+        save_library_config(root_buf, &config)?;
+
+        let message = if total == 0 { Some("No images needed text extraction.".to_string()) } else { None };
+        Ok((if cancelled { "cancelled" } else { "completed" }, message))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("text-extraction-finished", TextAnalysisFinished { status, message });
 }
 
 #[tauri::command]
@@ -1459,6 +1600,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AnalysisControl::default())
         .manage(NsfwControl::default())
+        .manage(OcrTextControl::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -1476,10 +1618,12 @@ pub fn run() {
             assign_category,
             cancel_nsfw_analysis,
             cancel_text_analysis,
+            cancel_text_extraction,
             choose_root_folder,
             create_category,
             delete_category,
             download_nsfw_model,
+            extract_text,
             get_app_settings,
             get_nsfw_model_info,
             move_image,

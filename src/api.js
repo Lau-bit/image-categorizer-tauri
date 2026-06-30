@@ -33,6 +33,12 @@ window.categorizerAPI = {
   onTextAnalysisProgress: callback => event.listen('text-analysis-progress', message => callback(message.payload)),
   onTextAnalysisFinished: callback => event.listen('text-analysis-finished', message => callback(message.payload)),
 
+  // OCR text extraction (saves recognized text to a sidecar folder)
+  extractText: (root, force) => invoke('extract_text', { root, force }),
+  cancelTextExtraction: () => invoke('cancel_text_extraction'),
+  onTextExtractionProgress: callback => event.listen('text-extraction-progress', message => callback(message.payload)),
+  onTextExtractionFinished: callback => event.listen('text-extraction-finished', message => callback(message.payload)),
+
   // NSFW (explicit content) analysis
   analyzeNsfw: (root, force) => invoke('analyze_nsfw', { root, force }),
   cancelNsfwAnalysis: () => invoke('cancel_nsfw_analysis'),

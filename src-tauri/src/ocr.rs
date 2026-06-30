@@ -3,7 +3,7 @@ use std::path::Path;
 
 use windows::core::HSTRING;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
-use windows::Media::Ocr::OcrEngine;
+use windows::Media::Ocr::{OcrEngine, OcrResult};
 use windows::Storage::{FileAccessMode, StorageFile};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows_future::{AsyncStatus, IAsyncOperation};
@@ -39,7 +39,10 @@ fn ensure_com_initialized() {
     });
 }
 
-pub fn analyze_image_text(path: &Path) -> Result<OcrStats, String> {
+// Decodes `path`, runs the Windows OCR engine over it, and returns the recognition result along
+// with the image's pixel area. Shared by both the text-classification stats pass and the full
+// text-extraction pass so the heavy decode/recognize path lives in exactly one place.
+fn recognize(path: &Path) -> Result<(OcrResult, f32), String> {
     ensure_com_initialized();
 
     let path_str = path.to_string_lossy().to_string();
@@ -87,6 +90,40 @@ pub fn analyze_image_text(path: &Path) -> Result<OcrStats, String> {
             .map_err(|error| format!("OCR recognition failed: {error}"))?,
     )
     .map_err(|error| format!("OCR recognition failed: {error}"))?;
+
+    Ok((result, image_area))
+}
+
+/// Reads back the full recognized text of an image, one OCR line per output line. Returns an
+/// empty string when the engine found no text. Used by the text-extraction pass.
+pub fn extract_image_text(path: &Path) -> Result<String, String> {
+    let (result, _image_area) = recognize(path)?;
+
+    let lines = result
+        .Lines()
+        .map_err(|error| format!("Failed to read OCR lines: {error}"))?;
+    let line_count = lines
+        .Size()
+        .map_err(|error| format!("Failed to read OCR lines: {error}"))?;
+
+    let mut out = String::new();
+    for line_index in 0..line_count {
+        let line = lines
+            .GetAt(line_index)
+            .map_err(|error| format!("Failed to read OCR line: {error}"))?;
+        let text = line
+            .Text()
+            .map_err(|error| format!("Failed to read OCR line text: {error}"))?;
+        if line_index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&text.to_string_lossy());
+    }
+    Ok(out)
+}
+
+pub fn analyze_image_text(path: &Path) -> Result<OcrStats, String> {
+    let (result, image_area) = recognize(path)?;
 
     let lines = result
         .Lines()
