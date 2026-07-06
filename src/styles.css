@@ -633,6 +633,42 @@ body.pointer-dragging {
 
 .settings-dialog {
   width: min(620px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 48px));
+  overflow-y: auto;
+}
+
+#auto-refresh-options {
+  display: grid;
+  gap: 10px;
+}
+
+#auto-refresh-options.disabled-section {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.auto-refresh-root-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.auto-refresh-root-row input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.auto-refresh-root-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dialog::backdrop {

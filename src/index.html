@@ -220,6 +220,61 @@
           <span>Dark mode</span>
         </label>
 
+        <div class="settings-stack">
+          <span class="settings-label">Automatic Daily Refresh</span>
+          <p class="dialog-hint">
+            Runs a rescan (and, if selected, analysis) once a day via Windows Task Scheduler, even
+            if the app isn't open — so the library is already up to date next time you open it.
+            While it runs, a tray icon appears; right-click it and choose "Cancel refresh" to stop
+            immediately, e.g. before a demanding game.
+          </p>
+
+          <label class="check-row">
+            <input id="auto-refresh-enabled-input" type="checkbox">
+            <span>Enable daily automatic refresh</span>
+          </label>
+
+          <div id="auto-refresh-options">
+            <label class="settings-stack">
+              <span class="settings-label">Run time</span>
+              <input id="auto-refresh-time-input" class="dialog-input" type="time" step="60">
+            </label>
+
+            <label class="settings-stack">
+              <span class="settings-label">Folders to refresh</span>
+              <div class="manual-folder-list" id="auto-refresh-root-list"></div>
+            </label>
+
+            <div class="settings-stack">
+              <span class="settings-label">What to run</span>
+              <label class="check-row">
+                <input id="auto-refresh-nsfw-input" type="checkbox">
+                <span>Explicit content analysis</span>
+              </label>
+              <label class="check-row">
+                <input id="auto-refresh-text-analysis-input" type="checkbox">
+                <span>Text analysis (Low/High Text)</span>
+              </label>
+              <label class="check-row">
+                <input id="auto-refresh-text-extraction-input" type="checkbox">
+                <span>Extract OCR text</span>
+              </label>
+            </div>
+
+            <label class="check-row">
+              <input id="auto-refresh-low-priority-input" type="checkbox">
+              <span>Run at low OS priority (recommended — avoids competing with games/other apps)</span>
+            </label>
+
+            <label class="check-row">
+              <input id="auto-refresh-toast-input" type="checkbox">
+              <span>Show a notification when it starts and finishes</span>
+            </label>
+
+            <p class="settings-value" id="auto-refresh-status"></p>
+          </div>
+        </div>
+
         <div class="dialog-actions">
           <button class="button" value="default" type="submit">Done</button>
         </div>

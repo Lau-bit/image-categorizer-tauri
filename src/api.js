@@ -18,6 +18,10 @@ window.categorizerAPI = {
   setTileSize: tileSize => invoke('set_tile_size', { tileSize }),
   setDarkMode: darkMode => invoke('set_dark_mode', { darkMode }),
 
+  // Automatic daily refresh (headless, Task-Scheduler-driven)
+  getAutoRefreshSettings: () => invoke('get_auto_refresh_settings'),
+  setAutoRefreshSettings: settings => invoke('set_auto_refresh_settings', settings),
+
   scanLibrary: root => invoke('scan_library', { root }),
   setSourcePattern: (root, preset, regex) => invoke('set_source_pattern', { root, preset, regex }),
   addManualSourceFolder: (root, folderPath) => invoke('add_manual_source_folder', { root, folderPath }),

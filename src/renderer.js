@@ -19,6 +19,7 @@ const state = {
   analyzing: false,
   analysisQueue: [],   // [{type: 'text'|'nsfw', force: bool}]
   analysisRunning: null, // 'text' | 'nsfw' | null
+  autoRefresh: null,
 };
 
 const els = {
@@ -81,6 +82,16 @@ const els = {
   nsfwModelHint: document.getElementById('nsfw-model-hint'),
   downloadNsfwModelButton: document.getElementById('download-nsfw-model-button'),
   nsfwModelReport: document.getElementById('nsfw-model-report'),
+  autoRefreshEnabledInput: document.getElementById('auto-refresh-enabled-input'),
+  autoRefreshOptions: document.getElementById('auto-refresh-options'),
+  autoRefreshTimeInput: document.getElementById('auto-refresh-time-input'),
+  autoRefreshRootList: document.getElementById('auto-refresh-root-list'),
+  autoRefreshNsfwInput: document.getElementById('auto-refresh-nsfw-input'),
+  autoRefreshTextAnalysisInput: document.getElementById('auto-refresh-text-analysis-input'),
+  autoRefreshTextExtractionInput: document.getElementById('auto-refresh-text-extraction-input'),
+  autoRefreshLowPriorityInput: document.getElementById('auto-refresh-low-priority-input'),
+  autoRefreshToastInput: document.getElementById('auto-refresh-toast-input'),
+  autoRefreshStatus: document.getElementById('auto-refresh-status'),
   toast: document.getElementById('toast'),
 };
 
@@ -234,6 +245,94 @@ async function downloadNsfwModel() {
       'No model was installed. You can try Download Model again.',
     ].join('\n');
     showToast(message);
+  }
+}
+
+function formatAutoRefreshStatus(autoRefresh) {
+  if (!autoRefresh) return '';
+  const parts = [];
+  parts.push(autoRefresh.taskInstalled ? 'Scheduled task: installed.' : 'Scheduled task: not installed.');
+  if (autoRefresh.lastRunAt) {
+    parts.push(`Last run: ${formatDate(Date.parse(autoRefresh.lastRunAt))} — ${autoRefresh.lastRunSummary || ''}`);
+  } else {
+    parts.push('Last run: never.');
+  }
+  return parts.join(' ');
+}
+
+function renderAutoRefreshRootList() {
+  const knownRoots = state.settings?.knownRoots || [];
+  const selected = new Set(state.autoRefresh?.roots || []);
+  els.autoRefreshRootList.innerHTML = '';
+  if (!knownRoots.length) {
+    const empty = document.createElement('div');
+    empty.className = 'manual-folder-empty';
+    empty.textContent = 'No known root folders yet — choose a root folder first.';
+    els.autoRefreshRootList.append(empty);
+    return;
+  }
+  for (const entry of knownRoots) {
+    const row = document.createElement('label');
+    row.className = 'auto-refresh-root-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = entry.path;
+    checkbox.checked = selected.has(entry.path);
+    checkbox.addEventListener('change', saveAutoRefreshSettings);
+    const label = document.createElement('span');
+    label.textContent = entry.path;
+    label.title = entry.path;
+    row.append(checkbox, label);
+    els.autoRefreshRootList.append(row);
+  }
+}
+
+function syncAutoRefreshDialog() {
+  const autoRefresh = state.autoRefresh;
+  if (!autoRefresh) return;
+  els.autoRefreshEnabledInput.checked = autoRefresh.enabled;
+  els.autoRefreshTimeInput.value = autoRefresh.time;
+  els.autoRefreshNsfwInput.checked = autoRefresh.runNsfw;
+  els.autoRefreshTextAnalysisInput.checked = autoRefresh.runTextAnalysis;
+  els.autoRefreshTextExtractionInput.checked = autoRefresh.runTextExtraction;
+  els.autoRefreshLowPriorityInput.checked = autoRefresh.lowPriority;
+  els.autoRefreshToastInput.checked = autoRefresh.toast;
+  els.autoRefreshOptions.classList.toggle('disabled-section', !autoRefresh.enabled);
+  els.autoRefreshStatus.textContent = formatAutoRefreshStatus(autoRefresh);
+  renderAutoRefreshRootList();
+}
+
+async function loadAutoRefreshSettings() {
+  try {
+    state.autoRefresh = await window.categorizerAPI.getAutoRefreshSettings();
+  } catch (error) {
+    state.autoRefresh = null;
+    showToast(errorText(error));
+  }
+  syncAutoRefreshDialog();
+}
+
+function collectCheckedAutoRefreshRoots() {
+  return [...els.autoRefreshRootList.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+}
+
+async function saveAutoRefreshSettings() {
+  const payload = {
+    enabled: els.autoRefreshEnabledInput.checked,
+    time: els.autoRefreshTimeInput.value || '04:00',
+    roots: collectCheckedAutoRefreshRoots(),
+    runNsfw: els.autoRefreshNsfwInput.checked,
+    runTextAnalysis: els.autoRefreshTextAnalysisInput.checked,
+    runTextExtraction: els.autoRefreshTextExtractionInput.checked,
+    lowPriority: els.autoRefreshLowPriorityInput.checked,
+    toast: els.autoRefreshToastInput.checked,
+  };
+  els.autoRefreshOptions.classList.toggle('disabled-section', !payload.enabled);
+  try {
+    state.autoRefresh = await window.categorizerAPI.setAutoRefreshSettings(payload);
+    els.autoRefreshStatus.textContent = formatAutoRefreshStatus(state.autoRefresh);
+  } catch (error) {
+    showToast(errorText(error));
   }
 }
 
@@ -810,6 +909,7 @@ async function submitMove() {
 function openSettingsDialog() {
   syncSettingsDialog();
   syncNsfwModelHint();
+  loadAutoRefreshSettings();
   els.settingsDialog.showModal();
 }
 
@@ -1341,6 +1441,13 @@ function installEvents() {
   els.nsfwThresholdInput.addEventListener('input', syncNsfwThresholdLabel);
   els.nsfwThresholdInput.addEventListener('change', saveNsfwThreshold);
   els.downloadNsfwModelButton.addEventListener('click', downloadNsfwModel);
+  els.autoRefreshEnabledInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshTimeInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshNsfwInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshTextAnalysisInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshTextExtractionInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshLowPriorityInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshToastInput.addEventListener('change', saveAutoRefreshSettings);
 
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') {

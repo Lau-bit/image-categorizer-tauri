@@ -5,13 +5,20 @@ use std::{
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, Read},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use rayon::prelude::*;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::TrayIconBuilder,
+    AppHandle, Emitter, Manager,
+};
+use tauri_plugin_notification::NotificationExt;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS};
 
 mod nsfw;
 use nsfw::{analyze_image_nsfw, create_session};
@@ -44,6 +51,14 @@ const NUDENET_MODEL_DOWNLOAD_URL: &str =
 const NUDENET_MODEL_DOWNLOAD_FILENAME: &str = "320n.onnx";
 const NUDENET_MODEL_FILENAMES: &[&str] = &["320n.onnx", "nudenet-320n.onnx", "nudenet.onnx"];
 
+// Passed on the command line by the Windows Task Scheduler entry that `set_auto_refresh_settings`
+// installs/removes. When present, `run()` skips creating any window entirely (see `run_headless_refresh`)
+// so the nightly job never flashes UI or fights the GUI's own startup scan for the sidecar file.
+const HEADLESS_REFRESH_ARG: &str = "--headless-refresh";
+const AUTO_REFRESH_TASK_NAME: &str = "ImageCategorizerAutoRefresh";
+const DEFAULT_AUTO_REFRESH_TIME: &str = "04:00";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
@@ -52,6 +67,18 @@ struct AppSettings {
     dark_mode: Option<bool>,
     #[serde(default)]
     known_roots: Vec<String>,
+    #[serde(default)]
+    auto_refresh_enabled: bool,
+    auto_refresh_time: Option<String>,
+    #[serde(default)]
+    auto_refresh_roots: Vec<String>,
+    auto_refresh_nsfw: Option<bool>,
+    auto_refresh_text_analysis: Option<bool>,
+    auto_refresh_text_extraction: Option<bool>,
+    auto_refresh_low_priority: Option<bool>,
+    auto_refresh_toast: Option<bool>,
+    last_auto_refresh_at: Option<String>,
+    last_auto_refresh_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -110,6 +137,22 @@ struct AppSettingsView {
 struct KnownRootView {
     path: String,
     exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoRefreshSettingsView {
+    enabled: bool,
+    time: String,
+    roots: Vec<String>,
+    run_nsfw: bool,
+    run_text_analysis: bool,
+    run_text_extraction: bool,
+    low_priority: bool,
+    toast: bool,
+    task_installed: bool,
+    last_run_at: Option<String>,
+    last_run_summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1594,21 +1637,306 @@ fn set_nsfw_threshold(root: String, threshold: f32) -> Result<LibraryView, Strin
     scan_and_reconcile(&root_buf)
 }
 
+fn validate_time_of_day(value: &str) -> Result<String, String> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [hour_str, minute_str] = parts[..] else {
+        return Err("Time must be in HH:MM format.".to_string());
+    };
+    let hour: u32 = hour_str.parse().map_err(|_| "Invalid hour.".to_string())?;
+    let minute: u32 = minute_str.parse().map_err(|_| "Invalid minute.".to_string())?;
+    if hour > 23 || minute > 59 {
+        return Err("Time must be between 00:00 and 23:59.".to_string());
+    }
+    Ok(format!("{hour:02}:{minute:02}"))
+}
+
+// Installs, updates, or removes the daily Windows Task Scheduler entry that reinvokes this same
+// exe with `--headless-refresh`. The task is authoritative only for *when* the job fires — the
+// job itself re-reads `auto_refresh_enabled` on every run and no-ops if it's off, so disabling the
+// feature in Settings is always the final word even if the scheduled task somehow survives.
+fn configure_scheduled_task(enabled: bool, time: &str) -> Result<(), String> {
+    if !enabled {
+        let _ = Command::new("schtasks")
+            .args(["/Delete", "/F", "/TN", AUTO_REFRESH_TASK_NAME])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().map_err(|error| format!("Failed to resolve executable path: {error}"))?;
+    let tr_value = format!("\"{}\" {HEADLESS_REFRESH_ARG}", exe.to_string_lossy());
+    let status = Command::new("schtasks")
+        .arg("/Create")
+        .arg("/F")
+        .arg("/SC")
+        .arg("DAILY")
+        .arg("/ST")
+        .arg(time)
+        .arg("/TN")
+        .arg(AUTO_REFRESH_TASK_NAME)
+        .arg("/TR")
+        .arg(&tr_value)
+        .arg("/RL")
+        .arg("LIMITED")
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+    if !status.success() {
+        return Err("schtasks failed to create the scheduled task.".to_string());
+    }
+    Ok(())
+}
+
+fn scheduled_task_installed() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", AUTO_REFRESH_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
+    let settings = load_app_settings(app);
+    AutoRefreshSettingsView {
+        enabled: settings.auto_refresh_enabled,
+        time: settings.auto_refresh_time.unwrap_or_else(|| DEFAULT_AUTO_REFRESH_TIME.to_string()),
+        roots: settings.auto_refresh_roots,
+        run_nsfw: settings.auto_refresh_nsfw.unwrap_or(true),
+        run_text_analysis: settings.auto_refresh_text_analysis.unwrap_or(true),
+        run_text_extraction: settings.auto_refresh_text_extraction.unwrap_or(false),
+        low_priority: settings.auto_refresh_low_priority.unwrap_or(true),
+        toast: settings.auto_refresh_toast.unwrap_or(true),
+        task_installed: scheduled_task_installed(),
+        last_run_at: settings.last_auto_refresh_at,
+        last_run_summary: settings.last_auto_refresh_summary,
+    }
+}
+
+#[tauri::command]
+fn get_auto_refresh_settings(app: AppHandle) -> AutoRefreshSettingsView {
+    auto_refresh_settings_view(&app)
+}
+
+#[tauri::command]
+fn set_auto_refresh_settings(
+    app: AppHandle,
+    enabled: bool,
+    time: String,
+    roots: Vec<String>,
+    run_nsfw: bool,
+    run_text_analysis: bool,
+    run_text_extraction: bool,
+    low_priority: bool,
+    toast: bool,
+) -> Result<AutoRefreshSettingsView, String> {
+    let time = validate_time_of_day(&time)?;
+    let mut settings = load_app_settings(&app);
+    settings.auto_refresh_enabled = enabled;
+    settings.auto_refresh_time = Some(time.clone());
+    settings.auto_refresh_roots = roots;
+    settings.auto_refresh_nsfw = Some(run_nsfw);
+    settings.auto_refresh_text_analysis = Some(run_text_analysis);
+    settings.auto_refresh_text_extraction = Some(run_text_extraction);
+    settings.auto_refresh_low_priority = Some(low_priority);
+    settings.auto_refresh_toast = Some(toast);
+    save_app_settings(&app, &settings)?;
+    configure_scheduled_task(enabled, &time)?;
+    Ok(auto_refresh_settings_view(&app))
+}
+
+// Lowers the whole process to below-normal OS scheduling priority so a nightly backlog yields
+// CPU to anything running in the foreground (a game, encoding, etc.) instead of competing for it.
+fn lower_process_priority() {
+    unsafe {
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+// Caps the rayon global pool at half the logical cores (rather than the all-cores default) so the
+// thumbnail pass can't fully saturate the machine during a background refresh.
+fn capped_thread_count() -> usize {
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    (available / 2).max(1)
+}
+
+// Entry point for `--headless-refresh`, run from `setup()` on its own thread while the (windowless)
+// event loop runs on the main thread to keep the tray icon's Cancel menu responsive. Sequentially
+// reconciles + analyzes every opted-in root, honouring the same per-pass toggles as the GUI's
+// "Analyze New" controls, then persists a summary and exits the process.
+fn run_headless_refresh(app: &AppHandle) {
+    let settings = load_app_settings(app);
+
+    if !settings.auto_refresh_enabled {
+        eprintln!("Auto-refresh is disabled in settings; exiting.");
+        app.exit(0);
+        return;
+    }
+
+    let roots: Vec<String> = settings
+        .auto_refresh_roots
+        .iter()
+        .filter(|root| Path::new(root).is_dir())
+        .cloned()
+        .collect();
+    if roots.is_empty() {
+        eprintln!("No auto-refresh folders configured; exiting.");
+        app.exit(0);
+        return;
+    }
+
+    if settings.auto_refresh_low_priority.unwrap_or(true) {
+        lower_process_priority();
+    }
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(capped_thread_count()).build_global();
+
+    let show_toast = settings.auto_refresh_toast.unwrap_or(true);
+    if show_toast {
+        let _ = app
+            .notification()
+            .builder()
+            .title("Image Categorizer")
+            .body(format!(
+                "Nightly refresh starting for {} folder{}. Right-click the tray icon to cancel.",
+                roots.len(),
+                if roots.len() == 1 { "" } else { "s" }
+            ))
+            .show();
+    }
+
+    let run_nsfw = settings.auto_refresh_nsfw.unwrap_or(true);
+    let run_text_analysis_pass = settings.auto_refresh_text_analysis.unwrap_or(true);
+    let run_text_extraction_pass = settings.auto_refresh_text_extraction.unwrap_or(false);
+
+    let total_roots = roots.len();
+    let mut folders_done = 0usize;
+    let mut cancelled = false;
+
+    for root in &roots {
+        let root_buf = PathBuf::from(root);
+        if scan_and_reconcile(&root_buf).is_err() {
+            continue;
+        }
+
+        if run_nsfw && !cancelled {
+            let control = app.state::<NsfwControl>();
+            control.running.store(true, Ordering::SeqCst);
+            control.cancel.store(false, Ordering::SeqCst);
+            run_nsfw_analysis(app, &root_buf, false);
+            if app.state::<NsfwControl>().cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+            }
+        }
+        if run_text_analysis_pass && !cancelled {
+            let control = app.state::<AnalysisControl>();
+            control.running.store(true, Ordering::SeqCst);
+            control.cancel.store(false, Ordering::SeqCst);
+            run_text_analysis(app, &root_buf, false);
+            if app.state::<AnalysisControl>().cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+            }
+        }
+        if run_text_extraction_pass && !cancelled {
+            let control = app.state::<OcrTextControl>();
+            control.running.store(true, Ordering::SeqCst);
+            control.cancel.store(false, Ordering::SeqCst);
+            run_text_extraction(app, &root_buf, false);
+            if app.state::<OcrTextControl>().cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+            }
+        }
+
+        folders_done += 1;
+        if cancelled {
+            break;
+        }
+    }
+
+    let summary = if cancelled {
+        format!(
+            "Cancelled after {folders_done} of {total_roots} folder{}.",
+            if total_roots == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("Completed {folders_done} folder{}.", if folders_done == 1 { "" } else { "s" })
+    };
+
+    let mut settings = load_app_settings(app);
+    settings.last_auto_refresh_at = Some(now_iso());
+    settings.last_auto_refresh_summary = Some(summary.clone());
+    let _ = save_app_settings(app, &settings);
+
+    if show_toast {
+        let _ = app
+            .notification()
+            .builder()
+            .title("Image Categorizer")
+            .body(format!("Nightly refresh: {summary}"))
+            .show();
+    }
+
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let headless_refresh = std::env::args().any(|arg| arg == HEADLESS_REFRESH_ARG);
+
+    // In headless mode, drop the declarative "main" window from the generated config entirely —
+    // rather than merely skipping `.show()` on it — because the frontend's own startup script
+    // (`renderer.js`'s `init()`) unconditionally shows the window and kicks off its own scan of
+    // the last-used root once it loads. Not creating the webview at all is what actually keeps
+    // this run invisible and avoids it racing the GUI's logic against this function's own passes.
+    let mut context = tauri::generate_context!();
+    if headless_refresh {
+        context.config_mut().app.windows.clear();
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AnalysisControl::default())
         .manage(NsfwControl::default())
         .manage(OcrTextControl::default())
-        .setup(|app| {
-            let app_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(1500));
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.show();
+        .setup(move |app| {
+            if headless_refresh {
+                let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
+                let cancel_item_id = cancel_item.id().clone();
+                let menu = MenuBuilder::new(app).item(&cancel_item).build()?;
+
+                let mut tray_builder = TrayIconBuilder::new()
+                    .tooltip("Image Categorizer — nightly refresh running")
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(move |app, event| {
+                        if event.id() == &cancel_item_id {
+                            app.state::<NsfwControl>().cancel.store(true, Ordering::SeqCst);
+                            app.state::<AnalysisControl>().cancel.store(true, Ordering::SeqCst);
+                            app.state::<OcrTextControl>().cancel.store(true, Ordering::SeqCst);
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    tray_builder = tray_builder.icon(icon);
                 }
-            });
+                tray_builder.build(app)?;
+
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    run_headless_refresh(&app_handle);
+                });
+            } else {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1625,6 +1953,7 @@ pub fn run() {
             download_nsfw_model,
             extract_text,
             get_app_settings,
+            get_auto_refresh_settings,
             get_nsfw_model_info,
             move_image,
             open_image,
@@ -1634,6 +1963,7 @@ pub fn run() {
             reveal_image,
             scan_library,
             select_root_folder,
+            set_auto_refresh_settings,
             set_dark_mode,
             set_folder_analysis_included,
             set_nsfw_threshold,
@@ -1641,6 +1971,6 @@ pub fn run() {
             set_text_thresholds,
             set_tile_size
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
