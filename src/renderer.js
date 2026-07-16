@@ -9,6 +9,7 @@ const state = {
   sort: 'newest',
   pendingCategoryRenameName: null,
   pendingMoveHash: null,
+  pendingMoveRelativePath: null,
   pendingImportPaths: null,
   pointerDrag: null,
   virtualImages: null,
@@ -901,6 +902,8 @@ function closeCategoryRenameDialog() {
 
 function openMoveDialog(image) {
   state.pendingMoveHash = image.hash;
+  // Duplicates share a hash, so remember the exact file this card stands for.
+  state.pendingMoveRelativePath = image.relativePath;
   const folders = (state.library?.sourceFolders || []).filter(folder => folder.name !== 'Root');
   els.moveFolderSelect.innerHTML = folders
     .map(folder => `<option value="${folder.name}" ${folder.name === image.sourceFolder ? 'selected' : ''}>${folder.name}</option>`)
@@ -911,6 +914,7 @@ function openMoveDialog(image) {
 
 function closeMoveDialog() {
   state.pendingMoveHash = null;
+  state.pendingMoveRelativePath = null;
   els.moveDialog.close();
 }
 
@@ -918,8 +922,10 @@ async function submitMove() {
   if (!state.pendingMoveHash || !state.library) return;
   const targetFolder = els.moveNewFolderInput.value.trim() || els.moveFolderSelect.value;
   if (!targetFolder) return;
+  const relativePath = state.pendingMoveRelativePath;
   try {
-    state.library = await window.categorizerAPI.moveImage(state.library.root, state.pendingMoveHash, targetFolder);
+    state.library = await window.categorizerAPI.moveImage(
+      state.library.root, state.pendingMoveHash, relativePath, targetFolder);
     closeMoveDialog();
     render();
     showToast(`Moved to ${targetFolder}`);

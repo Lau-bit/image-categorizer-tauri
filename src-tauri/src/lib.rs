@@ -39,6 +39,11 @@ const HASH_SAMPLE_BYTES: usize = 65536;
 const MAX_IMPORT_DEPTH: usize = 8;
 const MAX_IMPORT_ERRORS: usize = 5;
 
+// How many analyzed images an in-flight pass buffers before merging them to disk. Small enough that
+// a crash costs seconds of work rather than hours; large enough that rewriting the sidecar (~10MB on
+// a 20k library) stays a rounding error next to the OCR/NSFW inference it sits between.
+const ANALYSIS_CHECKPOINT_EVERY: usize = 250;
+
 // Extracted OCR text is written here, one `<hash>.txt` per image, so the folder stays stable
 // across renames/moves and dedupes identical images — same keying scheme as the thumbnail cache.
 const OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
@@ -480,6 +485,16 @@ fn detect_source_folders(root: &Path, config: &LibraryConfig) -> Result<Vec<(Str
     Ok(folders)
 }
 
+/// The source folder a record belongs to, read back out of its stored relative path. Paths are
+/// stored with '/' separators (see `scanned_image`); a path with no separator is a file sitting
+/// directly in the root, which `ROOT_SOURCE_FOLDER` represents.
+fn record_source_folder(last_known_path: &str) -> &str {
+    match last_known_path.split_once('/') {
+        Some((folder, _)) => folder,
+        None => ROOT_SOURCE_FOLDER,
+    }
+}
+
 struct ScannedImage {
     relative_path: String,
     absolute_path: PathBuf,
@@ -491,15 +506,21 @@ struct ScannedImage {
 }
 
 fn hash_file(path: &Path, size: u64) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-    let mut buffer = vec![0u8; HASH_SAMPLE_BYTES.min(size as usize).max(1)];
-    let read = file
-        .read(&mut buffer)
+    let file = File::open(path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+
+    // `Read::read` is allowed to return fewer bytes than asked for without being at EOF, which a
+    // single call would silently treat as the whole sample — yielding a different hash for a file
+    // that never changed, orphaning its record and losing that image's category. `read_to_end` on a
+    // capped reader keeps reading until the cap or real EOF. It hashes the identical bytes a full
+    // single read would have, so hashes already stored in sidecars stay valid.
+    let mut buffer = Vec::with_capacity(HASH_SAMPLE_BYTES.min(size as usize));
+    file.take(HASH_SAMPLE_BYTES as u64)
+        .read_to_end(&mut buffer)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
 
     let mut hasher = DefaultHasher::new();
     size.hash(&mut hasher);
-    buffer[..read].hash(&mut hasher);
+    buffer[..].hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
 }
 
@@ -605,6 +626,72 @@ fn collect_direct_images_in_folder(
     Ok(())
 }
 
+/// Merges freshly computed analysis results into whatever is on disk *now*, rather than writing back
+/// the snapshot the pass started from.
+///
+/// A pass over ~20k images runs for hours. The old code loaded the config once at the start, mutated
+/// that copy throughout, and saved it at the end — so any manual category, import, threshold or
+/// folder change the user made during those hours was silently overwritten by the stale copy. The
+/// nightly job is a *separate process*, so the in-process `AtomicBool` guards could never fix this.
+/// Re-reading immediately before writing narrows the clobber window from hours to microseconds.
+fn commit_analysis<F>(root: &Path, apply: F) -> Result<(), String>
+where
+    F: FnOnce(&mut LibraryConfig),
+{
+    let mut config = load_library_config(root);
+    apply(&mut config);
+    reclassify_nsfw_categories(&mut config);
+    reclassify_text_categories(&mut config);
+    save_library_config(root, &config)
+}
+
+fn commit_text_results(root: &Path, results: &mut Vec<(String, u32, f32)>) -> Result<(), String> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    commit_analysis(root, |config| {
+        for (hash, word_count, area_ratio) in results.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.ocr_word_count = Some(*word_count);
+                record.ocr_text_area_ratio = Some(*area_ratio);
+            }
+        }
+    })?;
+    results.clear();
+    Ok(())
+}
+
+fn commit_nsfw_results(root: &Path, results: &mut Vec<(String, f32, Vec<String>)>) -> Result<(), String> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    commit_analysis(root, |config| {
+        for (hash, score, labels) in results.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.nsfw_score = Some(*score);
+                record.nsfw_labels = Some(labels.clone());
+            }
+        }
+    })?;
+    results.clear();
+    Ok(())
+}
+
+fn commit_extraction_results(root: &Path, results: &mut Vec<(String, u32)>) -> Result<(), String> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    commit_analysis(root, |config| {
+        for (hash, chars) in results.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.ocr_text_chars = Some(*chars);
+            }
+        }
+    })?;
+    results.clear();
+    Ok(())
+}
+
 fn ocr_thresholds(config: &LibraryConfig) -> (u32, f32) {
     (
         config.ocr_word_threshold.unwrap_or(DEFAULT_OCR_WORD_THRESHOLD),
@@ -649,8 +736,12 @@ fn reclassify_text_categories(config: &mut LibraryConfig) {
                 record.classified_by = Some("auto-nsfw".to_string());
                 record.classified_at = Some(now_iso());
             }
-            record.ocr_word_count = None;
-            record.ocr_text_area_ratio = None;
+            // Explicit wins over the text categories, and the `continue` below is what enforces that.
+            // This used to also null `ocr_word_count`/`ocr_text_area_ratio` here, which threw away
+            // real OCR results on every single scan: the card then read "Text: not analyzed" forever,
+            // and raising the NSFW threshold later released the image with no text data to classify
+            // it by, forcing an expensive re-OCR. Keeping the data costs nothing and changes nothing
+            // about which category wins.
             continue;
         }
         let (Some(word_count), Some(area_ratio)) = (record.ocr_word_count, record.ocr_text_area_ratio) else {
@@ -695,7 +786,32 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         record.size = Some(image.size);
         record.modified_ms = Some(image.modified_ms);
     }
-    config.images.retain(|hash, _| seen_hashes.contains(hash));
+    // Only forget an image when we actually looked in the folder it lives in and it wasn't there.
+    //
+    // This used to be `retain(|hash, _| seen_hashes.contains(hash))`, which could not tell "the file
+    // was deleted" apart from "that folder wasn't scanned this time". `detect_source_folders` only
+    // walks folders matching the source pattern or listed as manual, so mistyping the pattern in
+    // Settings — or dropping a manual folder, or a month folder being temporarily renamed/offline —
+    // made every record in the de-matched folders vanish, taking every manual category, NSFW score
+    // and OCR result with it. Restoring the pattern brought the files back as blank records; the
+    // classifications were gone for good.
+    //
+    // The cost of this is that records for a folder you delete outright linger in the sidecar,
+    // because a folder that isn't there is also a folder we didn't scan. That is the intended trade:
+    // a few stale KB beats silently shredding hand-made classifications, and it means re-adding a
+    // folder restores its categories.
+    let scanned_folders: std::collections::HashSet<&str> = std::iter::once(ROOT_SOURCE_FOLDER)
+        .chain(source_folders.iter().map(|(name, _)| name.as_str()))
+        .collect();
+    config.images.retain(|hash, record| {
+        if seen_hashes.contains(hash) {
+            return true;
+        }
+        if record.last_known_path.is_empty() {
+            return false; // No path at all: not a real image, nothing to protect.
+        }
+        !scanned_folders.contains(record_source_folder(&record.last_known_path))
+    });
 
     reclassify_nsfw_categories(&mut config);
     reclassify_text_categories(&mut config);
@@ -932,7 +1048,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let view = scan_and_reconcile(root_buf)?;
-        let mut config = load_library_config(root_buf);
+        let config = load_library_config(root_buf);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
 
@@ -966,9 +1082,11 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             })
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
+        drop(config);
 
         let total = pending.len();
         let mut cancelled = false;
+        let mut results: Vec<(String, u32, f32)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if control.cancel.load(Ordering::SeqCst) {
@@ -977,15 +1095,16 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             }
 
             match analyze_image_text(Path::new(path)) {
-                Ok(stats) => {
-                    if let Some(record) = config.images.get_mut(hash) {
-                        record.ocr_word_count = Some(stats.word_count);
-                        record.ocr_text_area_ratio = Some(stats.text_area_ratio);
-                    }
-                }
+                Ok(stats) => results.push((hash.clone(), stats.word_count, stats.text_area_ratio)),
                 Err(error) => {
                     eprintln!("OCR failed for {path}: {error}");
                 }
+            }
+
+            // Checkpoint periodically so a crash, a reboot or a cancel part-way through a multi-hour
+            // pass keeps the work done so far instead of throwing all of it away.
+            if results.len() >= ANALYSIS_CHECKPOINT_EVERY {
+                commit_text_results(root_buf, &mut results)?;
             }
 
             let _ = app.emit(
@@ -998,8 +1117,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             );
         }
 
-        reclassify_text_categories(&mut config);
-        save_library_config(root_buf, &config)?;
+        commit_text_results(root_buf, &mut results)?;
 
         let message = if total == 0 { Some("No images needed analysis.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))
@@ -1066,7 +1184,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let view = scan_and_reconcile(root_buf)?;
-        let mut config = load_library_config(root_buf);
+        let config = load_library_config(root_buf);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
 
@@ -1096,9 +1214,11 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
             })
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
+        drop(config);
 
         let total = pending.len();
         let mut cancelled = false;
+        let mut results: Vec<(String, u32)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if control.cancel.load(Ordering::SeqCst) {
@@ -1110,17 +1230,17 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
                 Ok(text) => {
                     let text_path = text_dir.join(format!("{hash}.txt"));
                     match fs::write(&text_path, &text) {
-                        Ok(()) => {
-                            if let Some(record) = config.images.get_mut(hash) {
-                                record.ocr_text_chars = Some(text.chars().count() as u32);
-                            }
-                        }
+                        Ok(()) => results.push((hash.clone(), text.chars().count() as u32)),
                         Err(error) => eprintln!("Failed to save OCR text for {path}: {error}"),
                     }
                 }
                 Err(error) => {
                     eprintln!("Text extraction failed for {path}: {error}");
                 }
+            }
+
+            if results.len() >= ANALYSIS_CHECKPOINT_EVERY {
+                commit_extraction_results(root_buf, &mut results)?;
             }
 
             let _ = app.emit(
@@ -1133,7 +1253,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
             );
         }
 
-        save_library_config(root_buf, &config)?;
+        commit_extraction_results(root_buf, &mut results)?;
 
         let message = if total == 0 { Some("No images needed text extraction.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))
@@ -1350,19 +1470,22 @@ fn import_images(root: String, target_folder: String, paths: Vec<String>) -> Res
         return Err("Nothing to import — no image files were found.".to_string());
     }
 
+    // Anything already under the root is in the library; copying it back in would just duplicate it.
+    let (inside, to_copy): (Vec<PathBuf>, Vec<PathBuf>) =
+        sources.into_iter().partition(|source| source.starts_with(&root_buf));
+    let mut skipped = inside.len();
+    if to_copy.is_empty() {
+        return Err("Everything you dropped is already in this library.".to_string());
+    }
+
     let target_dir = root_buf.join(&target_name);
+    let target_existed = target_dir.is_dir();
     fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create import folder: {error}"))?;
 
     let mut imported = 0usize;
-    let mut skipped = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
-    for source in &sources {
-        // Already somewhere under the root: it's in the library, copying it would just duplicate it.
-        if source.starts_with(&root_buf) {
-            skipped += 1;
-            continue;
-        }
+    for source in &to_copy {
         let file_name = path_name(source);
         let destination = unique_destination(&target_dir, &file_name);
         match fs::copy(source, &destination) {
@@ -1376,11 +1499,23 @@ fn import_images(root: String, target_folder: String, paths: Vec<String>) -> Res
         }
     }
 
+    // Every copy failed, so the folder we just made is empty and was never wanted. Only clear up
+    // after ourselves — `remove_dir` refuses a non-empty directory, but a folder the user already
+    // had is not ours to remove even when it happens to be empty.
+    if imported == 0 && !target_existed {
+        let _ = fs::remove_dir(&target_dir);
+    }
+
     if imported > 0 {
         let mut config = load_library_config(&root_buf);
         if !config.manual_source_folders.iter().any(|item| item == &target_name) {
             config.manual_source_folders.push(target_name.clone());
-            save_library_config(&root_buf, &config)?;
+            // The files are already copied. If registering the folder fails, say so but still
+            // report the import — propagating here would discard the count and leave the caller
+            // thinking nothing happened, when in fact the images are on disk.
+            if let Err(error) = save_library_config(&root_buf, &config) {
+                errors.push(format!("Copied the images, but failed to register {target_name} as a source folder: {error}"));
+            }
         }
     }
 
@@ -1392,33 +1527,68 @@ fn import_images(root: String, target_folder: String, paths: Vec<String>) -> Res
     })
 }
 
+/// Moves one image file into `target_folder`.
+///
+/// `relative_path` identifies *which file* to move. It can't be derived from the hash: records are
+/// keyed by hash, so duplicate files share one record whose `last_known_path` points at whichever
+/// copy the last scan happened to visit. Resolving the file from the record therefore moved the
+/// wrong copy — click Move on one duplicate and a different one silently moved instead.
 #[tauri::command]
-fn move_image(root: String, hash: String, target_folder: String) -> Result<LibraryView, String> {
+fn move_image(
+    root: String,
+    hash: String,
+    relative_path: String,
+    target_folder: String,
+) -> Result<LibraryView, String> {
     let root_buf = root_path(&root)?;
-    let config = load_library_config(&root_buf);
-    let record = config.images.get(&hash).ok_or_else(|| "Image not found.".to_string())?;
-    let source = root_buf.join(&record.last_known_path);
-    if !source.is_file() {
+
+    // The path comes from the frontend, so confine it to the library before touching the disk.
+    let source = root_buf.join(relative_path.replace('/', "\\"));
+    let canonical_root = root_buf
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve root: {error}"))?;
+    let canonical_source = source
+        .canonicalize()
+        .map_err(|_| "Source file no longer exists at the known path.".to_string())?;
+    if !canonical_source.starts_with(&canonical_root) {
+        return Err("That image is not inside the library root.".to_string());
+    }
+    if !canonical_source.is_file() {
         return Err("Source file no longer exists at the known path.".to_string());
     }
+    let source = canonical_source;
 
     let target_name = validate_child_name(&target_folder, "Folder")?;
     let target_dir = root_buf.join(&target_name);
     fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create target folder: {error}"))?;
 
     let file_name = path_name(&source);
-    let mut destination = target_dir.join(&file_name);
-    if destination != source {
-        destination = unique_destination(&target_dir, &file_name);
-        fs::rename(&source, &destination).map_err(|error| format!("Failed to move file: {error}"))?;
-    }
+    // `source` is canonicalized (`\\?\D:\...` on Windows) so it can never compare equal to a plain
+    // `target_dir.join(name)`. Compare canonical parent to canonical target instead, or a file
+    // already sitting in the destination would be "moved" onto itself as a spurious " (2)" copy.
+    let canonical_target = target_dir
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve target folder: {error}"))?;
+    let destination = if source.parent() == Some(canonical_target.as_path()) {
+        source.clone()
+    } else {
+        let candidate = unique_destination(&target_dir, &file_name);
+        fs::rename(&source, &candidate).map_err(|error| format!("Failed to move file: {error}"))?;
+        candidate
+    };
+
+    let new_relative = destination
+        .strip_prefix(&root_buf)
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| format!("{target_name}/{}", path_name(&destination)));
 
     let mut config = load_library_config(&root_buf);
     if let Some(record) = config.images.get_mut(&hash) {
-        record.last_known_path = destination
-            .strip_prefix(&root_buf)
-            .map(|value| value.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| file_name.clone());
+        // Only re-point the record if it was tracking the file we actually moved; with duplicates it
+        // may be tracking a different copy, which is still exactly where it was.
+        if record.last_known_path == relative_path {
+            record.last_known_path = new_relative;
+        }
     }
     save_library_config(&root_buf, &config)?;
     scan_and_reconcile(&root_buf)
@@ -1688,8 +1858,7 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
         let mut session = create_session(&model_path)?;
         let view = scan_and_reconcile(root_buf)?;
-        let mut config = load_library_config(root_buf);
-        ensure_category(&mut config, EXPLICIT_CATEGORY);
+        let config = load_library_config(root_buf);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
 
@@ -1707,9 +1876,11 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             })
             .map(|img| (img.hash.clone(), img.path.clone(), img.name.clone()))
             .collect();
+        drop(config);
 
         let total = pending.len();
         let mut cancelled = false;
+        let mut results: Vec<(String, f32, Vec<String>)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if control.cancel.load(Ordering::SeqCst) {
@@ -1717,20 +1888,17 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                 break;
             }
             match analyze_image_nsfw(&mut session, Path::new(path)) {
-                Ok(stats) => {
-                    if let Some(record) = config.images.get_mut(hash) {
-                        record.nsfw_score = Some(stats.score);
-                        record.nsfw_labels = Some(stats.labels);
-                    }
-                }
+                Ok(stats) => results.push((hash.clone(), stats.score, stats.labels)),
                 Err(e) => {
-                    if let Some(record) = config.images.get_mut(hash) {
-                        record.nsfw_score = Some(0.0);
-                        record.nsfw_labels = Some(vec![format!("NSFW analysis error: {e}")]);
-                    }
+                    results.push((hash.clone(), 0.0, vec![format!("NSFW analysis error: {e}")]));
                     eprintln!("NSFW analysis failed for {path}: {e}");
                 }
             }
+
+            if results.len() >= ANALYSIS_CHECKPOINT_EVERY {
+                commit_nsfw_results(root_buf, &mut results)?;
+            }
+
             let _ = app.emit(
                 "nsfw-analysis-progress",
                 TextAnalysisProgress {
@@ -1741,9 +1909,7 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             );
         }
 
-        reclassify_nsfw_categories(&mut config);
-        reclassify_text_categories(&mut config);
-        save_library_config(root_buf, &config)?;
+        commit_nsfw_results(root_buf, &mut results)?;
 
         let message = if total == 0 { Some("No images needed NSFW analysis.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))

@@ -61,7 +61,9 @@ window.categorizerAPI = {
   deleteCategory: (root, name) => invoke('delete_category', { root, name }),
 
   assignCategory: (root, hash, category) => invoke('assign_category', { root, hash, category }),
-  moveImage: (root, hash, targetFolder) => invoke('move_image', { root, hash, targetFolder }),
+  // relativePath says which FILE to move: duplicates share one hash, so the hash alone is ambiguous.
+  moveImage: (root, hash, relativePath, targetFolder) =>
+    invoke('move_image', { root, hash, relativePath, targetFolder }),
 
   // Manual import: copy images (or whole folders of them) from anywhere into a library subfolder.
   importImages: (root, targetFolder, paths) => invoke('import_images', { root, targetFolder, paths }),
