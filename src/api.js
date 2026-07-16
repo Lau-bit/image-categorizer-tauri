@@ -6,10 +6,13 @@ const dialog = tauri?.dialog;
 const convertFileSrc = tauri?.core?.convertFileSrc;
 const event = tauri?.event;
 const tauriWindow = tauri?.window;
+const webview = tauri?.webview;
 
 if (!invoke || !dialog || !convertFileSrc || !event || !tauriWindow) {
   console.error('Tauri API is not available.');
 }
+
+const IMPORT_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'heic', 'heif'];
 
 window.categorizerAPI = {
   showWindow: () => tauriWindow?.getCurrentWindow?.()?.show?.(),
@@ -59,6 +62,42 @@ window.categorizerAPI = {
 
   assignCategory: (root, hash, category) => invoke('assign_category', { root, hash, category }),
   moveImage: (root, hash, targetFolder) => invoke('move_image', { root, hash, targetFolder }),
+
+  // Manual import: copy images (or whole folders of them) from anywhere into a library subfolder.
+  importImages: (root, targetFolder, paths) => invoke('import_images', { root, targetFolder, paths }),
+
+  chooseImagesToImport: async () => {
+    const selection = await dialog.open({
+      title: 'Choose Images to Import',
+      multiple: true,
+      filters: [{ name: 'Images', extensions: IMPORT_EXTENSIONS }],
+    });
+    if (!selection) return null;
+    return Array.isArray(selection) ? selection : [selection];
+  },
+
+  chooseFolderToImport: async () => {
+    const folderPath = await dialog.open({
+      title: 'Choose a Folder of Images to Import',
+      directory: true,
+      multiple: false,
+    });
+    if (!folderPath) return null;
+    return [folderPath];
+  },
+
+  // Fires while files are dragged over the window and when they land. `dragDropEnabled` defaults to
+  // true on the Tauri window, which suppresses the webview's own HTML5 drop events — so this is the
+  // only way to see an OS drag, and it's also the only way to learn the real on-disk paths.
+  // Tauri emits 'enter' | 'over' | 'drop' | 'leave'. 'enter' fires first and must show the overlay
+  // too — treating it as a cancel made the overlay blink off before the first 'over' restored it.
+  onFileDrop: callback =>
+    webview?.getCurrentWebview?.()?.onDragDrop?.(dropEvent => {
+      const { type, paths } = dropEvent.payload;
+      if (type === 'enter' || type === 'over') callback({ state: 'over' });
+      else if (type === 'drop') callback({ state: 'drop', paths: paths || [] });
+      else callback({ state: 'cancel' });
+    }),
 
   openImage: filePath => invoke('open_image', { filePath }),
   revealImage: filePath => invoke('reveal_image', { filePath }),

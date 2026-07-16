@@ -98,6 +98,18 @@
               type="button"
               title="Rescan: looks for new, moved, or deleted images and refreshes thumbnails. Does not run analysis."
             >Rescan</button>
+            <button
+              id="import-button"
+              class="button"
+              type="button"
+              title="Copy images from anywhere on disk into this library. You can also drag files or folders onto the window."
+            >Import…</button>
+            <button
+              id="import-folder-button"
+              class="button secondary"
+              type="button"
+              title="Copy every image inside a folder (and its subfolders) into this library."
+            >Import Folder…</button>
             <button id="open-folder-button" class="button secondary" type="button">Open Root</button>
           </div>
         </header>
@@ -106,6 +118,13 @@
           <div class="image-grid" id="image-grid"></div>
           <div class="empty-state" id="empty-state"></div>
         </section>
+        <div class="drop-overlay hidden" id="drop-overlay">
+          <div class="drop-overlay-inner">
+            <div class="drop-overlay-icon">↓</div>
+            <div class="drop-overlay-title">Drop to import</div>
+            <div class="drop-overlay-hint">Files or folders — you'll choose where they land.</div>
+          </div>
+        </div>
       </main>
     </div>
 
@@ -127,6 +146,20 @@
         <div class="dialog-actions">
           <button class="button secondary" value="cancel" type="button" id="cancel-category-rename-button">Cancel</button>
           <button class="button" value="default" type="submit">Rename</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="import-dialog">
+      <form method="dialog" id="import-form">
+        <h2>Import Images</h2>
+        <p class="dialog-hint">Copies the originals into this library. The source files are left where they are.</p>
+        <p class="dialog-hint" id="import-count"></p>
+        <select id="import-folder-select" class="dialog-input"></select>
+        <input id="import-new-folder-input" class="dialog-input" autocomplete="off" placeholder="Or type a new folder name">
+        <div class="dialog-actions">
+          <button class="button secondary" value="cancel" type="button" id="cancel-import-button">Cancel</button>
+          <button class="button" value="default" type="submit">Import</button>
         </div>
       </form>
     </dialog>

@@ -9,6 +9,7 @@ const state = {
   sort: 'newest',
   pendingCategoryRenameName: null,
   pendingMoveHash: null,
+  pendingImportPaths: null,
   pointerDrag: null,
   virtualImages: null,
   virtualStart: 0,
@@ -58,6 +59,15 @@ const els = {
   categoryRenameForm: document.getElementById('category-rename-form'),
   categoryRenameInput: document.getElementById('category-rename-input'),
   cancelCategoryRenameButton: document.getElementById('cancel-category-rename-button'),
+  importButton: document.getElementById('import-button'),
+  importDialog: document.getElementById('import-dialog'),
+  importCount: document.getElementById('import-count'),
+  importFolderSelect: document.getElementById('import-folder-select'),
+  importNewFolderInput: document.getElementById('import-new-folder-input'),
+  importForm: document.getElementById('import-form'),
+  cancelImportButton: document.getElementById('cancel-import-button'),
+  importFolderButton: document.getElementById('import-folder-button'),
+  dropOverlay: document.getElementById('drop-overlay'),
   moveDialog: document.getElementById('move-dialog'),
   moveForm: document.getElementById('move-form'),
   moveFolderSelect: document.getElementById('move-folder-select'),
@@ -825,10 +835,22 @@ function selectCategory(name) {
   render();
 }
 
+// Patches the one image that changed rather than reloading the library. The sidebar's tallies come
+// from `categoryCountsForIncludedSources()`, which recounts `state.library.images` on every render,
+// so updating the record in place is all that's needed to keep every count honest.
 async function assignCategory(hash, category) {
   if (!state.library) return;
+  // Records are keyed by hash but the grid has one card per FILE, so duplicate files share a single
+  // record. Patch every card carrying this hash — the one save governs all of them, and patching
+  // only the first would leave its twins displaying a category the backend no longer agrees with.
+  const images = (state.library.images || []).filter(item => item.hash === hash);
   try {
-    state.library = await window.categorizerAPI.assignCategory(state.library.root, hash, category);
+    const result = await window.categorizerAPI.assignCategory(state.library.root, hash, category);
+    for (const image of images) {
+      image.category = category || null;
+      image.classifiedBy = result?.classifiedBy ?? null;
+      image.classifiedAt = result?.classifiedAt ?? null;
+    }
     render();
     showToast(category ? `Assigned to ${category}` : 'Marked unclassified');
   } catch (error) {
@@ -901,6 +923,79 @@ async function submitMove() {
     closeMoveDialog();
     render();
     showToast(`Moved to ${targetFolder}`);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+// Imports land in a month-stamped folder by default, so a drop needs no decision to go somewhere
+// sensible — the dialog still lets you redirect it before it happens.
+function defaultImportFolder() {
+  const now = new Date();
+  return `Imported ${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+}
+
+function openImportDialog(paths) {
+  if (!state.library) {
+    showToast('Choose a root folder first.');
+    return;
+  }
+  // The buttons are disabled while analyzing, but a drag-drop reaches this directly — so the guard
+  // has to live here, at the one point every import path goes through.
+  if (state.analyzing) {
+    showToast('Analysis is running — wait for it to finish before importing.');
+    return;
+  }
+  state.pendingImportPaths = paths;
+  const folders = (state.library.sourceFolders || []).filter(folder => folder.name !== 'Root');
+  const suggested = defaultImportFolder();
+  els.importCount.textContent =
+    paths.length === 1 ? '1 item selected' : `${paths.length} items selected`;
+  els.importFolderSelect.innerHTML = folders
+    .map(folder => `<option value="${folder.name}">${folder.name}</option>`)
+    .join('');
+  els.importNewFolderInput.value = folders.some(folder => folder.name === suggested) ? '' : suggested;
+  els.importDialog.showModal();
+  setTimeout(() => els.importNewFolderInput.focus(), 0);
+}
+
+function closeImportDialog() {
+  state.pendingImportPaths = null;
+  els.importDialog.close();
+}
+
+async function submitImport() {
+  const paths = state.pendingImportPaths;
+  if (!paths || !state.library) return;
+  const targetFolder = els.importNewFolderInput.value.trim() || els.importFolderSelect.value;
+  if (!targetFolder) {
+    showToast('Pick or name a folder to import into.');
+    return;
+  }
+  const root = state.library.root;
+  closeImportDialog();
+  setStatus(`Importing ${paths.length} item${paths.length === 1 ? '' : 's'} into ${targetFolder}…`);
+  try {
+    const report = await window.categorizerAPI.importImages(root, targetFolder, paths);
+    await refreshAll();
+    const parts = [`Imported ${report.imported} image${report.imported === 1 ? '' : 's'} into ${report.targetFolder}`];
+    if (report.skipped) parts.push(`${report.skipped} skipped`);
+    showToast(parts.join(' — '));
+    if (report.errors?.length) console.warn('Import errors:', report.errors);
+  } catch (error) {
+    showToast(errorText(error));
+    setStatus('Import failed.');
+  }
+}
+
+async function importFromPicker(chooser) {
+  if (!state.library) {
+    showToast('Choose a root folder first.');
+    return;
+  }
+  try {
+    const paths = await chooser();
+    if (paths?.length) openImportDialog(paths);
   } catch (error) {
     showToast(errorText(error));
   }
@@ -1054,6 +1149,10 @@ function setInteractionsLocked(locked) {
   els.refreshButton.disabled = locked;
   els.openFolderButton.disabled = locked;
   els.settingsButton.disabled = locked;
+  // Importing writes the sidecar too, and a running analysis pass overwrites that file wholesale
+  // from a snapshot it took when it started — an import landing mid-pass would be erased by it.
+  els.importButton.disabled = locked;
+  els.importFolderButton.disabled = locked;
   els.analyzeButton.classList.toggle('hidden', locked);
   els.reanalyzeButton.classList.toggle('hidden', locked);
   els.cancelAnalysisButton.classList.toggle('hidden', !locked);
@@ -1373,6 +1472,15 @@ function installEvents() {
   });
   els.settingsButton.addEventListener('click', openSettingsDialog);
   els.refreshButton.addEventListener('click', refreshAll);
+  els.importButton.addEventListener('click', () =>
+    importFromPicker(window.categorizerAPI.chooseImagesToImport));
+  els.importFolderButton.addEventListener('click', () =>
+    importFromPicker(window.categorizerAPI.chooseFolderToImport));
+  els.cancelImportButton.addEventListener('click', closeImportDialog);
+  els.importForm.addEventListener('submit', event => {
+    event.preventDefault();
+    submitImport();
+  });
   els.analyzeButton.addEventListener('click', () => startAnalysis(false));
   els.reanalyzeButton.addEventListener('click', () => startAnalysis(true));
   els.cancelAnalysisButton.addEventListener('click', cancelCurrentAnalysis);
@@ -1454,6 +1562,7 @@ function installEvents() {
       if (els.categoryDialog.open) closeCategoryDialog();
       if (els.categoryRenameDialog.open) closeCategoryRenameDialog();
       if (els.moveDialog.open) closeMoveDialog();
+      if (els.importDialog.open) closeImportDialog();
       if (els.settingsDialog.open) closeSettingsDialog();
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
@@ -1476,6 +1585,24 @@ function showWindowAfterPaint() {
       });
     });
   });
+}
+
+// Drops from Explorer arrive here rather than as HTML5 drop events, because the Tauri window
+// intercepts the OS drag. Dropping only opens the import dialog — nothing is copied until it's
+// confirmed, so a stray drag onto the window can't quietly reshape the library.
+async function installFileDropListener() {
+  try {
+    await window.categorizerAPI.onFileDrop(({ state: dropState, paths }) => {
+      if (dropState === 'over') {
+        els.dropOverlay.classList.remove('hidden');
+        return;
+      }
+      els.dropOverlay.classList.add('hidden');
+      if (dropState === 'drop' && paths?.length) openImportDialog(paths);
+    });
+  } catch (error) {
+    console.warn('Failed to install file drop listener:', error);
+  }
 }
 
 async function installAnalysisListeners() {
@@ -1509,6 +1636,7 @@ async function init() {
     showWindowAfterPaint();
 
     await installAnalysisListeners();
+    await installFileDropListener();
     await refreshAll();
   } catch (error) {
     console.error('Startup failed:', error);

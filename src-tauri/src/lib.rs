@@ -34,6 +34,11 @@ const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const MAX_SCAN_DEPTH: usize = 4;
 const HASH_SAMPLE_BYTES: usize = 65536;
 
+// How deep `import_images` walks into a dropped folder, and how many per-file copy failures it
+// reports back before it stops collecting them (the count still reflects every failure).
+const MAX_IMPORT_DEPTH: usize = 8;
+const MAX_IMPORT_ERRORS: usize = 5;
+
 // Extracted OCR text is written here, one `<hash>.txt` per image, so the folder stays stable
 // across renames/moves and dedupes identical images — same keying scheme as the thumbnail cache.
 const OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
@@ -99,6 +104,13 @@ struct ImageRecord {
     nsfw_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nsfw_labels: Option<Vec<String>>,
+    // Size and mtime of the file at `last_known_path` when its hash was last computed. A scan
+    // reuses the stored hash whenever both still match, so unchanged files are never re-read —
+    // see `hash_index`. Absent on records written before this cache existed; those re-hash once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -170,6 +182,23 @@ struct SourceFolderView {
 struct CategoryView {
     name: String,
     count: usize,
+}
+
+/// What `assign_category` stamped on the record, so the frontend can mirror it without a rescan.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssignResult {
+    classified_by: Option<String>,
+    classified_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportReport {
+    imported: usize,
+    skipped: usize,
+    target_folder: String,
+    errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -474,11 +503,69 @@ fn hash_file(path: &Path, size: u64) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+/// Maps a known relative path to the hash last computed for it, plus the size/mtime it had at
+/// that moment. Built from the sidecar's existing records — no extra file to keep in sync.
+type HashIndex = HashMap<String, (String, u64, u64)>;
+
+fn build_hash_index(config: &LibraryConfig) -> HashIndex {
+    config
+        .images
+        .iter()
+        .filter_map(|(hash, record)| match (record.size, record.modified_ms) {
+            (Some(size), Some(modified_ms)) => Some((
+                record.last_known_path.clone(),
+                (hash.clone(), size, modified_ms),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Builds the scan entry for one image file, reusing the cached hash when the file is byte-for-byte
+/// the file we hashed last time (same path, size and mtime). Hashing reads 64KB off disk per image,
+/// so on a large library skipping it is the difference between a refresh costing a gigabyte of
+/// reads and costing a directory listing.
+fn scanned_image(
+    root: &Path,
+    source_folder: &str,
+    path: PathBuf,
+    metadata: &fs::Metadata,
+    hash_index: &HashIndex,
+) -> Result<ScannedImage, String> {
+    let name = path_name(&path);
+    let size = metadata.len();
+    let modified_ms = metadata.modified().map(system_time_ms).unwrap_or_default();
+    let relative_path = path
+        .strip_prefix(root)
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| name.clone());
+
+    let cached = hash_index
+        .get(&relative_path)
+        .filter(|(_, cached_size, cached_modified)| *cached_size == size && *cached_modified == modified_ms)
+        .map(|(hash, _, _)| hash.clone());
+    let hash = match cached {
+        Some(hash) => hash,
+        None => hash_file(&path, size)?,
+    };
+
+    Ok(ScannedImage {
+        relative_path,
+        absolute_path: path,
+        name,
+        source_folder: source_folder.to_string(),
+        size,
+        modified_ms,
+        hash,
+    })
+}
+
 fn collect_images_in_folder(
     root: &Path,
     source_folder: &str,
     folder: &Path,
     depth: usize,
+    hash_index: &HashIndex,
     images: &mut Vec<ScannedImage>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
@@ -490,23 +577,9 @@ fn collect_images_in_folder(
         }
         if path.is_file() && is_image_path(&path) {
             let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
-            let size = metadata.len();
-            let hash = hash_file(&path, size)?;
-            let relative_path = path
-                .strip_prefix(root)
-                .map(|value| value.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| name.clone());
-            images.push(ScannedImage {
-                relative_path,
-                absolute_path: path.clone(),
-                name,
-                source_folder: source_folder.to_string(),
-                size,
-                modified_ms: metadata.modified().map(system_time_ms).unwrap_or_default(),
-                hash,
-            });
+            images.push(scanned_image(root, source_folder, path, &metadata, hash_index)?);
         } else if path.is_dir() && depth < MAX_SCAN_DEPTH {
-            collect_images_in_folder(root, source_folder, &path, depth + 1, images)?;
+            collect_images_in_folder(root, source_folder, &path, depth + 1, hash_index, images)?;
         }
     }
     Ok(())
@@ -516,6 +589,7 @@ fn collect_direct_images_in_folder(
     root: &Path,
     source_folder: &str,
     folder: &Path,
+    hash_index: &HashIndex,
     images: &mut Vec<ScannedImage>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
@@ -526,21 +600,7 @@ fn collect_direct_images_in_folder(
             continue;
         }
         let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
-        let size = metadata.len();
-        let hash = hash_file(&path, size)?;
-        let relative_path = path
-            .strip_prefix(root)
-            .map(|value| value.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| name.clone());
-        images.push(ScannedImage {
-            relative_path,
-            absolute_path: path,
-            name,
-            source_folder: source_folder.to_string(),
-            size,
-            modified_ms: metadata.modified().map(system_time_ms).unwrap_or_default(),
-            hash,
-        });
+        images.push(scanned_image(root, source_folder, path, &metadata, hash_index)?);
     }
     Ok(())
 }
@@ -610,10 +670,11 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     let mut config = load_library_config(root);
     let source_folders = detect_source_folders(root, &config)?;
 
+    let hash_index = build_hash_index(&config);
     let mut all_images: Vec<ScannedImage> = Vec::new();
-    collect_direct_images_in_folder(root, ROOT_SOURCE_FOLDER, root, &mut all_images)?;
+    collect_direct_images_in_folder(root, ROOT_SOURCE_FOLDER, root, &hash_index, &mut all_images)?;
     for (folder_name, _) in &source_folders {
-        collect_images_in_folder(root, folder_name, &root.join(folder_name), 0, &mut all_images)?;
+        collect_images_in_folder(root, folder_name, &root.join(folder_name), 0, &hash_index, &mut all_images)?;
     }
 
     let thumb_dir = root.join(THUMBNAIL_DIR_NAME);
@@ -629,18 +690,10 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     let mut seen_hashes = std::collections::HashSet::new();
     for image in &all_images {
         seen_hashes.insert(image.hash.clone());
-        let record = config.images.entry(image.hash.clone()).or_insert_with(|| ImageRecord {
-            last_known_path: image.relative_path.clone(),
-            category: None,
-            classified_by: None,
-            classified_at: None,
-            ocr_word_count: None,
-            ocr_text_area_ratio: None,
-            ocr_text_chars: None,
-            nsfw_score: None,
-            nsfw_labels: None,
-        });
+        let record = config.images.entry(image.hash.clone()).or_default();
         record.last_known_path = image.relative_path.clone();
+        record.size = Some(image.size);
+        record.modified_ms = Some(image.modified_ms);
     }
     config.images.retain(|hash, _| seen_hashes.contains(hash));
 
@@ -1196,8 +1249,12 @@ fn delete_category(root: String, name: String) -> Result<LibraryView, String> {
     scan_and_reconcile(&root)
 }
 
+/// Records one manual classification and nothing else. Deliberately does NOT return a `LibraryView`:
+/// re-scanning to answer a single click meant re-reading every image in the library and shipping the
+/// whole thing back over IPC. The caller already knows which image changed and patches its own copy,
+/// so this only persists the edit and reports the timestamp it stamped.
 #[tauri::command]
-fn assign_category(root: String, hash: String, category: Option<String>) -> Result<LibraryView, String> {
+fn assign_category(root: String, hash: String, category: Option<String>) -> Result<AssignResult, String> {
     let root = root_path(&root)?;
     let mut config = load_library_config(&root);
 
@@ -1207,11 +1264,13 @@ fn assign_category(root: String, hash: String, category: Option<String>) -> Resu
         }
     }
 
-    let record = config.images.entry(hash).or_insert_with(ImageRecord::default);
-    if category.is_some() {
+    let assigned = category.is_some();
+    let classified_at = assigned.then(now_iso);
+    let record = config.images.entry(hash).or_default();
+    if assigned {
         record.category = category;
         record.classified_by = Some("manual".to_string());
-        record.classified_at = Some(now_iso());
+        record.classified_at = classified_at.clone();
     } else {
         record.category = None;
         record.classified_by = None;
@@ -1219,7 +1278,118 @@ fn assign_category(root: String, hash: String, category: Option<String>) -> Resu
     }
 
     save_library_config(&root, &config)?;
-    scan_and_reconcile(&root)
+    Ok(AssignResult {
+        classified_by: assigned.then(|| "manual".to_string()),
+        classified_at,
+    })
+}
+
+/// Picks a free filename in `target_dir` for `file_name`, suffixing " (2)", " (3)", … on collision.
+fn unique_destination(target_dir: &Path, file_name: &str) -> PathBuf {
+    let mut destination = target_dir.join(file_name);
+    if !destination.exists() {
+        return destination;
+    }
+    let stem = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("image").to_string();
+    let ext = Path::new(file_name).extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let mut counter = 2;
+    while destination.exists() {
+        let candidate_name = if ext.is_empty() {
+            format!("{stem} ({counter})")
+        } else {
+            format!("{stem} ({counter}).{ext}")
+        };
+        destination = target_dir.join(candidate_name);
+        counter += 1;
+    }
+    destination
+}
+
+/// Flattens whatever was dropped or picked into a list of image files: plain files pass through,
+/// folders are walked. Unreadable entries are skipped rather than failing the whole import.
+fn collect_import_sources(path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if path.is_file() {
+        if is_image_path(path) {
+            out.push(path.to_path_buf());
+        }
+        return;
+    }
+    if !path.is_dir() || depth >= MAX_IMPORT_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let child = entry.path();
+        if path_name(&child).starts_with('.') {
+            continue;
+        }
+        collect_import_sources(&child, depth + 1, out);
+    }
+}
+
+/// Copies dropped or picked images — and any images inside dropped folders — into `target_folder`
+/// under the root, then registers that folder as a source so the imports are visible even when its
+/// name doesn't match the library's source pattern.
+///
+/// Copies rather than moves: the sources belong to something else (a download folder, a phone dump,
+/// another tool's output) and emptying them out from under their owner isn't this app's call.
+#[tauri::command]
+fn import_images(root: String, target_folder: String, paths: Vec<String>) -> Result<ImportReport, String> {
+    let root_buf = root_path(&root)?;
+    let target_name = validate_child_name(&target_folder, "Folder")?;
+
+    // Work out what there is to copy before creating anything, so a drop that turns out to hold no
+    // images doesn't leave an empty folder behind as a souvenir.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for path in &paths {
+        collect_import_sources(Path::new(path), 0, &mut sources);
+    }
+    if sources.is_empty() {
+        return Err("Nothing to import — no image files were found.".to_string());
+    }
+
+    let target_dir = root_buf.join(&target_name);
+    fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create import folder: {error}"))?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for source in &sources {
+        // Already somewhere under the root: it's in the library, copying it would just duplicate it.
+        if source.starts_with(&root_buf) {
+            skipped += 1;
+            continue;
+        }
+        let file_name = path_name(source);
+        let destination = unique_destination(&target_dir, &file_name);
+        match fs::copy(source, &destination) {
+            Ok(_) => imported += 1,
+            Err(error) => {
+                if errors.len() < MAX_IMPORT_ERRORS {
+                    errors.push(format!("{file_name}: {error}"));
+                }
+                skipped += 1;
+            }
+        }
+    }
+
+    if imported > 0 {
+        let mut config = load_library_config(&root_buf);
+        if !config.manual_source_folders.iter().any(|item| item == &target_name) {
+            config.manual_source_folders.push(target_name.clone());
+            save_library_config(&root_buf, &config)?;
+        }
+    }
+
+    Ok(ImportReport {
+        imported,
+        skipped,
+        target_folder: target_name,
+        errors,
+    })
 }
 
 #[tauri::command]
@@ -1239,18 +1409,7 @@ fn move_image(root: String, hash: String, target_folder: String) -> Result<Libra
     let file_name = path_name(&source);
     let mut destination = target_dir.join(&file_name);
     if destination != source {
-        let stem = Path::new(&file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("image").to_string();
-        let ext = Path::new(&file_name).extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        let mut counter = 2;
-        while destination.exists() {
-            let candidate_name = if ext.is_empty() {
-                format!("{stem} ({counter})")
-            } else {
-                format!("{stem} ({counter}).{ext}")
-            };
-            destination = target_dir.join(candidate_name);
-            counter += 1;
-        }
+        destination = unique_destination(&target_dir, &file_name);
         fs::rename(&source, &destination).map_err(|error| format!("Failed to move file: {error}"))?;
     }
 
@@ -1955,6 +2114,7 @@ pub fn run() {
             get_app_settings,
             get_auto_refresh_settings,
             get_nsfw_model_info,
+            import_images,
             move_image,
             open_image,
             open_root_folder,

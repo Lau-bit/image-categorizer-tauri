@@ -290,10 +290,56 @@ body.light-mode .count-pill {
 }
 
 .main {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+}
+
+/* Absolute rather than a grid child: `.main` declares exactly two rows, so leaving the overlay in
+   flow would add a third and shove the grid up whenever a drag started. */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(16, 17, 20, 0.82);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+body.light-mode .drop-overlay {
+  background: rgba(247, 247, 247, 0.86);
+}
+
+.drop-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 36px 52px;
+  border: 2px dashed var(--accent);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 18px 44px var(--shadow);
+}
+
+.drop-overlay-icon {
+  font-size: 30px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.drop-overlay-title {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.drop-overlay-hint {
+  color: var(--muted);
 }
 
 .topbar {
