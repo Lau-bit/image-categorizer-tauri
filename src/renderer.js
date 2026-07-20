@@ -17,6 +17,9 @@ const state = {
   virtualEnd: 0,
   cardHeight: null,
   scrollFrameRequested: false,
+  // True while the library is being scanned/loaded, so the UI can show an intentional
+  // spinner instead of the misleading "no data" empty states before the first scan lands.
+  loading: false,
   // Analysis state
   analyzing: false,
   analysisQueue: [],   // [{type: 'text'|'nsfw', force: bool}]
@@ -38,6 +41,9 @@ const els = {
   viewSubtitle: document.getElementById('view-subtitle'),
   imageGrid: document.getElementById('image-grid'),
   emptyState: document.getElementById('empty-state'),
+  loadingState: document.getElementById('loading-state'),
+  loadingLabel: document.getElementById('loading-label'),
+  statusSpinner: document.getElementById('status-spinner'),
   mainDropTarget: document.getElementById('main-drop-target'),
   searchInput: document.getElementById('search-input'),
   statusMessage: document.getElementById('status-message'),
@@ -113,16 +119,32 @@ function showToast(message) {
   showToast.timer = setTimeout(() => els.toast.classList.remove('visible'), 2400);
 }
 
-function setStatus(message) {
+// `persist` keeps the message up until it's explicitly replaced — used for the "Scanning…"
+// message during a load, which can outlast the 5s auto-clear on a large library and would
+// otherwise vanish mid-scan, making the app look stalled.
+function setStatus(message, persist = false) {
   els.statusMessage.textContent = message || '';
   els.statusMessage.title = message || '';
   clearTimeout(setStatus.timer);
-  if (message) {
+  if (message && !persist) {
     setStatus.timer = setTimeout(() => {
       els.statusMessage.textContent = '';
       els.statusMessage.title = '';
     }, 5000);
   }
+}
+
+// The small topbar spinner signals background activity for both a library scan and an
+// analysis pass, so it's driven off both flags rather than tied to one caller.
+function updateActivityIndicator() {
+  const active = state.loading || state.analyzing;
+  els.statusSpinner.classList.toggle('hidden', !active);
+}
+
+function setLoading(active, label) {
+  state.loading = active;
+  if (active && label) els.loadingLabel.textContent = label;
+  updateActivityIndicator();
 }
 
 function errorText(error) {
@@ -474,7 +496,12 @@ function renderSidebar() {
 
   els.categoryList.innerHTML = '';
   const categories = library?.categories || [];
-  if (!categories.length) {
+  if (state.loading && !library) {
+    const loadingEl = document.createElement('div');
+    loadingEl.className = 'category-empty';
+    loadingEl.textContent = 'Loading…';
+    els.categoryList.append(loadingEl);
+  } else if (!categories.length) {
     const empty = document.createElement('button');
     empty.className = 'category-empty';
     empty.type = 'button';
@@ -526,7 +553,12 @@ function renderSidebar() {
 
   els.sourceFolderList.innerHTML = '';
   const sourceFolders = library?.sourceFolders || [];
-  if (!sourceFolders.length) {
+  if (state.loading && !library) {
+    const loadingEl = document.createElement('div');
+    loadingEl.className = 'category-empty';
+    loadingEl.textContent = 'Loading…';
+    els.sourceFolderList.append(loadingEl);
+  } else if (!sourceFolders.length) {
     const empty = document.createElement('div');
     empty.className = 'category-empty';
     empty.textContent = 'No source folders detected yet.';
@@ -562,7 +594,11 @@ function renderHeader() {
   } else {
     els.viewTitle.textContent = state.currentCategory || 'Category';
   }
-  els.viewSubtitle.textContent = library?.root || 'No root folder chosen yet';
+  // While loading, prefer the known root path (reassures which folder is being scanned) over the
+  // "no root" message, which is only true once a scan has actually landed with no folder set.
+  els.viewSubtitle.textContent =
+    library?.root ||
+    (state.loading ? (state.settings?.lastRoot || 'Loading…') : 'No root folder chosen yet');
 }
 
 function categoryOptionsHtml(selected) {
@@ -735,13 +771,19 @@ function onGridScroll() {
 
 function renderImages() {
   const images = visibleImages();
-  els.emptyState.classList.toggle('visible', images.length === 0);
+  // Only take over the whole content area with the spinner when there's nothing to show yet.
+  // A rescan that already has images keeps the grid visible (topbar spinner covers it), so the
+  // view never blanks out and never feels locked up.
+  const showLoading = state.loading && !images.length;
+  els.loadingState.classList.toggle('hidden', !showLoading);
+  els.emptyState.classList.toggle('visible', images.length === 0 && !showLoading);
 
   if (!images.length) {
     state.virtualImages = null;
     els.imageGrid.style.paddingTop = '0px';
     els.imageGrid.style.paddingBottom = '0px';
     els.imageGrid.innerHTML = '';
+    if (showLoading) return;
     if (!state.library?.root) {
       els.emptyState.innerHTML = '';
       const button = document.createElement('button');
@@ -786,9 +828,14 @@ async function refreshLibrary() {
 }
 
 async function refreshAll() {
-  setStatus('Scanning for new, moved, or deleted images…');
+  setLoading(true);
+  setStatus('Scanning for new, moved, or deleted images…', true);
+  // Paint the loading state before the (potentially slow) scan begins — otherwise the first
+  // intentional frame wouldn't land until the scan already finished.
+  render();
   try {
     await loadSettings();
+    render();
     await refreshLibrary();
   } catch (error) {
     showToast(errorText(error));
@@ -801,6 +848,7 @@ async function refreshAll() {
     };
     state.library = null;
   }
+  setLoading(false);
   if (state.currentView === 'category' && !(state.library?.categories || []).some(c => c.name === state.currentCategory)) {
     state.currentView = 'all';
     state.currentCategory = null;
@@ -1149,6 +1197,7 @@ async function setFolderAnalysisIncluded(folderName, included) {
 
 function setInteractionsLocked(locked) {
   state.analyzing = locked;
+  updateActivityIndicator();
   els.addCategoryButton.disabled = locked;
   els.addSourceFolderButton.disabled = locked;
   els.rootFolderSelect.disabled = locked;
@@ -1178,11 +1227,15 @@ async function runNextInQueue() {
     setInteractionsLocked(false);
     if (state.library) {
       try {
-        setStatus('Refreshing library…');
+        setLoading(true);
+        setStatus('Refreshing library…', true);
+        render();
         state.library = await window.categorizerAPI.scanLibrary(state.library.root);
+        setLoading(false);
         render();
         setStatus('Analysis complete.');
       } catch (error) {
+        setLoading(false);
         setStatus('');
         showToast(errorText(error));
       }
@@ -1638,6 +1691,9 @@ async function installAnalysisListeners() {
 async function init() {
   try {
     installEvents();
+    // Mark loading before the first paint so the window unhides onto an intentional spinner
+    // rather than the "No root folder chosen yet" empty state shown before settings load.
+    setLoading(true);
     render();
     showWindowAfterPaint();
 
@@ -1645,6 +1701,7 @@ async function init() {
     await installFileDropListener();
     await refreshAll();
   } catch (error) {
+    setLoading(false);
     console.error('Startup failed:', error);
     setStatus('Startup hit an error. Choose or rescan a folder to retry.');
     showToast(errorText(error));

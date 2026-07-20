@@ -54,6 +54,7 @@
           </div>
           <div class="top-actions">
             <input id="search-input" class="search-input" type="search" placeholder="Search images">
+            <span id="status-spinner" class="status-spinner hidden" aria-hidden="true"></span>
             <span id="status-message" class="status-message"></span>
             <select id="sort-select" class="sort-select" title="Sort images">
               <option value="newest">Newest</option>
@@ -117,6 +118,10 @@
         <section class="drop-target" id="main-drop-target">
           <div class="image-grid" id="image-grid"></div>
           <div class="empty-state" id="empty-state"></div>
+          <div class="loading-state hidden" id="loading-state">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="loading-label" id="loading-label">Loading your library…</span>
+          </div>
         </section>
         <div class="drop-overlay hidden" id="drop-overlay">
           <div class="drop-overlay-inner">

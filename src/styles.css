@@ -667,6 +667,56 @@ body.pointer-dragging {
   display: grid;
 }
 
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-height: 260px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.loading-label {
+  color: var(--muted-strong);
+  font-size: 13px;
+}
+
+.spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+.status-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Motion still communicates "working"; slow it rather than freeze it for reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner,
+  .status-spinner {
+    animation-duration: 1.8s;
+  }
+}
+
 .dialog {
   width: min(440px, calc(100vw - 32px));
   border: 1px solid var(--border);
