@@ -22,9 +22,10 @@ const state = {
   loading: false,
   // Analysis state
   analyzing: false,
-  analysisQueue: [],   // [{type: 'text'|'nsfw', force: bool}]
-  analysisRunning: null, // 'text' | 'nsfw' | null
+  analysisQueue: [],   // [{type: 'text'|'nsfw'|'ocr'|'chunk'|'vision', force: bool}]
+  analysisRunning: null, // 'text' | 'nsfw' | 'ocr' | 'chunk' | 'vision' | null
   autoRefresh: null,
+  chunkPlan: null,
 };
 
 const els = {
@@ -55,6 +56,8 @@ const els = {
   analyzeTextCheck: document.getElementById('analyze-text-check'),
   analyzeNsfwCheck: document.getElementById('analyze-nsfw-check'),
   extractTextCheck: document.getElementById('extract-text-check'),
+  analyzeChunkCheck: document.getElementById('analyze-chunk-check'),
+  analyzeVisionCheck: document.getElementById('analyze-vision-check'),
   analyzeNsfwCheckLabel: document.getElementById('analyze-nsfw-check-label'),
   openFolderButton: document.getElementById('open-folder-button'),
   settingsButton: document.getElementById('settings-button'),
@@ -109,6 +112,12 @@ const els = {
   autoRefreshLowPriorityInput: document.getElementById('auto-refresh-low-priority-input'),
   autoRefreshToastInput: document.getElementById('auto-refresh-toast-input'),
   autoRefreshStatus: document.getElementById('auto-refresh-status'),
+  visionEndpointInput: document.getElementById('vision-endpoint-input'),
+  visionModelInput: document.getElementById('vision-model-input'),
+  chunkPlanStatus: document.getElementById('chunk-plan-status'),
+  regenerateChunkPlanButton: document.getElementById('regenerate-chunk-plan-button'),
+  openChunkPlanButton: document.getElementById('open-chunk-plan-button'),
+  discardChunkPlanButton: document.getElementById('discard-chunk-plan-button'),
   toast: document.getElementById('toast'),
 };
 
@@ -278,6 +287,78 @@ async function downloadNsfwModel() {
       'No model was installed. You can try Download Model again.',
     ].join('\n');
     showToast(message);
+  }
+}
+
+function formatChunkPlanStatus(plan) {
+  if (!plan || !plan.exists) return 'No chunk plan yet — run "Video Dedup" under Analyze to build one.';
+  const gen = plan.generatedAt ? ` · built ${formatDate(Date.parse(plan.generatedAt))}` : '';
+  const g = plan.groups === 1 ? '' : 's';
+  const f = plan.totalFrames === 1 ? '' : 's';
+  return `${plan.groups} video${g} · ${plan.totalFrames} frame${f} · ${plan.selectedFrames} selected for description${gen}`;
+}
+
+async function loadVisionAndChunkSettings() {
+  try {
+    const vision = await window.categorizerAPI.getVisionSettings();
+    els.visionEndpointInput.value = vision.endpoint || '';
+    els.visionModelInput.value = vision.model || '';
+  } catch {
+    // non-fatal
+  }
+  try {
+    state.chunkPlan = state.library?.root
+      ? await window.categorizerAPI.getChunkPlan(state.library.root)
+      : null;
+  } catch {
+    state.chunkPlan = null;
+  }
+  els.chunkPlanStatus.textContent = formatChunkPlanStatus(state.chunkPlan);
+}
+
+async function saveVisionSettings() {
+  try {
+    await window.categorizerAPI.setVisionSettings(
+      els.visionEndpointInput.value.trim(),
+      els.visionModelInput.value.trim(),
+    );
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function regenerateChunkPlan() {
+  if (!state.library?.root) return;
+  try {
+    state.chunkPlan = await window.categorizerAPI.regenerateChunkPlan(state.library.root);
+    els.chunkPlanStatus.textContent = formatChunkPlanStatus(state.chunkPlan);
+    showToast('Chunk plan regenerated.');
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function discardChunkPlan() {
+  if (!state.library?.root) return;
+  if (!window.confirm('Discard the video chunk plan? Describe will then consider every image, with no video-frame de-duplication.')) return;
+  try {
+    state.chunkPlan = await window.categorizerAPI.discardChunkPlan(state.library.root);
+    els.chunkPlanStatus.textContent = formatChunkPlanStatus(state.chunkPlan);
+    showToast('Chunk plan discarded.');
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function openChunkPlanFile() {
+  if (!state.chunkPlan?.exists) {
+    showToast('No chunk plan file yet — run "Video Dedup" first.');
+    return;
+  }
+  try {
+    await window.categorizerAPI.revealImage(state.chunkPlan.path);
+  } catch (error) {
+    showToast(errorText(error));
   }
 }
 
@@ -640,6 +721,16 @@ function analysisSummary(image) {
     lines.push(image.ocrTextChars > 0
       ? `Extracted text: ${image.ocrTextChars} chars saved`
       : 'Extracted text: no text found');
+  }
+
+  if (image.videoTitle) {
+    lines.push(`Video: ${image.videoTitle}`);
+  }
+
+  if (image.visionDescChars != null) {
+    lines.push(image.visionDescChars > 0
+      ? `Description: ${image.visionDescChars} chars saved`
+      : 'Description: empty');
   }
 
   if (image.classifiedBy) {
@@ -1059,6 +1150,7 @@ function openSettingsDialog() {
   syncSettingsDialog();
   syncNsfwModelHint();
   loadAutoRefreshSettings();
+  loadVisionAndChunkSettings();
   els.settingsDialog.showModal();
 }
 
@@ -1217,6 +1309,8 @@ function setInteractionsLocked(locked) {
 function analysisTypeLabel(type) {
   if (type === 'nsfw') return 'Explicit';
   if (type === 'ocr') return 'Extract Text';
+  if (type === 'chunk') return 'Video Dedup';
+  if (type === 'vision') return 'Describe';
   return 'Text';
 }
 
@@ -1253,6 +1347,10 @@ async function runNextInQueue() {
       await window.categorizerAPI.analyzeText(state.library.root, force);
     } else if (type === 'ocr') {
       await window.categorizerAPI.extractText(state.library.root, force);
+    } else if (type === 'chunk') {
+      await window.categorizerAPI.buildChunkPlan(state.library.root, force);
+    } else if (type === 'vision') {
+      await window.categorizerAPI.analyzeVision(state.library.root, force);
     } else {
       await window.categorizerAPI.analyzeNsfw(state.library.root, force);
     }
@@ -1271,15 +1369,21 @@ async function startAnalysis(force) {
   const wantText = els.analyzeTextCheck.checked;
   const wantNsfw = els.analyzeNsfwCheck.checked;
   const wantOcr = els.extractTextCheck.checked;
-  if (!wantText && !wantNsfw && !wantOcr) {
+  const wantChunk = els.analyzeChunkCheck.checked;
+  const wantVision = els.analyzeVisionCheck.checked;
+  if (!wantText && !wantNsfw && !wantOcr && !wantChunk && !wantVision) {
     showToast('Select at least one analysis type.');
     return;
   }
 
+  // Order matters: Explicit first (Describe skips explicit images), then Video Dedup (builds the
+  // sample plan Describe reads), then the text passes, and Describe last so it sees the results.
   state.analysisQueue = [];
   if (wantNsfw) state.analysisQueue.push({ type: 'nsfw', force });
+  if (wantChunk) state.analysisQueue.push({ type: 'chunk', force });
   if (wantText) state.analysisQueue.push({ type: 'text', force });
   if (wantOcr) state.analysisQueue.push({ type: 'ocr', force });
+  if (wantVision) state.analysisQueue.push({ type: 'vision', force });
 
   setInteractionsLocked(true);
   await runNextInQueue();
@@ -1295,6 +1399,10 @@ async function cancelCurrentAnalysis() {
       await window.categorizerAPI.cancelNsfwAnalysis();
     } else if (state.analysisRunning === 'ocr') {
       await window.categorizerAPI.cancelTextExtraction();
+    } else if (state.analysisRunning === 'chunk') {
+      await window.categorizerAPI.cancelChunkScan();
+    } else if (state.analysisRunning === 'vision') {
+      await window.categorizerAPI.cancelVisionAnalysis();
     }
     setStatus('Cancelling…');
   } catch (error) {
@@ -1608,6 +1716,11 @@ function installEvents() {
   els.nsfwThresholdInput.addEventListener('input', syncNsfwThresholdLabel);
   els.nsfwThresholdInput.addEventListener('change', saveNsfwThreshold);
   els.downloadNsfwModelButton.addEventListener('click', downloadNsfwModel);
+  els.visionEndpointInput.addEventListener('change', saveVisionSettings);
+  els.visionModelInput.addEventListener('change', saveVisionSettings);
+  els.regenerateChunkPlanButton.addEventListener('click', regenerateChunkPlan);
+  els.openChunkPlanButton.addEventListener('click', openChunkPlanFile);
+  els.discardChunkPlanButton.addEventListener('click', discardChunkPlan);
   els.autoRefreshEnabledInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshTimeInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshNsfwInput.addEventListener('change', saveAutoRefreshSettings);
@@ -1678,6 +1791,14 @@ async function installAnalysisListeners() {
       setStatus(`Extract Text: ${processed}/${total} — ${currentName}`);
     }),
     window.categorizerAPI.onTextExtractionFinished(payload => onAnalysisFinished('ocr', payload)),
+    window.categorizerAPI.onChunkScanProgress(({ processed, total, currentName }) => {
+      setStatus(`Video Dedup: ${processed}/${total} — ${currentName}`);
+    }),
+    window.categorizerAPI.onChunkScanFinished(payload => onAnalysisFinished('chunk', payload)),
+    window.categorizerAPI.onVisionAnalysisProgress(({ processed, total, currentName }) => {
+      setStatus(`Describe: ${processed}/${total} — ${currentName}`);
+    }),
+    window.categorizerAPI.onVisionAnalysisFinished(payload => onAnalysisFinished('vision', payload)),
   ];
 
   const results = await Promise.allSettled(listeners);

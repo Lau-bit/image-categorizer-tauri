@@ -40,9 +40,10 @@ fn ensure_com_initialized() {
 }
 
 // Decodes `path`, runs the Windows OCR engine over it, and returns the recognition result along
-// with the image's pixel area. Shared by both the text-classification stats pass and the full
-// text-extraction pass so the heavy decode/recognize path lives in exactly one place.
-fn recognize(path: &Path) -> Result<(OcrResult, f32), String> {
+// with the image's pixel width and height. Shared by the text-classification stats pass, the full
+// text-extraction pass, and the title-strip pass so the heavy decode/recognize path lives in
+// exactly one place.
+fn recognize(path: &Path) -> Result<(OcrResult, f32, f32), String> {
     ensure_com_initialized();
 
     let path_str = path.to_string_lossy().to_string();
@@ -79,7 +80,6 @@ fn recognize(path: &Path) -> Result<(OcrResult, f32), String> {
     let height = bitmap
         .PixelHeight()
         .map_err(|error| format!("Failed to read image size: {error}"))? as f32;
-    let image_area = (width * height).max(1.0);
 
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()
         .map_err(|error| format!("Failed to start OCR engine: {error}"))?;
@@ -91,13 +91,65 @@ fn recognize(path: &Path) -> Result<(OcrResult, f32), String> {
     )
     .map_err(|error| format!("OCR recognition failed: {error}"))?;
 
-    Ok((result, image_area))
+    Ok((result, width, height))
+}
+
+/// Reads back only the text found in the top `top_fraction` band of the image — the region that
+/// holds a borderless browser/app title bar. Used by the video-chunking pass to pull the on-screen
+/// window title (e.g. a YouTube video title) without OCRing (or being confused by) the rest of the
+/// frame. A line counts as "in the band" when its highest word starts within the band.
+pub fn extract_title_strip(path: &Path, top_fraction: f32) -> Result<String, String> {
+    let (result, _width, height) = recognize(path)?;
+    let band = (height * top_fraction).max(1.0);
+
+    let lines = result
+        .Lines()
+        .map_err(|error| format!("Failed to read OCR lines: {error}"))?;
+    let line_count = lines
+        .Size()
+        .map_err(|error| format!("Failed to read OCR lines: {error}"))?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for line_index in 0..line_count {
+        let line = lines
+            .GetAt(line_index)
+            .map_err(|error| format!("Failed to read OCR line: {error}"))?;
+        let words = line
+            .Words()
+            .map_err(|error| format!("Failed to read OCR words: {error}"))?;
+        let word_count = words
+            .Size()
+            .map_err(|error| format!("Failed to read OCR words: {error}"))?;
+        if word_count == 0 {
+            continue;
+        }
+        let mut line_top = f32::MAX;
+        for word_index in 0..word_count {
+            let word = words
+                .GetAt(word_index)
+                .map_err(|error| format!("Failed to read OCR word: {error}"))?;
+            let rect = word
+                .BoundingRect()
+                .map_err(|error| format!("Failed to read OCR word bounds: {error}"))?;
+            if rect.Y < line_top {
+                line_top = rect.Y;
+            }
+        }
+        if line_top <= band {
+            let text = line
+                .Text()
+                .map_err(|error| format!("Failed to read OCR line text: {error}"))?;
+            parts.push(text.to_string_lossy());
+        }
+    }
+
+    Ok(parts.join(" "))
 }
 
 /// Reads back the full recognized text of an image, one OCR line per output line. Returns an
 /// empty string when the engine found no text. Used by the text-extraction pass.
 pub fn extract_image_text(path: &Path) -> Result<String, String> {
-    let (result, _image_area) = recognize(path)?;
+    let (result, _width, _height) = recognize(path)?;
 
     let lines = result
         .Lines()
@@ -123,7 +175,8 @@ pub fn extract_image_text(path: &Path) -> Result<String, String> {
 }
 
 pub fn analyze_image_text(path: &Path) -> Result<OcrStats, String> {
-    let (result, image_area) = recognize(path)?;
+    let (result, width, height) = recognize(path)?;
+    let image_area = (width * height).max(1.0);
 
     let lines = result
         .Lines()
@@ -163,4 +216,78 @@ pub fn analyze_image_text(path: &Path) -> Result<OcrStats, String> {
         word_count,
         text_area_ratio: (text_area / image_area).clamp(0.0, 1.0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Exercises the real Windows OCR path end to end against a rendered title-bar screenshot.
+    // Env-gated so `cargo test` stays hermetic when the fixture isn't provided; the test harness
+    // sets ICAT_TEST_TITLE_IMAGE to the image to run it.
+    #[test]
+    fn title_strip_reads_top_bar_and_excludes_content() {
+        let Ok(path) = std::env::var("ICAT_TEST_TITLE_IMAGE") else {
+            eprintln!("skipping title_strip test: ICAT_TEST_TITLE_IMAGE not set");
+            return;
+        };
+
+        let strip = extract_title_strip(std::path::Path::new(&path), 0.06)
+            .expect("title-strip OCR should succeed");
+        eprintln!("OCR title strip = {strip:?}");
+
+        let lower = strip.to_lowercase();
+        assert!(lower.contains("youtube"), "should read the video-site marker in the top bar: {strip:?}");
+        assert!(lower.contains("driving"), "should read the title text in the top bar: {strip:?}");
+        assert!(
+            !strip.to_uppercase().contains("CONTENTZONE"),
+            "top-band filter must exclude content below the title bar: {strip:?}"
+        );
+
+        // Full pipeline: the read strip must resolve to a clean video title via the chunker.
+        let title = crate::chunker::clean_title(&strip).expect("marker present -> Some(title)");
+        eprintln!("cleaned title = {title:?}");
+        assert!(title.to_lowercase().contains("driving"), "cleaned title should keep the real title: {title:?}");
+        assert!(!title.to_lowercase().contains("youtube"), "cleaned title should drop the marker: {title:?}");
+    }
+
+    // Diagnostic (env-gated): OCR the title strip of up to ICAT_TEST_SCAN_LIMIT images (newest by
+    // name) in ICAT_TEST_SCAN_DIR and print each result. Validates title reading on REAL screenshots
+    // and surfaces which ones are video frames. Always passes — it's a scan tool, not an assertion.
+    #[test]
+    fn list_real_title_strips() {
+        let Ok(dir) = std::env::var("ICAT_TEST_SCAN_DIR") else {
+            eprintln!("skipping list_real_title_strips: ICAT_TEST_SCAN_DIR not set");
+            return;
+        };
+        let limit: usize = std::env::var("ICAT_TEST_SCAN_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("scan dir readable")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| matches!(x.to_lowercase().as_str(), "png" | "jpg" | "jpeg"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        entries.sort();
+        entries.reverse();
+
+        let mut videos = 0usize;
+        for path in entries.iter().take(limit) {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            match extract_title_strip(path, 0.06) {
+                Ok(strip) => {
+                    let title = crate::chunker::clean_title(&strip);
+                    if title.is_some() {
+                        videos += 1;
+                    }
+                    eprintln!("{name} => title={title:?} | strip={strip:?}");
+                }
+                Err(e) => eprintln!("{name} => ERROR {e}"),
+            }
+        }
+        eprintln!("=== {videos} of {} looked like videos ===", entries.len().min(limit));
+    }
 }

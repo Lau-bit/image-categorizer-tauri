@@ -55,6 +55,24 @@ window.categorizerAPI = {
   onNsfwAnalysisProgress: callback => event.listen('nsfw-analysis-progress', message => callback(message.payload)),
   onNsfwAnalysisFinished: callback => event.listen('nsfw-analysis-finished', message => callback(message.payload)),
 
+  // Video de-duplication: OCR the title bar, group frames by video, sample N. Produces a standalone
+  // chunk plan file the vision pass then reads.
+  buildChunkPlan: (root, force) => invoke('build_chunk_plan', { root, force }),
+  cancelChunkScan: () => invoke('cancel_chunk_scan'),
+  getChunkPlan: root => invoke('get_chunk_plan', { root }),
+  regenerateChunkPlan: root => invoke('regenerate_chunk_plan', { root }),
+  discardChunkPlan: root => invoke('discard_chunk_plan', { root }),
+  onChunkScanProgress: callback => event.listen('chunk-scan-progress', message => callback(message.payload)),
+  onChunkScanFinished: callback => event.listen('chunk-scan-finished', message => callback(message.payload)),
+
+  // Vision descriptions (images → words) via a local OpenAI-compatible model.
+  analyzeVision: (root, force) => invoke('analyze_vision', { root, force }),
+  cancelVisionAnalysis: () => invoke('cancel_vision_analysis'),
+  getVisionSettings: () => invoke('get_vision_settings'),
+  setVisionSettings: (endpoint, model) => invoke('set_vision_settings', { endpoint, model }),
+  onVisionAnalysisProgress: callback => event.listen('vision-analysis-progress', message => callback(message.payload)),
+  onVisionAnalysisFinished: callback => event.listen('vision-analysis-finished', message => callback(message.payload)),
+
   // Category management
   createCategory: (root, name) => invoke('create_category', { root, name }),
   renameCategory: (root, oldName, newName) => invoke('rename_category', { root, oldName, newName }),

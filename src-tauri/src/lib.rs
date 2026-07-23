@@ -29,6 +29,12 @@ use ocr::{analyze_image_text, extract_image_text};
 mod thumbnails;
 use thumbnails::{ensure_thumbnail, THUMBNAIL_DIR_NAME};
 
+mod chunker;
+use chunker::{build_plan, clean_title, ChunkPlan};
+
+mod vision;
+use vision::{build_agent, describe_image, DESCRIBE_PROMPT};
+
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "heic", "heif"];
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const MAX_SCAN_DEPTH: usize = 4;
@@ -47,6 +53,25 @@ const ANALYSIS_CHECKPOINT_EVERY: usize = 250;
 // Extracted OCR text is written here, one `<hash>.txt` per image, so the folder stays stable
 // across renames/moves and dedupes identical images — same keying scheme as the thumbnail cache.
 const OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
+
+// Video-chunking + vision-description feature (all keyed by content hash, same as the caches above).
+// The chunk plan is a standalone, hand-editable file so it can be reviewed or discarded by itself
+// without touching the main sidecar. Vision descriptions land one `<hash>.json` (+ `<hash>.txt`) per
+// image under the descriptions dir, with an `index.json` mapping relative path -> hash so other apps
+// can look a description up by the image file they hold.
+const CHUNK_PLAN_FILE_NAME: &str = ".image-categorizer-chunks.json";
+const VISION_DESC_DIR_NAME: &str = ".image-categorizer-descriptions";
+const VISION_INDEX_FILE_NAME: &str = "index.json";
+const VISION_DESC_SCHEMA_VERSION: u32 = 1;
+const VISION_PROMPT_VERSION: u32 = 1;
+
+// Fraction of the frame height OCRed for the title bar, and how many frames per confirmed video the
+// chunk plan samples for the vision pass. Fixed defaults for this first version.
+const TITLE_STRIP_TOP_FRACTION: f32 = 0.06;
+const DEFAULT_SAMPLES_PER_GROUP: u32 = 10;
+
+const DEFAULT_VISION_ENDPOINT: &str = "http://localhost:1234/v1/chat/completions";
+const DEFAULT_VISION_MODEL: &str = "local-model";
 
 const DEFAULT_OCR_WORD_THRESHOLD: u32 = 35;
 const DEFAULT_OCR_AREA_THRESHOLD: f32 = 0.05;
@@ -89,6 +114,10 @@ struct AppSettings {
     auto_refresh_toast: Option<bool>,
     last_auto_refresh_at: Option<String>,
     last_auto_refresh_summary: Option<String>,
+    // OpenAI-compatible vision endpoint (LM Studio by default) + the model name to send. Global, so
+    // one setting drives the description pass across every library.
+    vision_endpoint: Option<String>,
+    vision_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -109,6 +138,16 @@ struct ImageRecord {
     nsfw_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nsfw_labels: Option<Vec<String>>,
+    // Video-chunking: the title read from this image's top strip. `None` = title strip not scanned
+    // yet (so it's pending); `Some("")` = scanned, no video marker found (a normal standalone image);
+    // `Some("Driving across…")` = a confirmed video frame with that title. Mirrors the `Some(0)`
+    // "done but empty" convention `ocr_text_chars` uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_title: Option<String>,
+    // Vision pass: character count of the saved description. `Some` (including `Some(0)`) marks the
+    // image as already described; the prose itself lives in the descriptions sidecar folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vision_desc_chars: Option<u32>,
     // Size and mtime of the file at `last_known_path` when its hash was last computed. A scan
     // reuses the stored hash whenever both still match, so unchanged files are never re-read —
     // see `hash_index`. Absent on records written before this cache existed; those re-hash once.
@@ -225,6 +264,9 @@ struct ImageView {
     ocr_text_chars: Option<u32>,
     nsfw_score: Option<f32>,
     nsfw_labels: Option<Vec<String>>,
+    // Non-empty when this frame was identified as belonging to a video of this title.
+    video_title: Option<String>,
+    vision_desc_chars: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +313,18 @@ struct NsfwControl {
 
 #[derive(Default)]
 struct OcrTextControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
+struct ChunkControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
+struct VisionControl {
     running: AtomicBool,
     cancel: AtomicBool,
 }
@@ -692,6 +746,36 @@ fn commit_extraction_results(root: &Path, results: &mut Vec<(String, u32)>) -> R
     Ok(())
 }
 
+fn commit_chunk_results(root: &Path, results: &mut Vec<(String, String)>) -> Result<(), String> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    commit_analysis(root, |config| {
+        for (hash, title) in results.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.video_title = Some(title.clone());
+            }
+        }
+    })?;
+    results.clear();
+    Ok(())
+}
+
+fn commit_vision_results(root: &Path, results: &mut Vec<(String, u32)>) -> Result<(), String> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    commit_analysis(root, |config| {
+        for (hash, chars) in results.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.vision_desc_chars = Some(*chars);
+            }
+        }
+    })?;
+    results.clear();
+    Ok(())
+}
+
 fn ocr_thresholds(config: &LibraryConfig) -> (u32, f32) {
     (
         config.ocr_word_threshold.unwrap_or(DEFAULT_OCR_WORD_THRESHOLD),
@@ -856,6 +940,10 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
             ocr_text_chars: record.ocr_text_chars,
             nsfw_score: record.nsfw_score,
             nsfw_labels: record.nsfw_labels,
+            // Surface the title only when it's a real video (non-empty); `Some("")` just means
+            // "title strip scanned, not a video" and should read as blank in the UI.
+            video_title: record.video_title.filter(|title| !title.is_empty()),
+            vision_desc_chars: record.vision_desc_chars,
         });
     }
 
@@ -2207,6 +2295,511 @@ fn run_headless_refresh(app: &AppHandle) {
     app.exit(0);
 }
 
+// ============================================================================
+// Video chunking (Stage A): OCR the title bar, group frames by video, sample N
+// ============================================================================
+
+fn chunk_plan_path(root: &Path) -> PathBuf {
+    root.join(CHUNK_PLAN_FILE_NAME)
+}
+
+fn load_chunk_plan(root: &Path) -> Option<ChunkPlan> {
+    fs::read_to_string(chunk_plan_path(root))
+        .ok()
+        .and_then(|data| serde_json::from_str::<ChunkPlan>(&data).ok())
+}
+
+fn save_chunk_plan(root: &Path, plan: &ChunkPlan) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(plan)
+        .map_err(|error| format!("Failed to serialize chunk plan: {error}"))?;
+    fs::write(chunk_plan_path(root), data).map_err(|error| format!("Failed to save chunk plan: {error}"))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChunkPlanSummary {
+    exists: bool,
+    path: String,
+    groups: usize,
+    total_frames: usize,
+    selected_frames: usize,
+    samples_per_group: u32,
+    generated_at: Option<String>,
+}
+
+fn chunk_plan_summary(root: &Path) -> ChunkPlanSummary {
+    let path = chunk_plan_path(root).to_string_lossy().to_string();
+    match load_chunk_plan(root) {
+        Some(plan) => ChunkPlanSummary {
+            exists: true,
+            path,
+            groups: plan.groups.len(),
+            total_frames: plan.groups.iter().map(|g| g.member_hashes.len()).sum(),
+            selected_frames: plan.groups.iter().map(|g| g.selected_hashes.len()).sum(),
+            samples_per_group: plan.samples_per_group,
+            generated_at: Some(plan.generated_at),
+        },
+        None => ChunkPlanSummary {
+            exists: false,
+            path,
+            groups: 0,
+            total_frames: 0,
+            selected_frames: 0,
+            samples_per_group: DEFAULT_SAMPLES_PER_GROUP,
+            generated_at: None,
+        },
+    }
+}
+
+// (Re)builds and saves the plan from every record confirmed as a video frame. `force` re-samples
+// every group; otherwise frozen selections carry over so a rescan that only adds frames never
+// reshuffles a set you already reviewed. With no video frames at all, any stale plan is removed so
+// the vision pass falls back to describing everything.
+fn rebuild_and_save_plan(root: &Path, force: bool) -> Result<ChunkPlanSummary, String> {
+    let config = load_library_config(root);
+    let titled: Vec<(String, String)> = config
+        .images
+        .iter()
+        .filter_map(|(hash, record)| {
+            record
+                .video_title
+                .as_ref()
+                .filter(|title| !title.is_empty())
+                .map(|title| (hash.clone(), title.clone()))
+        })
+        .collect();
+
+    if titled.is_empty() {
+        let _ = fs::remove_file(chunk_plan_path(root));
+        return Ok(chunk_plan_summary(root));
+    }
+
+    let previous = load_chunk_plan(root);
+    let plan = build_plan(&titled, DEFAULT_SAMPLES_PER_GROUP, now_iso(), previous.as_ref(), force);
+    save_chunk_plan(root, &plan)?;
+    Ok(chunk_plan_summary(root))
+}
+
+#[tauri::command]
+fn get_chunk_plan(root: String) -> Result<ChunkPlanSummary, String> {
+    let root_buf = root_path(&root)?;
+    Ok(chunk_plan_summary(&root_buf))
+}
+
+#[tauri::command]
+fn regenerate_chunk_plan(root: String) -> Result<ChunkPlanSummary, String> {
+    let root_buf = root_path(&root)?;
+    rebuild_and_save_plan(&root_buf, true)
+}
+
+#[tauri::command]
+fn discard_chunk_plan(root: String) -> Result<ChunkPlanSummary, String> {
+    let root_buf = root_path(&root)?;
+    let path = chunk_plan_path(&root_buf);
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| format!("Failed to delete chunk plan: {error}"))?;
+    }
+    Ok(chunk_plan_summary(&root_buf))
+}
+
+#[tauri::command]
+fn build_chunk_plan(
+    app: AppHandle,
+    control: tauri::State<'_, ChunkControl>,
+    root: String,
+    force: bool,
+) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Video chunk scan is already running.".to_string());
+    }
+    let root_buf = match root_path(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+    let app_handle = app.clone();
+    std::thread::spawn(move || run_chunk_scan(&app_handle, &root_buf, force));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_chunk_scan(control: tauri::State<'_, ChunkControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No video chunk scan is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+// OCRs the title strip of every not-yet-scanned image (resumable via `video_title`), then rebuilds
+// the chunk plan (preserving frozen selections unless `force`). Mirrors the other passes' skeleton.
+fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
+    let control = app.state::<ChunkControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let view = scan_and_reconcile(root_buf)?;
+        let config = load_library_config(root_buf);
+        let excluded_folders: std::collections::HashSet<String> =
+            config.excluded_analysis_folders.iter().cloned().collect();
+
+        let pending: Vec<(String, String, String)> = view
+            .images
+            .iter()
+            .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| {
+                force
+                    || config
+                        .images
+                        .get(&image.hash)
+                        .map(|record| record.video_title.is_none())
+                        .unwrap_or(true)
+            })
+            .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
+            .collect();
+        drop(config);
+
+        let total = pending.len();
+        let mut cancelled = false;
+        let mut results: Vec<(String, String)> = Vec::new();
+
+        for (index, (hash, path, name)) in pending.iter().enumerate() {
+            if control.cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            match ocr::extract_title_strip(Path::new(path), TITLE_STRIP_TOP_FRACTION) {
+                // `Some(title)` for a video; `""` means "scanned, no video marker found".
+                Ok(strip) => results.push((hash.clone(), clean_title(&strip).unwrap_or_default())),
+                Err(error) => eprintln!("Title-strip OCR failed for {path}: {error}"),
+            }
+
+            if results.len() >= ANALYSIS_CHECKPOINT_EVERY {
+                commit_chunk_results(root_buf, &mut results)?;
+            }
+
+            let _ = app.emit(
+                "chunk-scan-progress",
+                TextAnalysisProgress { processed: index + 1, total, current_name: name.clone() },
+            );
+        }
+
+        commit_chunk_results(root_buf, &mut results)?;
+
+        let summary = rebuild_and_save_plan(root_buf, force)?;
+        let message = Some(format!(
+            "{} video{} grouped from {} frame{}; {} selected for description.",
+            summary.groups,
+            if summary.groups == 1 { "" } else { "s" },
+            summary.total_frames,
+            if summary.total_frames == 1 { "" } else { "s" },
+            summary.selected_frames,
+        ));
+        Ok((if cancelled { "cancelled" } else { "completed" }, message))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("chunk-scan-finished", TextAnalysisFinished { status, message });
+}
+
+// ============================================================================
+// Vision descriptions (Stage B): images -> words via a local vision model
+// ============================================================================
+
+fn vision_endpoint(settings: &AppSettings) -> String {
+    settings
+        .vision_endpoint
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_VISION_ENDPOINT.to_string())
+}
+
+fn vision_model(settings: &AppSettings) -> String {
+    settings
+        .vision_model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VisionSettingsView {
+    endpoint: String,
+    model: String,
+}
+
+#[tauri::command]
+fn get_vision_settings(app: AppHandle) -> VisionSettingsView {
+    let settings = load_app_settings(&app);
+    VisionSettingsView { endpoint: vision_endpoint(&settings), model: vision_model(&settings) }
+}
+
+#[tauri::command]
+fn set_vision_settings(app: AppHandle, endpoint: String, model: String) -> Result<VisionSettingsView, String> {
+    let mut settings = load_app_settings(&app);
+    settings.vision_endpoint = Some(endpoint.trim().to_string()).filter(|value| !value.is_empty());
+    settings.vision_model = Some(model.trim().to_string()).filter(|value| !value.is_empty());
+    save_app_settings(&app, &settings)?;
+    Ok(VisionSettingsView { endpoint: vision_endpoint(&settings), model: vision_model(&settings) })
+}
+
+// Writes one image's description sidecar (`<hash>.json` rich + `<hash>.txt` prose) and returns the
+// prose character count.
+fn write_vision_description(
+    desc_dir: &Path,
+    hash: &str,
+    relative_path: &str,
+    name: &str,
+    video_title: Option<&str>,
+    description: &str,
+    model: &str,
+) -> Result<u32, String> {
+    let record = serde_json::json!({
+        "schemaVersion": VISION_DESC_SCHEMA_VERSION,
+        "hash": hash,
+        "relativePath": relative_path,
+        "name": name,
+        "videoTitle": video_title,
+        "description": description,
+        "model": model,
+        "promptVersion": VISION_PROMPT_VERSION,
+        "analyzedAt": now_iso(),
+    });
+    let json = serde_json::to_string_pretty(&record)
+        .map_err(|error| format!("Failed to serialize description: {error}"))?;
+    fs::write(desc_dir.join(format!("{hash}.json")), json)
+        .map_err(|error| format!("Failed to save description: {error}"))?;
+    fs::write(desc_dir.join(format!("{hash}.txt")), description)
+        .map_err(|error| format!("Failed to save description text: {error}"))?;
+    Ok(description.chars().count() as u32)
+}
+
+// Rebuilds `index.json` (relative path -> hash) from every described record, so a consumer holding
+// an image file can resolve it to its `<hash>.json`. Derived from the sidecar, never bookkept
+// incrementally, so it can't drift out of sync.
+fn write_vision_index(root: &Path, desc_dir: &Path) -> Result<(), String> {
+    let config = load_library_config(root);
+    let mut by_path = serde_json::Map::new();
+    for (hash, record) in &config.images {
+        if record.vision_desc_chars.is_some() && !record.last_known_path.is_empty() {
+            by_path.insert(record.last_known_path.clone(), serde_json::Value::String(hash.clone()));
+        }
+    }
+    let index = serde_json::json!({
+        "version": 1,
+        "generatedAt": now_iso(),
+        "descriptionDir": VISION_DESC_DIR_NAME,
+        "byPath": by_path,
+    });
+    let json = serde_json::to_string_pretty(&index)
+        .map_err(|error| format!("Failed to serialize description index: {error}"))?;
+    fs::write(desc_dir.join(VISION_INDEX_FILE_NAME), json)
+        .map_err(|error| format!("Failed to save description index: {error}"))
+}
+
+#[tauri::command]
+fn analyze_vision(
+    app: AppHandle,
+    control: tauri::State<'_, VisionControl>,
+    root: String,
+    force: bool,
+) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Vision description is already running.".to_string());
+    }
+    let root_buf = match root_path(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+    let app_handle = app.clone();
+    std::thread::spawn(move || run_vision_analysis(&app_handle, &root_buf, force));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_vision_analysis(control: tauri::State<'_, VisionControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No vision description is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+// Describes eligible images with the local vision model, one at a time, committing after each so a
+// stop/crash resumes cleanly (a half-finished item leaves no sidecar and no marker, so it's just
+// redone). Eligible = not in an excluded folder, not explicit (per NSFW score), and — when a chunk
+// plan exists — every non-video image plus only the sampled frames of each video. Explicit or
+// not-yet-NSFW-scored images are skipped and counted so the summary explains what was left out.
+fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+    let control = app.state::<VisionControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let settings = load_app_settings(app);
+        let endpoint = vision_endpoint(&settings);
+        let model = vision_model(&settings);
+
+        let view = scan_and_reconcile(root_buf)?;
+        let config = load_library_config(root_buf);
+        let threshold = nsfw_threshold(&config);
+        let excluded_folders: std::collections::HashSet<String> =
+            config.excluded_analysis_folders.iter().cloned().collect();
+
+        // The chunk plan decides which video frames are allowed (only the sampled ones) and which
+        // hashes are video members at all (the rest are non-video and always eligible).
+        let plan = load_chunk_plan(root_buf);
+        let mut selected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut video_members: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(plan) = &plan {
+            for group in &plan.groups {
+                for hash in &group.member_hashes {
+                    video_members.insert(hash.clone());
+                }
+                for hash in &group.selected_hashes {
+                    selected.insert(hash.clone());
+                }
+            }
+        }
+
+        let desc_dir = root_buf.join(VISION_DESC_DIR_NAME);
+        fs::create_dir_all(&desc_dir).map_err(|error| format!("Failed to create descriptions folder: {error}"))?;
+
+        let mut skipped_video = 0usize;
+        let mut skipped_explicit = 0usize;
+        let mut skipped_unscored = 0usize;
+
+        let pending: Vec<(String, String, String, String, Option<String>)> = view
+            .images
+            .iter()
+            .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| {
+                if video_members.contains(&image.hash) && !selected.contains(&image.hash) {
+                    skipped_video += 1;
+                    return false;
+                }
+                true
+            })
+            .filter(|image| match config.images.get(&image.hash).and_then(|r| r.nsfw_score) {
+                Some(score) if score >= threshold => {
+                    skipped_explicit += 1;
+                    false
+                }
+                Some(_) => true,
+                None => {
+                    skipped_unscored += 1;
+                    false
+                }
+            })
+            .filter(|image| {
+                force
+                    || config
+                        .images
+                        .get(&image.hash)
+                        .map(|record| record.vision_desc_chars.is_none())
+                        .unwrap_or(true)
+            })
+            .map(|image| {
+                let title = config
+                    .images
+                    .get(&image.hash)
+                    .and_then(|r| r.video_title.clone())
+                    .filter(|t| !t.is_empty());
+                (
+                    image.hash.clone(),
+                    image.path.clone(),
+                    image.name.clone(),
+                    image.relative_path.clone(),
+                    title,
+                )
+            })
+            .collect();
+        drop(config);
+
+        let total = pending.len();
+        if total == 0 {
+            let _ = write_vision_index(root_buf, &desc_dir);
+            let mut notes = vec![];
+            if skipped_unscored > 0 {
+                notes.push(format!("{skipped_unscored} not yet Explicit-analyzed (run Explicit first)"));
+            }
+            if skipped_explicit > 0 {
+                notes.push(format!("{skipped_explicit} explicit"));
+            }
+            if skipped_video > 0 {
+                notes.push(format!("{skipped_video} deduped video frames"));
+            }
+            let message = if notes.is_empty() {
+                "No images needed description.".to_string()
+            } else {
+                format!("Nothing to describe. Skipped: {}.", notes.join(", "))
+            };
+            return Ok(("completed", Some(message)));
+        }
+
+        let agent = build_agent();
+        let mut cancelled = false;
+        let mut failures = 0usize;
+        let mut results: Vec<(String, u32)> = Vec::new();
+
+        for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
+            if control.cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            match describe_image(&agent, &endpoint, &model, DESCRIBE_PROMPT, Path::new(path)) {
+                Ok(description) => {
+                    match write_vision_description(&desc_dir, hash, relative_path, name, title.as_deref(), &description, &model) {
+                        Ok(chars) => results.push((hash.clone(), chars)),
+                        Err(error) => {
+                            failures += 1;
+                            eprintln!("Failed to save description for {path}: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("Vision description failed for {path}: {error}");
+                }
+            }
+
+            // Commit each result promptly so a stop resumes with at most the in-flight image redone.
+            commit_vision_results(root_buf, &mut results)?;
+
+            let _ = app.emit(
+                "vision-analysis-progress",
+                TextAnalysisProgress { processed: index + 1, total, current_name: name.clone() },
+            );
+        }
+
+        commit_vision_results(root_buf, &mut results)?;
+        write_vision_index(root_buf, &desc_dir)?;
+
+        let described = total - failures;
+        let mut message = format!("Described {described} image{}.", if described == 1 { "" } else { "s" });
+        if failures > 0 {
+            message.push_str(&format!(" {failures} failed (see logs; endpoint {endpoint})."));
+        }
+        Ok((if cancelled { "cancelled" } else { "completed" }, Some(message)))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("vision-analysis-finished", TextAnalysisFinished { status, message });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let headless_refresh = std::env::args().any(|arg| arg == HEADLESS_REFRESH_ARG);
@@ -2227,6 +2820,8 @@ pub fn run() {
         .manage(AnalysisControl::default())
         .manage(NsfwControl::default())
         .manage(OcrTextControl::default())
+        .manage(ChunkControl::default())
+        .manage(VisionControl::default())
         .setup(move |app| {
             if headless_refresh {
                 let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
@@ -2242,6 +2837,8 @@ pub fn run() {
                             app.state::<NsfwControl>().cancel.store(true, Ordering::SeqCst);
                             app.state::<AnalysisControl>().cancel.store(true, Ordering::SeqCst);
                             app.state::<OcrTextControl>().cancel.store(true, Ordering::SeqCst);
+                            app.state::<ChunkControl>().cancel.store(true, Ordering::SeqCst);
+                            app.state::<VisionControl>().cancel.store(true, Ordering::SeqCst);
                         }
                     });
                 if let Some(icon) = app.default_window_icon().cloned() {
@@ -2268,22 +2865,30 @@ pub fn run() {
             add_manual_source_folder,
             analyze_nsfw,
             analyze_text,
+            analyze_vision,
             assign_category,
+            build_chunk_plan,
+            cancel_chunk_scan,
             cancel_nsfw_analysis,
             cancel_text_analysis,
             cancel_text_extraction,
+            cancel_vision_analysis,
             choose_root_folder,
             create_category,
             delete_category,
+            discard_chunk_plan,
             download_nsfw_model,
             extract_text,
             get_app_settings,
             get_auto_refresh_settings,
+            get_chunk_plan,
             get_nsfw_model_info,
+            get_vision_settings,
             import_images,
             move_image,
             open_image,
             open_root_folder,
+            regenerate_chunk_plan,
             remove_manual_source_folder,
             rename_category,
             reveal_image,
@@ -2295,8 +2900,131 @@ pub fn run() {
             set_nsfw_threshold,
             set_source_pattern,
             set_text_thresholds,
-            set_tile_size
+            set_tile_size,
+            set_vision_settings
         ])
         .run(context)
         .expect("error while running tauri application");
+}
+
+// End-to-end harness (env-gated) that runs the whole non-GUI pipeline — real scan, real title-strip
+// OCR, real grouping/sampling, and the real `describe_image` HTTP path — against a stub endpoint,
+// with Claude standing in for the vision model (its per-image descriptions live in DESCRIPTIONS,
+// routed by filename and handed to the stub one image at a time). Proves the plumbing on real
+// screenshots without a running LM Studio. Set ICAT_TEST_LIBRARY, ICAT_TEST_VISION_ENDPOINT, and
+// ICAT_TEST_STUB_RESPONSE_FILE to run it.
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+
+    const PYRENEES_DESC: &str = "A first-person dashcam driving still on a two-lane mountain highway, filmed from inside a moving car. The road curves gently right with a white van ahead; a dry-stone retaining wall topped with rockfall netting climbs a steep rock face on the right, while a roadside billboard reading 'caldea' and forested green mountains rise on the left under a clear blue sky with bright sun. The browser title bar reads 'Driving across the Pyrenees mountains from France FR to Andorra AD - YouTube', identifying a YouTube driving video, and the 'caldea' billboard is an Andorran thermal-spa brand consistent with the Andorra approach.\nLocation: Pyrenees mountains, on the France to Andorra route.";
+
+    const NYC_DESC: &str = "A dark night-time aerial shot looking down on a single low, brightly lit commercial building beside a large parking lot, with a tall illuminated pole flying a US flag in the foreground and scattered light poles, a few parked cars, and mostly black surroundings. The window title bar reads 'New York City Skyline at Night Live Screensaver HD, Aerial Landscapes Wallpaper HD Live - YouTube', so the source video claims a New York City skyline, though the visible frame shows an isolated lit building and lot rather than a recognizable skyline. The American flag is consistent with a United States location.\nLocation: United States (title claims New York City; not confirmed by the visible frame).";
+
+    const VSCODE_DESC: &str = "A screenshot of the Visual Studio Code editor (not a video), with the 'aikoodaus' workspace open and several Claude Code chat panels tiled side by side — visible tab titles include 'Evaluate image categorizer Tauri', 'Build neon city asset package', and 'Add deep mining mode to voxel-frontier'. A right-hand sidebar lists a chat history under CHAT / CLAUDE CODE / CODEX, and terminal panes at the bottom show pwsh/node sessions (agent-asset-forge, asset-forge) with a dev server on 127.0.0.1. This is a software-development screenshot, so no geographic location applies.\nLocation: none (code editor screenshot).";
+
+    fn my_description_for(name: &str) -> &'static str {
+        if name.contains("052645_109") {
+            NYC_DESC
+        } else if name.contains("075543_178") {
+            VSCODE_DESC
+        } else {
+            PYRENEES_DESC
+        }
+    }
+
+    #[test]
+    fn end_to_end_describe_with_claude_as_the_model() {
+        let (Ok(root_str), Ok(endpoint)) =
+            (std::env::var("ICAT_TEST_LIBRARY"), std::env::var("ICAT_TEST_VISION_ENDPOINT"))
+        else {
+            eprintln!("skipping e2e: ICAT_TEST_LIBRARY / ICAT_TEST_VISION_ENDPOINT not set");
+            return;
+        };
+        let resp_file = std::env::var("ICAT_TEST_STUB_RESPONSE_FILE").expect("ICAT_TEST_STUB_RESPONSE_FILE");
+        let model = "claude-as-stub";
+        let root = Path::new(&root_str);
+
+        // 1. Real scan — builds the sidecar, thumbnails, and one record per copied screenshot.
+        let view = scan_and_reconcile(root).expect("scan");
+        eprintln!("\n[1] scanned {} images", view.images.len());
+
+        // 2. Mark every record NSFW-safe. In real use you run Explicit first; Describe skips explicit
+        //    AND not-yet-scored images, so this stands in for that prerequisite.
+        {
+            let mut config = load_library_config(root);
+            for record in config.images.values_mut() {
+                record.nsfw_score = Some(0.0);
+            }
+            save_library_config(root, &config).unwrap();
+        }
+
+        // 3. Real Video Dedup: OCR each title strip, resolve the video title, then build the plan
+        //    with samples_per_group = 2 to show de-duplication on the Pyrenees group.
+        let mut chunk_results: Vec<(String, String)> = Vec::new();
+        for image in &view.images {
+            let strip = ocr::extract_title_strip(Path::new(&image.path), TITLE_STRIP_TOP_FRACTION).unwrap_or_default();
+            chunk_results.push((image.hash.clone(), clean_title(&strip).unwrap_or_default()));
+        }
+        commit_chunk_results(root, &mut chunk_results).unwrap();
+
+        let config = load_library_config(root);
+        let titled: Vec<(String, String)> = config
+            .images
+            .iter()
+            .filter_map(|(hash, record)| {
+                record.video_title.as_ref().filter(|t| !t.is_empty()).map(|t| (hash.clone(), t.clone()))
+            })
+            .collect();
+        let plan = build_plan(&titled, 2, now_iso(), None, false);
+        save_chunk_plan(root, &plan).unwrap();
+        eprintln!("[3] chunk plan: {} group(s)", plan.groups.len());
+        for group in &plan.groups {
+            eprintln!("    {:?}: {} frames -> {} selected", group.title, group.member_hashes.len(), group.selected_hashes.len());
+        }
+
+        // 4. Vision pass with Claude as the model: describe non-video images + only the sampled video
+        //    frames, writing the real sidecars + index via the real functions.
+        let mut selected = std::collections::HashSet::new();
+        let mut video_members = std::collections::HashSet::new();
+        for group in &plan.groups {
+            for hash in &group.member_hashes {
+                video_members.insert(hash.clone());
+            }
+            for hash in &group.selected_hashes {
+                selected.insert(hash.clone());
+            }
+        }
+
+        let desc_dir = root.join(VISION_DESC_DIR_NAME);
+        fs::create_dir_all(&desc_dir).unwrap();
+        let agent = build_agent();
+
+        let mut described = 0usize;
+        eprintln!("[4] describing:");
+        for image in &view.images {
+            if video_members.contains(&image.hash) && !selected.contains(&image.hash) {
+                eprintln!("    SKIP (deduped video frame) {}", image.name);
+                continue;
+            }
+            let my_desc = my_description_for(&image.name);
+            fs::write(&resp_file, my_desc).unwrap();
+
+            let returned = describe_image(&agent, &endpoint, model, DESCRIBE_PROMPT, Path::new(&image.path))
+                .expect("describe_image should reach the stub");
+            assert_eq!(returned.trim(), my_desc.trim(), "round-trip must return exactly what the model produced");
+
+            let title = config.images.get(&image.hash).and_then(|r| r.video_title.clone()).filter(|t| !t.is_empty());
+            let chars = write_vision_description(&desc_dir, &image.hash, &image.relative_path, &image.name, title.as_deref(), &returned, model).unwrap();
+            commit_vision_results(root, &mut vec![(image.hash.clone(), chars)]).unwrap();
+            described += 1;
+            eprintln!("    DESCRIBED {} ({} chars)", image.name, chars);
+        }
+        write_vision_index(root, &desc_dir).unwrap();
+
+        eprintln!("[done] described {described} images; plan + index written under {}", desc_dir.display());
+        assert!(chunk_plan_path(root).exists(), "chunk plan file must exist");
+        assert!(desc_dir.join(VISION_INDEX_FILE_NAME).exists(), "description index must exist");
+        assert!(described >= 3, "should describe the sampled frames plus the standalone images");
+    }
 }

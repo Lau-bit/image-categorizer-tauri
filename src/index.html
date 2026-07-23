@@ -75,6 +75,14 @@
                 <input type="checkbox" id="extract-text-check">
                 <span>Extract Text</span>
               </label>
+              <label class="analysis-type-check" title="OCR the title bar of video-frame screenshots, group frames from the same video, and keep a random sample per video for description (builds/updates the chunk plan)">
+                <input type="checkbox" id="analyze-chunk-check">
+                <span>Video Dedup</span>
+              </label>
+              <label class="analysis-type-check" id="analyze-vision-check-label" title="Describe each image in words with a local vision model (LM Studio). Skips explicit images and non-sampled duplicate video frames.">
+                <input type="checkbox" id="analyze-vision-check">
+                <span>Describe</span>
+              </label>
               <button
                 id="analyze-button"
                 class="button secondary"
@@ -243,6 +251,38 @@
             <button class="button compact secondary hidden" id="download-nsfw-model-button" type="button">Download Model</button>
           </div>
           <pre class="download-report hidden" id="nsfw-model-report"></pre>
+        </div>
+
+        <div class="settings-stack">
+          <span class="settings-label">Vision Descriptions (Images → Words)</span>
+          <p class="dialog-hint">
+            Describes images in words with a local OpenAI-compatible vision model. Load a vision
+            model in LM Studio and start its local server, then tick "Describe" under Analyze.
+            Each description is saved beside the library (a <code>.image-categorizer-descriptions</code>
+            folder, one file per image, plus an <code>index.json</code>) so other apps — e.g. Local
+            LLM Chat — can read an image as text. Explicit images are skipped, so run Explicit first.
+          </p>
+          <label class="settings-stack">
+            <span class="settings-label">Vision endpoint</span>
+            <input id="vision-endpoint-input" class="dialog-input" autocomplete="off" placeholder="http://localhost:1234/v1/chat/completions">
+          </label>
+          <label class="settings-stack">
+            <span class="settings-label">Model name (as loaded in LM Studio)</span>
+            <input id="vision-model-input" class="dialog-input" autocomplete="off" placeholder="local-model">
+          </label>
+
+          <span class="settings-label">Video Chunk Plan</span>
+          <p class="dialog-hint">
+            "Video Dedup" reads each screenshot's title bar, groups frames from the same video, and
+            samples 10 per video for description — so 500 near-identical frames don't each get
+            described. The plan is a standalone file you can inspect, hand-edit, or discard.
+          </p>
+          <p class="settings-value" id="chunk-plan-status">No chunk plan yet.</p>
+          <div class="model-row">
+            <button class="button compact secondary" id="regenerate-chunk-plan-button" type="button" title="Re-sample every group from scratch (re-rolls which frames are kept)">Regenerate</button>
+            <button class="button compact secondary" id="open-chunk-plan-button" type="button" title="Reveal the chunk plan file in Explorer to inspect or edit it">Open Plan File</button>
+            <button class="button compact secondary" id="discard-chunk-plan-button" type="button" title="Delete the chunk plan; the vision pass will then consider every image">Discard Plan</button>
+          </div>
         </div>
 
         <label class="settings-stack">
