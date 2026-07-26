@@ -25,6 +25,10 @@
           <span>Unclassified</span>
           <span class="count-pill" id="unclassified-count">0</span>
         </button>
+        <button class="nav-item" id="geo-tab" type="button">
+          <span>Geo Coverage</span>
+          <span class="count-pill" id="geo-count">0</span>
+        </button>
 
         <div class="section-title">
           <span>Categories</span>
@@ -54,8 +58,10 @@
           </div>
           <div class="top-actions">
             <input id="search-input" class="search-input" type="search" placeholder="Search images">
-            <span id="status-spinner" class="status-spinner hidden" aria-hidden="true"></span>
-            <span id="status-message" class="status-message"></span>
+            <span class="status-area">
+              <span id="status-spinner" class="status-spinner" aria-hidden="true"></span>
+              <span id="status-message" class="status-message"></span>
+            </span>
             <select id="sort-select" class="sort-select" title="Sort images">
               <option value="newest">Newest</option>
               <option value="name">Name</option>
@@ -87,19 +93,20 @@
                 id="analyze-button"
                 class="button secondary"
                 type="button"
-                title="Analyze images not yet analyzed (for selected types and included folders)"
+                title="Analyze images not yet analyzed (for selected types, included folders, and included categories)"
               >Analyze New</button>
               <button
                 id="reanalyze-button"
                 class="button secondary"
                 type="button"
-                title="Re-analyze all images even if already analyzed (for selected types and included folders)"
+                title="Re-analyze all images even if already analyzed (for selected types, included folders, and included categories)"
               >Re-analyze All</button>
               <button
                 id="cancel-analysis-button"
-                class="button secondary hidden"
+                class="button danger hidden"
                 type="button"
-              >Cancel</button>
+                title="Stop the running analysis pass"
+              >&#9632; Cancel</button>
             </div>
             <button
               id="refresh-button"
@@ -130,6 +137,57 @@
             <span class="spinner" aria-hidden="true"></span>
             <span class="loading-label" id="loading-label">Loading your library…</span>
           </div>
+        </section>
+
+        <!-- Geo lives in its own panel rather than reusing the image grid: it is a scoreboard, not
+             a list of images, and keeping it separate means the grid's virtual scrolling and drop
+             handling are untouched by any of this. -->
+        <section class="geo-view hidden" id="geo-view">
+          <div class="geo-toolbar">
+            <button id="geo-derive-button" class="button" type="button">Derive Geo</button>
+            <button id="geo-classify-button" class="button secondary" type="button">Classify Scenes</button>
+            <button id="geo-cancel-classify-button" class="button secondary hidden" type="button">Stop</button>
+            <button id="geo-build-sets-button" class="button secondary" type="button">Build Country Sets</button>
+            <label class="geo-inline-field">
+              <span>Set size</span>
+              <input id="geo-set-size" class="geo-number-input" type="number" min="4" max="64" step="1" value="16">
+            </label>
+            <button id="geo-gazetteer-button" class="button secondary" type="button">Edit Gazetteer…</button>
+            <span class="geo-toolbar-spacer"></span>
+            <span class="geo-generated" id="geo-generated"></span>
+          </div>
+
+          <div class="geo-stats" id="geo-stats"></div>
+          <div class="geo-kinds" id="geo-kinds"></div>
+
+          <div class="geo-columns">
+            <div class="geo-column">
+              <div class="geo-section-head">
+                <h2>Coverage</h2>
+                <p class="geo-section-hint">
+                  Counted in distinct <strong>videos</strong>, not images — sixteen frames of two drives
+                  is not a country. Worst first inside each cluster; clusters are confusion
+                  neighbourhoods, so a low ratio is where distance points are being lost.
+                </p>
+              </div>
+              <div class="geo-legend" id="geo-legend"></div>
+              <div class="geo-clusters" id="geo-clusters"></div>
+            </div>
+
+            <div class="geo-column">
+              <div class="geo-section-head">
+                <h2>Country Sets</h2>
+                <p class="geo-section-hint">
+                  One frame per video wherever the country can afford it. Sets that had to reuse
+                  videos are badged <span class="geo-badge limited">limited</span> — still good as
+                  reference, not as practice.
+                </p>
+              </div>
+              <div class="geo-sets" id="geo-sets"></div>
+            </div>
+          </div>
+
+          <div class="geo-worklist" id="geo-worklist"></div>
         </section>
         <div class="drop-overlay hidden" id="drop-overlay">
           <div class="drop-overlay-inner">
@@ -267,8 +325,22 @@
             <input id="vision-endpoint-input" class="dialog-input" autocomplete="off" placeholder="http://localhost:1234/v1/chat/completions">
           </label>
           <label class="settings-stack">
-            <span class="settings-label">Model name (as loaded in LM Studio)</span>
-            <input id="vision-model-input" class="dialog-input" autocomplete="off" placeholder="local-model">
+            <span class="settings-label">Model</span>
+            <div class="model-row">
+              <select id="vision-model-select" class="dialog-input" title="Models offered by the endpoint">
+                <option value="">— pick a model —</option>
+              </select>
+              <button class="button compact secondary" id="refresh-vision-models-button" type="button" title="Fetch the model list from the endpoint">Refresh</button>
+            </div>
+            <input id="vision-model-input" class="dialog-input" autocomplete="off" placeholder="local-model" title="Or type a model id manually">
+          </label>
+          <div class="model-row">
+            <p class="settings-value" id="vision-model-status"></p>
+            <button class="button compact" id="load-vision-model-button" type="button" title="Load the selected model into LM Studio now, so Describe won't fail on an empty server">Load model</button>
+          </div>
+          <label class="settings-stack">
+            <span class="settings-label">API token (only if LM Studio requires one)</span>
+            <input id="vision-api-key-input" class="dialog-input" type="password" autocomplete="off" placeholder="leave blank if auth is off">
           </label>
 
           <span class="settings-label">Video Chunk Plan</span>
@@ -359,6 +431,9 @@
       </form>
     </dialog>
 
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite">
+      <span class="toast-text" id="toast-text"></span>
+      <button class="toast-dismiss" id="toast-dismiss" type="button" title="Dismiss" aria-label="Dismiss">&#10005;</button>
+    </div>
   </body>
 </html>

@@ -37,6 +37,8 @@ window.categorizerAPI = {
     invoke('set_text_thresholds', { root, wordThreshold, areaThreshold }),
   setFolderAnalysisIncluded: (root, folderName, included) =>
     invoke('set_folder_analysis_included', { root, folderName, included }),
+  setCategoryAnalysisIncluded: (root, categoryName, included) =>
+    invoke('set_category_analysis_included', { root, categoryName, included }),
   onTextAnalysisProgress: callback => event.listen('text-analysis-progress', message => callback(message.payload)),
   onTextAnalysisFinished: callback => event.listen('text-analysis-finished', message => callback(message.payload)),
 
@@ -69,9 +71,28 @@ window.categorizerAPI = {
   analyzeVision: (root, force) => invoke('analyze_vision', { root, force }),
   cancelVisionAnalysis: () => invoke('cancel_vision_analysis'),
   getVisionSettings: () => invoke('get_vision_settings'),
-  setVisionSettings: (endpoint, model) => invoke('set_vision_settings', { endpoint, model }),
+  setVisionSettings: (endpoint, model, apiKey) => invoke('set_vision_settings', { endpoint, model, apiKey }),
+  listVisionModels: () => invoke('list_vision_models'),
+  loadVisionModel: model => invoke('load_vision_model', { model }),
   onVisionAnalysisProgress: callback => event.listen('vision-analysis-progress', message => callback(message.payload)),
   onVisionAnalysisFinished: callback => event.listen('vision-analysis-finished', message => callback(message.payload)),
+
+  // Geo layer: countries derived from the vision descriptions, plus country sets built from them.
+  // Purely additive — these read/write their own sidecars and never touch image categories.
+  deriveGeo: root => invoke('derive_geo', { root }),
+  // Scene-kind pass: text-only over the descriptions, so country sets can drop interiors,
+  // talking heads and screenshots that carry a real country but show no place.
+  classifyKinds: (root, force) => invoke('classify_kinds', { root, force }),
+  cancelKindClassification: () => invoke('cancel_kind_classification'),
+  getKindSummary: root => invoke('get_kind_summary', { root }),
+  onKindProgress: callback => event.listen('kind-classification-progress', message => callback(message.payload)),
+  onKindFinished: callback => event.listen('kind-classification-finished', message => callback(message.payload)),
+  getGeoSummary: root => invoke('get_geo_summary', { root }),
+  getGeoCoverage: root => invoke('get_geo_coverage', { root }),
+  buildGeoSets: (root, targetSize) => invoke('build_geo_sets', { root, targetSize }),
+  getGeoSets: root => invoke('get_geo_sets', { root }),
+  getGeoSetImages: (root, setId) => invoke('get_geo_set_images', { root, setId }),
+  openGeoGazetteer: root => invoke('open_geo_gazetteer', { root }),
 
   // Category management
   createCategory: (root, name) => invoke('create_category', { root, name }),

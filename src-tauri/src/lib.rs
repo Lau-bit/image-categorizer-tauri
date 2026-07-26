@@ -33,7 +33,11 @@ mod chunker;
 use chunker::{build_plan, clean_title, ChunkPlan};
 
 mod vision;
-use vision::{build_agent, describe_image, DESCRIBE_PROMPT};
+use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROMPT};
+
+mod geo;
+
+mod kinds;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "heic", "heif"];
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
@@ -69,6 +73,14 @@ const VISION_PROMPT_VERSION: u32 = 1;
 // chunk plan samples for the vision pass. Fixed defaults for this first version.
 const TITLE_STRIP_TOP_FRACTION: f32 = 0.06;
 const DEFAULT_SAMPLES_PER_GROUP: u32 = 10;
+
+// How many leading images may fail at the vision endpoint with nothing yet described before the
+// Describe pass gives up and reports the endpoint's own error (no model loaded / bad token / down).
+const VISION_FAIL_FAST_ATTEMPTS: usize = 3;
+
+// How much of a description the scene classifier sees. Enough to cover the actual scene prose after
+// the video title is stripped, without bloating a 20-item batch prompt.
+const KIND_SCENE_MAX_CHARS: usize = 700;
 
 const DEFAULT_VISION_ENDPOINT: &str = "http://localhost:1234/v1/chat/completions";
 const DEFAULT_VISION_MODEL: &str = "local-model";
@@ -115,9 +127,11 @@ struct AppSettings {
     last_auto_refresh_at: Option<String>,
     last_auto_refresh_summary: Option<String>,
     // OpenAI-compatible vision endpoint (LM Studio by default) + the model name to send. Global, so
-    // one setting drives the description pass across every library.
+    // one setting drives the description pass across every library. `vision_api_key` is the bearer
+    // token LM Studio requires when its API-token auth is enabled; `None` = send no Authorization.
     vision_endpoint: Option<String>,
     vision_model: Option<String>,
+    vision_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -176,6 +190,8 @@ struct LibraryConfig {
     nsfw_score_threshold: Option<f32>,
     #[serde(default)]
     excluded_analysis_folders: Vec<String>,
+    #[serde(default)]
+    excluded_analysis_categories: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +242,7 @@ struct SourceFolderView {
 struct CategoryView {
     name: String,
     count: usize,
+    included_in_analysis: bool,
 }
 
 /// What `assign_category` stamped on the record, so the frontend can mirror it without a rescan.
@@ -325,6 +342,12 @@ struct ChunkControl {
 
 #[derive(Default)]
 struct VisionControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
+struct KindControl {
     running: AtomicBool,
     cancel: AtomicBool,
 }
@@ -981,6 +1004,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         .map(|name| CategoryView {
             name: name.clone(),
             count: category_counts.get(name).copied().unwrap_or(0),
+            included_in_analysis: !config.excluded_analysis_categories.iter().any(|excluded| excluded == name),
         })
         .collect();
     categories.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -1140,6 +1164,8 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
 
+        let excluded_categories = excluded_analysis_categories(&config);
+
         let included_folder_exists = view
             .source_folders
             .iter()
@@ -1152,6 +1178,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             .images
             .iter()
             .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
             .filter(|image| {
                 config
                     .images
@@ -1280,6 +1307,8 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
         fs::create_dir_all(&text_dir)
             .map_err(|error| format!("Failed to create text folder: {error}"))?;
 
+        let excluded_categories = excluded_analysis_categories(&config);
+
         let included_folder_exists = view
             .source_folders
             .iter()
@@ -1292,6 +1321,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
             .images
             .iter()
             .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
             .filter(|image| {
                 force
                     || config
@@ -1400,6 +1430,41 @@ fn set_folder_analysis_included(root: String, folder_name: String, included: boo
     }
     save_library_config(&root, &config)?;
     scan_and_reconcile(&root)
+}
+
+#[tauri::command]
+fn set_category_analysis_included(root: String, category_name: String, included: bool) -> Result<LibraryView, String> {
+    let root = root_path(&root)?;
+    let mut config = load_library_config(&root);
+    config.excluded_analysis_categories.retain(|item| item != &category_name);
+    if !included {
+        config.excluded_analysis_categories.push(category_name);
+    }
+    save_library_config(&root, &config)?;
+    scan_and_reconcile(&root)
+}
+
+/// The set of categories switched OFF for analysis. Images whose current category is in this set are
+/// skipped by every analysis pass — the category analog of `excluded_analysis_folders`. Lets the
+/// user stop spending analysis (chiefly vision tokens) on images already well-handled, e.g. "High
+/// Text", which OCR already captured, so Describe can focus on low-text images and deduped frames.
+fn excluded_analysis_categories(config: &LibraryConfig) -> std::collections::HashSet<String> {
+    config.excluded_analysis_categories.iter().cloned().collect()
+}
+
+/// True when `hash`'s current category is one the user excluded from analysis.
+fn category_is_excluded(
+    config: &LibraryConfig,
+    hash: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> bool {
+    !excluded.is_empty()
+        && config
+            .images
+            .get(hash)
+            .and_then(|record| record.category.as_deref())
+            .map(|category| excluded.contains(category))
+            .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -1949,11 +2014,13 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let config = load_library_config(root_buf);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
+        let excluded_categories = excluded_analysis_categories(&config);
 
         let pending: Vec<(String, String, String)> = view
             .images
             .iter()
             .filter(|img| !excluded_folders.contains(&img.source_folder))
+            .filter(|img| !category_is_excluded(&config, &img.hash, &excluded_categories))
             .filter(|img| {
                 force
                     || config
@@ -2444,11 +2511,13 @@ fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
         let config = load_library_config(root_buf);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
+        let excluded_categories = excluded_analysis_categories(&config);
 
         let pending: Vec<(String, String, String)> = view
             .images
             .iter()
             .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
             .filter(|image| {
                 force
                     || config
@@ -2528,26 +2597,92 @@ fn vision_model(settings: &AppSettings) -> String {
         .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string())
 }
 
+/// The bearer token sent to the vision endpoint, or `None` when unset. LM Studio rejects every
+/// request when its "Require API token" auth is on and no token is supplied; most other local
+/// servers ignore the header, so it is optional.
+fn vision_api_key(settings: &AppSettings) -> Option<String> {
+    settings
+        .vision_api_key
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Derives the `…/v1/models` URL from the configured chat-completions endpoint, so the model picker
+/// hits the same server without needing a second setting. Strips a trailing `/chat/completions`
+/// (the usual shape) — else falls back to appending `/models` beside whatever path is configured.
+fn vision_models_url(settings: &AppSettings) -> String {
+    let endpoint = vision_endpoint(settings);
+    let trimmed = endpoint.trim_end_matches('/');
+    let base = trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/completions"))
+        .unwrap_or(trimmed);
+    format!("{base}/models")
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VisionSettingsView {
     endpoint: String,
     model: String,
+    api_key: String,
 }
 
 #[tauri::command]
 fn get_vision_settings(app: AppHandle) -> VisionSettingsView {
     let settings = load_app_settings(&app);
-    VisionSettingsView { endpoint: vision_endpoint(&settings), model: vision_model(&settings) }
+    VisionSettingsView {
+        endpoint: vision_endpoint(&settings),
+        model: vision_model(&settings),
+        api_key: vision_api_key(&settings).unwrap_or_default(),
+    }
 }
 
 #[tauri::command]
-fn set_vision_settings(app: AppHandle, endpoint: String, model: String) -> Result<VisionSettingsView, String> {
+fn set_vision_settings(
+    app: AppHandle,
+    endpoint: String,
+    model: String,
+    api_key: String,
+) -> Result<VisionSettingsView, String> {
     let mut settings = load_app_settings(&app);
     settings.vision_endpoint = Some(endpoint.trim().to_string()).filter(|value| !value.is_empty());
     settings.vision_model = Some(model.trim().to_string()).filter(|value| !value.is_empty());
+    settings.vision_api_key = Some(api_key.trim().to_string()).filter(|value| !value.is_empty());
     save_app_settings(&app, &settings)?;
-    Ok(VisionSettingsView { endpoint: vision_endpoint(&settings), model: vision_model(&settings) })
+    Ok(VisionSettingsView {
+        endpoint: vision_endpoint(&settings),
+        model: vision_model(&settings),
+        api_key: vision_api_key(&settings).unwrap_or_default(),
+    })
+}
+
+/// Lists the model ids the configured vision endpoint offers, for the Settings model picker.
+#[tauri::command]
+fn list_vision_models(app: AppHandle) -> Result<Vec<String>, String> {
+    let settings = load_app_settings(&app);
+    let models_url = vision_models_url(&settings);
+    let api_key = vision_api_key(&settings);
+    let agent = build_agent();
+    list_models(&agent, &models_url, api_key.as_deref())
+}
+
+/// Actively loads `model` into the endpoint now (LM Studio JIT-loads it on a tiny poke), so the user
+/// can confirm the model comes up before running Describe instead of discovering mid-run that
+/// nothing was loaded. Blocks until the model responds — a cold load legitimately takes a while.
+#[tauri::command]
+fn load_vision_model(app: AppHandle, model: String) -> Result<String, String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Pick or type a model first.".to_string());
+    }
+    let settings = load_app_settings(&app);
+    let endpoint = vision_endpoint(&settings);
+    let api_key = vision_api_key(&settings);
+    let agent = build_agent();
+    warm_model(&agent, &endpoint, &model, api_key.as_deref())?;
+    Ok(format!("Model \"{model}\" is loaded and ready."))
 }
 
 // Writes one image's description sidecar (`<hash>.json` rich + `<hash>.txt` prose) and returns the
@@ -2648,12 +2783,14 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let settings = load_app_settings(app);
         let endpoint = vision_endpoint(&settings);
         let model = vision_model(&settings);
+        let api_key = vision_api_key(&settings);
 
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
         let threshold = nsfw_threshold(&config);
         let excluded_folders: std::collections::HashSet<String> =
             config.excluded_analysis_folders.iter().cloned().collect();
+        let excluded_categories = excluded_analysis_categories(&config);
 
         // The chunk plan decides which video frames are allowed (only the sampled ones) and which
         // hashes are video members at all (the rest are non-video and always eligible).
@@ -2677,11 +2814,21 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut skipped_video = 0usize;
         let mut skipped_explicit = 0usize;
         let mut skipped_unscored = 0usize;
+        let mut skipped_category = 0usize;
 
         let pending: Vec<(String, String, String, String, Option<String>)> = view
             .images
             .iter()
             .filter(|image| !excluded_folders.contains(&image.source_folder))
+            .filter(|image| {
+                // Omitted categories (e.g. "High Text", already covered by OCR) never reach the
+                // vision model — this is where the token savings the user asked for come from.
+                if category_is_excluded(&config, &image.hash, &excluded_categories) {
+                    skipped_category += 1;
+                    return false;
+                }
+                true
+            })
             .filter(|image| {
                 if video_members.contains(&image.hash) && !selected.contains(&image.hash) {
                     skipped_video += 1;
@@ -2738,6 +2885,9 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             if skipped_video > 0 {
                 notes.push(format!("{skipped_video} deduped video frames"));
             }
+            if skipped_category > 0 {
+                notes.push(format!("{skipped_category} in omitted categories"));
+            }
             let message = if notes.is_empty() {
                 "No images needed description.".to_string()
             } else {
@@ -2747,8 +2897,23 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         let agent = build_agent();
+
+        // Actively load the chosen model before the first image. LM Studio JIT-loads a cold model on
+        // this poke; if it can't (model not downloaded, wrong token, server down) every image would
+        // fail identically, so surface that now with the server's own message instead of grinding.
+        if let Err(error) = warm_model(&agent, &endpoint, &model, api_key.as_deref()) {
+            return Err(format!(
+                "Describe couldn't load the model \"{model}\". Pick a model that is downloaded in \
+                 LM Studio (Settings → Describe → Load model), and check the endpoint and API token. \
+                 Error: {error}"
+            ));
+        }
+
         let mut cancelled = false;
         let mut failures = 0usize;
+        let mut described_ok = 0usize;
+        let mut endpoint_failures = 0usize;
+        let mut last_endpoint_error: Option<String> = None;
         let mut results: Vec<(String, u32)> = Vec::new();
 
         for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
@@ -2756,10 +2921,13 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                 cancelled = true;
                 break;
             }
-            match describe_image(&agent, &endpoint, &model, DESCRIBE_PROMPT, Path::new(path)) {
+            match describe_image(&agent, &endpoint, &model, api_key.as_deref(), DESCRIBE_PROMPT, Path::new(path)) {
                 Ok(description) => {
                     match write_vision_description(&desc_dir, hash, relative_path, name, title.as_deref(), &description, &model) {
-                        Ok(chars) => results.push((hash.clone(), chars)),
+                        Ok(chars) => {
+                            described_ok += 1;
+                            results.push((hash.clone(), chars));
+                        }
                         Err(error) => {
                             failures += 1;
                             eprintln!("Failed to save description for {path}: {error}");
@@ -2768,12 +2936,28 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                 }
                 Err(error) => {
                     failures += 1;
+                    endpoint_failures += 1;
                     eprintln!("Vision description failed for {path}: {error}");
+                    last_endpoint_error = Some(error);
                 }
             }
 
             // Commit each result promptly so a stop resumes with at most the in-flight image redone.
             commit_vision_results(root_buf, &mut results)?;
+
+            // Fail fast: if the first few requests all bounce off the endpoint with nothing
+            // described, the model is unloaded, the server is down, or the API token is wrong —
+            // grinding through (and re-encoding) every remaining image would just fail identically.
+            // Abort loudly with the server's own error so the user can fix it, instead of the old
+            // behaviour of silent slow progress the run never recovers from.
+            if described_ok == 0 && endpoint_failures >= VISION_FAIL_FAST_ATTEMPTS {
+                let reason = last_endpoint_error.unwrap_or_else(|| "unknown error".to_string());
+                return Err(format!(
+                    "Describe aborted: the vision endpoint failed on the first {endpoint_failures} \
+                     image(s) with nothing described. Check that a model is loaded in LM Studio and \
+                     that the endpoint and API token in Settings are correct. Last error: {reason}"
+                ));
+            }
 
             let _ = app.emit(
                 "vision-analysis-progress",
@@ -2789,6 +2973,9 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         if failures > 0 {
             message.push_str(&format!(" {failures} failed (see logs; endpoint {endpoint})."));
         }
+        if skipped_category > 0 {
+            message.push_str(&format!(" {skipped_category} omitted by category."));
+        }
         Ok((if cancelled { "cancelled" } else { "completed" }, Some(message)))
     })();
 
@@ -2798,6 +2985,615 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         Err(error) => ("error".to_string(), Some(error)),
     };
     let _ = app.emit("vision-analysis-finished", TextAnalysisFinished { status, message });
+}
+
+// =================================================================================================
+// Geo layer
+//
+// A parallel axis over the vision descriptions: which country each image shows, and country sets
+// built from that. It writes only its own three sidecars (see `geo.rs`) and never touches an
+// image's `category`, so Low Text / High Text membership — the filter super-image-viewer browses
+// on — is unaffected by anything here.
+//
+// The derive is pure over data already on disk (descriptions × gazetteer × chunk plan), needs no
+// model, and takes a couple of seconds on a 10k-description library, so it is cheap to re-run after
+// every capture session.
+// =================================================================================================
+
+/// Reads every saved vision description. The `.txt` sidecar holds the same prose as the `.json` and
+/// needs no parsing, so this walks those and takes the hash from the file stem.
+fn load_descriptions(root: &Path) -> Vec<geo::DescribedImage> {
+    let desc_dir = root.join(VISION_DESC_DIR_NAME);
+    let Ok(entries) = fs::read_dir(&desc_dir) else {
+        return Vec::new();
+    };
+    let paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("txt"))
+        .collect();
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            let hash = path.file_stem()?.to_str()?.to_string();
+            let description = fs::read_to_string(path).ok()?;
+            Some(geo::DescribedImage { hash, description })
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoSummary {
+    exists: bool,
+    generated_at: Option<String>,
+    stats: geo::GeoStats,
+    sets: usize,
+    geo_path: String,
+    gazetteer_path: String,
+    sets_path: String,
+}
+
+fn geo_summary(root: &Path, geo_file: Option<&geo::GeoFile>) -> GeoSummary {
+    GeoSummary {
+        exists: geo_file.is_some(),
+        generated_at: geo_file.map(|file| file.generated_at.clone()),
+        stats: geo_file.map(|file| file.stats.clone()).unwrap_or_default(),
+        sets: geo::load_sets(root).map(|file| file.sets.len()).unwrap_or(0),
+        geo_path: geo::geo_path(root).to_string_lossy().to_string(),
+        gazetteer_path: geo::gazetteer_path(root).to_string_lossy().to_string(),
+        sets_path: geo::sets_path(root).to_string_lossy().to_string(),
+    }
+}
+
+/// Rebuilds the geo records from scratch. Also rewrites the gazetteer's `unresolved` worklist —
+/// the hand-written `overrides` in that file are read, used, and preserved untouched.
+#[tauri::command]
+fn derive_geo(root: String) -> Result<GeoSummary, String> {
+    let root_buf = root_path(&root)?;
+    let descriptions = load_descriptions(&root_buf);
+    if descriptions.is_empty() {
+        return Err(
+            "No vision descriptions found. Run Describe first — geo is derived from those.".to_string(),
+        );
+    }
+
+    let plan = load_chunk_plan(&root_buf);
+    let groups: Vec<geo::SourceGroup<'_>> = plan
+        .as_ref()
+        .map(|plan| {
+            plan.groups
+                .iter()
+                .map(|group| geo::SourceGroup {
+                    title: &group.title,
+                    member_hashes: &group.member_hashes,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut gazetteer = geo::load_gazetteer(&root_buf);
+    let previous = geo::load_geo(&root_buf);
+    let derived = geo::derive(
+        &descriptions,
+        &groups,
+        &mut gazetteer,
+        previous.as_ref(),
+        now_iso(),
+    );
+
+    geo::save_gazetteer(&root_buf, &gazetteer)?;
+    let json = serde_json::to_string_pretty(&derived)
+        .map_err(|error| format!("Failed to serialize geo records: {error}"))?;
+    fs::write(geo::geo_path(&root_buf), json)
+        .map_err(|error| format!("Failed to save geo records: {error}"))?;
+
+    Ok(geo_summary(&root_buf, Some(&derived)))
+}
+
+// ---- Scene kinds -------------------------------------------------------------------------------
+// A text-only pass over the descriptions that answers "does this picture show a place at all", so
+// country sets can drop the mall interiors, talking heads and browser screenshots that carry a real
+// country but teach no geography. See `kinds.rs` for why it reads prose instead of pixels.
+
+#[tauri::command]
+fn classify_kinds(
+    app: AppHandle,
+    control: tauri::State<'_, KindControl>,
+    root: String,
+    force: bool,
+) -> Result<(), String> {
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Scene classification is already running.".to_string());
+    }
+    let root_buf = match root_path(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            control.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    control.cancel.store(false, Ordering::SeqCst);
+    let handle = app.clone();
+    std::thread::spawn(move || run_kind_classification(&handle, &root_buf, force));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_kind_classification(control: tauri::State<'_, KindControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No scene classification is running.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Classifies every geo-tagged image that has no kind yet (or all of them, with `force`).
+///
+/// Scoped to geo-tagged images on purpose: they are exactly the population country sets draw from,
+/// which is a little over a third of the described library. Results are checkpointed after every
+/// batch, so a cancel or a crash costs one batch rather than the whole run.
+fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
+    let control = app.state::<KindControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let settings = load_app_settings(app);
+        let endpoint = vision_endpoint(&settings);
+        let model = vision_model(&settings);
+        let api_key = vision_api_key(&settings);
+
+        let geo_file = geo::load_geo(root)
+            .ok_or_else(|| "No geo records yet. Run Derive Geo first.".to_string())?;
+        let mut kinds_file = kinds::load_kinds(root);
+        if force || kinds_file.prompt_version != kinds::KIND_PROMPT_VERSION {
+            // A changed prompt invalidates old labels — keeping them would mix two rubrics.
+            kinds_file.kinds.clear();
+        }
+
+        // Only images that have a description of their OWN are classifiable. The rest of the
+        // geo-tagged population was propagated from a video's sampled frames and never described —
+        // they get their kind the same way, by inheriting it (see `propagate_kinds`). Iterating all
+        // of them would spend the whole pass skipping two images in five.
+        let desc_dir = root.join(VISION_DESC_DIR_NAME);
+        let pending: Vec<String> = geo_file
+            .images
+            .keys()
+            .filter(|hash| !kinds_file.kinds.contains_key(*hash))
+            .filter(|hash| desc_dir.join(format!("{hash}.txt")).exists())
+            .cloned()
+            .collect();
+
+        if pending.is_empty() {
+            let filled = propagate_and_save_kinds(root, &mut kinds_file, &model)?;
+            return Ok((
+                "completed",
+                Some(format!(
+                    "Every described image is already classified; {filled} more inherited from their videos."
+                )),
+            ));
+        }
+
+        let agent = build_agent();
+        let total = pending.len();
+        let mut processed = 0usize;
+        let mut failures = 0usize;
+        let mut unparsed = 0usize;
+
+        for chunk in pending.chunks(kinds::DEFAULT_BATCH_SIZE) {
+            if control.cancel.load(Ordering::SeqCst) {
+                kinds_file.prompt_version = kinds::KIND_PROMPT_VERSION;
+                kinds_file.version = kinds::KIND_SCHEMA_VERSION;
+                kinds_file.generated_at = now_iso();
+                kinds_file.model = model.clone();
+                kinds_file.note = kinds::KINDS_NOTE.to_string();
+                kinds::save_kinds(root, &kinds_file)?;
+                return Ok((
+                    "cancelled",
+                    Some(format!("Stopped after {processed} of {total}.")),
+                ));
+            }
+
+            let mut scenes = Vec::with_capacity(chunk.len());
+            let mut hashes = Vec::with_capacity(chunk.len());
+            for hash in chunk {
+                let Ok(text) = fs::read_to_string(desc_dir.join(format!("{hash}.txt"))) else {
+                    continue;
+                };
+                scenes.push(kinds::scene_text(&text, KIND_SCENE_MAX_CHARS));
+                hashes.push(hash.clone());
+            }
+            if scenes.is_empty() {
+                processed += chunk.len();
+                continue;
+            }
+
+            match kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), &scenes) {
+                Ok(labels) => {
+                    for (hash, label) in hashes.iter().zip(labels) {
+                        match label {
+                            Some(kind) => {
+                                kinds_file.kinds.insert(hash.clone(), kind);
+                            }
+                            // Left unlabelled rather than guessed; the next run picks it up.
+                            None => unparsed += 1,
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    // A dead endpoint would otherwise burn through every batch failing identically.
+                    if failures >= VISION_FAIL_FAST_ATTEMPTS && kinds_file.kinds.is_empty() {
+                        return Err(error);
+                    }
+                    eprintln!("[kinds] batch failed: {error}");
+                }
+            }
+
+            processed += chunk.len();
+            kinds_file.version = kinds::KIND_SCHEMA_VERSION;
+            kinds_file.prompt_version = kinds::KIND_PROMPT_VERSION;
+            kinds_file.generated_at = now_iso();
+            kinds_file.model = model.clone();
+            kinds_file.note = kinds::KINDS_NOTE.to_string();
+            kinds::save_kinds(root, &kinds_file)?;
+
+            let _ = app.emit(
+                "kind-classification-progress",
+                TextAnalysisProgress {
+                    processed,
+                    total,
+                    current_name: format!("{} classified", kinds_file.kinds.len()),
+                },
+            );
+        }
+
+        let filled = propagate_and_save_kinds(root, &mut kinds_file, &model)?;
+        let mut message = format!(
+            "Classified {} images, {filled} more inherited from their videos.",
+            kinds_file.kinds.len()
+        );
+        if unparsed > 0 {
+            message.push_str(&format!(" {unparsed} unlabelled (run again to fill in)."));
+        }
+        if failures > 0 {
+            message.push_str(&format!(" {failures} batches failed."));
+        }
+        Ok(("completed", Some(message)))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("kind-classification-finished", TextAnalysisFinished { status, message });
+}
+
+/// Recomputes the inherited kinds from the chunk plan and writes the sidecar. Always rebuilt from
+/// scratch rather than accumulated, so a later classification round can revise what a video's
+/// undescribed frames inherit. Returns how many frames ended up inheriting a kind.
+fn propagate_and_save_kinds(
+    root: &Path,
+    kinds_file: &mut kinds::KindsFile,
+    model: &str,
+) -> Result<usize, String> {
+    let groups: Vec<Vec<String>> = load_chunk_plan(root)
+        .map(|plan| plan.groups.into_iter().map(|group| group.member_hashes).collect())
+        .unwrap_or_default();
+    kinds_file.propagated = kinds::propagate_kinds(&kinds_file.kinds, &groups);
+    kinds_file.version = kinds::KIND_SCHEMA_VERSION;
+    kinds_file.prompt_version = kinds::KIND_PROMPT_VERSION;
+    kinds_file.generated_at = now_iso();
+    kinds_file.model = model.to_string();
+    kinds_file.note = kinds::KINDS_NOTE.to_string();
+    kinds::save_kinds(root, kinds_file)?;
+    Ok(kinds_file.propagated.len())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KindSummary {
+    exists: bool,
+    generated_at: Option<String>,
+    classified: usize,
+    /// Geo-tagged images still without a kind — what a run would work through.
+    pending: usize,
+    counts: HashMap<String, usize>,
+    allowed_kinds: Vec<String>,
+    kinds_path: String,
+}
+
+#[tauri::command]
+fn get_kind_summary(root: String) -> Result<KindSummary, String> {
+    let root_buf = root_path(&root)?;
+    let file = kinds::load_kinds(&root_buf);
+    // Counts cover own + inherited, because that is what set building actually filters against.
+    let effective = file.effective();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for kind in effective.values() {
+        *counts.entry(kind.clone()).or_insert(0) += 1;
+    }
+    // Pending = geo-tagged images that still have no kind from either route.
+    let pending = geo::load_geo(&root_buf)
+        .map(|geo| {
+            geo.images
+                .keys()
+                .filter(|hash| !effective.contains_key(*hash))
+                .count()
+        })
+        .unwrap_or(0);
+    Ok(KindSummary {
+        exists: !effective.is_empty(),
+        generated_at: (!file.generated_at.is_empty()).then(|| file.generated_at.clone()),
+        classified: effective.len(),
+        pending,
+        counts,
+        allowed_kinds: kinds::allowed_kinds(&file),
+        kinds_path: kinds::kinds_path(&root_buf).to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_geo_summary(root: String) -> Result<GeoSummary, String> {
+    let root_buf = root_path(&root)?;
+    let geo_file = geo::load_geo(&root_buf);
+    Ok(geo_summary(&root_buf, geo_file.as_ref()))
+}
+
+#[tauri::command]
+fn get_geo_coverage(root: String) -> Result<Option<geo::CoverageView>, String> {
+    let root_buf = root_path(&root)?;
+    Ok(geo::load_geo(&root_buf).map(|file| geo::coverage_view(&root_buf, &file)))
+}
+
+#[tauri::command]
+fn build_geo_sets(root: String, target_size: Option<usize>) -> Result<geo::GeoSetsFile, String> {
+    let root_buf = root_path(&root)?;
+    let geo_file = geo::load_geo(&root_buf)
+        .ok_or_else(|| "No geo records yet. Run Derive Geo first.".to_string())?;
+    let excluded = geo::load_excluded(&root_buf);
+    let kind_file = kinds::load_kinds(&root_buf);
+    let allowed = kinds::allowed_kinds(&kind_file);
+    let built = geo::build_sets(
+        &geo_file,
+        target_size.unwrap_or(geo::DEFAULT_SET_SIZE),
+        &excluded.excluded,
+        &kind_file.effective(),
+        &allowed,
+        now_iso(),
+    );
+    let json = serde_json::to_string_pretty(&built)
+        .map_err(|error| format!("Failed to serialize geo sets: {error}"))?;
+    fs::write(geo::sets_path(&root_buf), json)
+        .map_err(|error| format!("Failed to save geo sets: {error}"))?;
+    Ok(built)
+}
+
+#[tauri::command]
+fn get_geo_sets(root: String) -> Result<Option<geo::GeoSetsFile>, String> {
+    let root_buf = root_path(&root)?;
+    Ok(geo::load_sets(&root_buf))
+}
+
+/// Resolves a set's member hashes to real file paths so the set can be opened or handed to a viewer.
+/// Hashes that no longer correspond to a file on disk are dropped rather than returned as blanks.
+#[tauri::command]
+fn get_geo_set_images(root: String, set_id: String) -> Result<Vec<ImageView>, String> {
+    let root_buf = root_path(&root)?;
+    let sets = geo::load_sets(&root_buf).ok_or_else(|| "No geo sets have been built.".to_string())?;
+    let set = sets
+        .sets
+        .iter()
+        .find(|candidate| candidate.id == set_id)
+        .ok_or_else(|| format!("Set '{set_id}' not found."))?;
+
+    // Consume the scan's images into a by-hash map rather than cloning out of it: `ImageView` is a
+    // plain serialize-only view and there is no reason to make it Clone just for this.
+    let view = scan_and_reconcile(&root_buf)?;
+    let mut by_hash: HashMap<String, ImageView> = view
+        .images
+        .into_iter()
+        .map(|image| (image.hash.clone(), image))
+        .collect();
+    Ok(set
+        .members
+        .iter()
+        .filter_map(|hash| by_hash.remove(hash))
+        .collect())
+}
+
+/// Opens the gazetteer in whatever the OS associates with .json — the intended way to work the
+/// unresolved list down.
+#[tauri::command]
+fn open_geo_gazetteer(root: String) -> Result<(), String> {
+    let root_buf = root_path(&root)?;
+    let path = geo::gazetteer_path(&root_buf);
+    if !path.exists() {
+        // Nothing to open before the first derive; write the empty template so the file always
+        // exists once asked for.
+        geo::save_gazetteer(&root_buf, &geo::Gazetteer::default())?;
+    }
+    open_image(path.to_string_lossy().to_string())
+}
+
+// Env-gated harness that runs the real geo derive against a real library and prints the resulting
+// coverage, without a GUI or a model. Set ICAT_GEO_LIBRARY to the library root and run
+// `cargo test geo_derive_against_real_library -- --ignored --nocapture`. Read-only: it derives in
+// memory and writes nothing.
+#[cfg(test)]
+mod geo_real_library_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn geo_derive_against_real_library() {
+        let Ok(root) = std::env::var("ICAT_GEO_LIBRARY") else {
+            eprintln!("set ICAT_GEO_LIBRARY to a library root");
+            return;
+        };
+        let root = PathBuf::from(root);
+
+        let descriptions = load_descriptions(&root);
+        let plan = load_chunk_plan(&root);
+        let groups: Vec<geo::SourceGroup<'_>> = plan
+            .as_ref()
+            .map(|plan| {
+                plan.groups
+                    .iter()
+                    .map(|group| geo::SourceGroup {
+                        title: &group.title,
+                        member_hashes: &group.member_hashes,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut gazetteer = geo::load_gazetteer(&root);
+        let derived = geo::derive(&descriptions, &groups, &mut gazetteer, None, "test".into());
+        let coverage = geo::coverage_view(&root, &derived);
+        let stats = &derived.stats;
+
+        println!("descriptions read      {}", stats.described);
+        println!("with a Location: line  {}", stats.with_location);
+        println!("tagged (own)           {}", stats.tagged_own);
+        println!("tagged (propagated)    {}", stats.tagged_propagated);
+        println!("TAGGED TOTAL           {}", stats.tagged_total);
+        println!("rejected as junk       {}", stats.rejected_junk);
+        println!("unresolved images      {}", stats.unresolved_images);
+        println!("unresolved strings     {}", stats.unresolved_strings);
+        println!("fiction videos skipped {}", stats.fiction_groups_skipped);
+        println!("countries seen         {}", stats.countries_seen);
+        println!();
+        for (tier, count) in &coverage.tiers {
+            println!("  tier {tier:<6} {count}");
+        }
+        println!();
+        for cluster in &coverage.clusters {
+            let names: Vec<String> = cluster
+                .countries
+                .iter()
+                .filter(|country| country.sources > 0)
+                .map(|country| format!("{}:{}", country.name, country.sources))
+                .collect();
+            println!(
+                "{:<28} {}/{} ready | {}",
+                cluster.name,
+                cluster.ready,
+                cluster.total,
+                names.join("  ")
+            );
+        }
+        if !coverage.off_reference.is_empty() {
+            println!("\noff-reference countries: {:?}", coverage.off_reference);
+        }
+        println!("\ntop unresolved (gazetteer worklist):");
+        for entry in coverage.worklist.iter().take(20) {
+            println!("  {:>4}  {}", entry.images, entry.location);
+        }
+
+        let excluded = geo::load_excluded(&root);
+        let kind_file = kinds::load_kinds(&root);
+        let allowed = kinds::allowed_kinds(&kind_file);
+        let sets = geo::build_sets(
+            &derived,
+            geo::DEFAULT_SET_SIZE,
+            &excluded.excluded,
+            &kind_file.effective(),
+            &allowed,
+            "test".into(),
+        );
+        let diverse = sets.sets.iter().filter(|set| set.quality == "diverse").count();
+        println!(
+            "\nsets: {} total, {} diverse, {} limited",
+            sets.sets.len(),
+            diverse,
+            sets.sets.len() - diverse
+        );
+        for set in sets.sets.iter().take(12) {
+            println!(
+                "  {:<22} {:>3} images  {:>3} videos  {}",
+                set.title, set.size, set.sources, set.quality
+            );
+        }
+
+        assert!(stats.tagged_total > 0, "the real library should produce geo tags");
+    }
+}
+
+// Env-gated harness that classifies a sample of REAL descriptions through the configured local
+// model and prints scene / kind pairs to eyeball. Proves the prompt before a 7k-image pass commits
+// to it. Needs ICAT_GEO_LIBRARY (+ optional ICAT_KIND_SAMPLE, default 40); reads the endpoint,
+// model and token from the app's own saved settings so no secret is handled here.
+// `cargo test classify_kinds_sample -- --ignored --nocapture`
+#[cfg(test)]
+mod kind_sample_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn classify_kinds_sample() {
+        let Ok(root) = std::env::var("ICAT_GEO_LIBRARY") else {
+            eprintln!("set ICAT_GEO_LIBRARY");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let sample_size: usize = std::env::var("ICAT_KIND_SAMPLE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(40);
+
+        // Sample from images that are actually IN sets — the population the filter has to fix.
+        let sets = geo::load_sets(&root).expect("build sets first");
+        let mut members: Vec<String> = sets
+            .sets
+            .iter()
+            .flat_map(|set| set.members.iter().cloned())
+            .collect();
+        members.sort();
+        members.dedup();
+        // Deterministic spread across the sorted hash space rather than a clock-seeded shuffle.
+        let step = (members.len() / sample_size.max(1)).max(1);
+        let picked: Vec<String> = members.iter().step_by(step).take(sample_size).cloned().collect();
+
+        let desc_dir = root.join(VISION_DESC_DIR_NAME);
+        let mut scenes = Vec::new();
+        let mut kept = Vec::new();
+        for hash in &picked {
+            let Ok(text) = fs::read_to_string(desc_dir.join(format!("{hash}.txt"))) else {
+                continue;
+            };
+            scenes.push(kinds::scene_text(&text, 700));
+            kept.push(hash.clone());
+        }
+
+        // Same location Tauri's app_data_dir resolves to on Windows, reached without an AppHandle.
+        let settings_path = PathBuf::from(std::env::var("APPDATA").expect("APPDATA"))
+            .join("com.slaur.image-categorizer")
+            .join("settings.json");
+        let settings: AppSettings = fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let endpoint = vision_endpoint(&settings);
+        let model = vision_model(&settings);
+        let api_key = vision_api_key(&settings);
+        let agent = build_agent();
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (chunk_index, chunk) in scenes.chunks(kinds::DEFAULT_BATCH_SIZE).enumerate() {
+            let labels = kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), chunk)
+                .expect("classify batch");
+            for (offset, label) in labels.iter().enumerate() {
+                let index = chunk_index * kinds::DEFAULT_BATCH_SIZE + offset;
+                let kind = label.clone().unwrap_or_else(|| "<unparsed>".to_string());
+                *counts.entry(kind.clone()).or_insert(0) += 1;
+                let preview: String = scenes[index].chars().take(150).collect();
+                println!("{kind:<10} | {preview}");
+            }
+        }
+        println!("\ncounts: {counts:?}");
+        assert!(!counts.is_empty());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2822,6 +3618,7 @@ pub fn run() {
         .manage(OcrTextControl::default())
         .manage(ChunkControl::default())
         .manage(VisionControl::default())
+        .manage(KindControl::default())
         .setup(move |app| {
             if headless_refresh {
                 let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
@@ -2868,24 +3665,36 @@ pub fn run() {
             analyze_vision,
             assign_category,
             build_chunk_plan,
+            build_geo_sets,
             cancel_chunk_scan,
+            cancel_kind_classification,
             cancel_nsfw_analysis,
             cancel_text_analysis,
             cancel_text_extraction,
             cancel_vision_analysis,
             choose_root_folder,
+            classify_kinds,
             create_category,
             delete_category,
+            derive_geo,
             discard_chunk_plan,
             download_nsfw_model,
             extract_text,
             get_app_settings,
             get_auto_refresh_settings,
             get_chunk_plan,
+            get_geo_coverage,
+            get_geo_set_images,
+            get_geo_sets,
+            get_geo_summary,
+            get_kind_summary,
             get_nsfw_model_info,
             get_vision_settings,
             import_images,
+            list_vision_models,
+            load_vision_model,
             move_image,
+            open_geo_gazetteer,
             open_image,
             open_root_folder,
             regenerate_chunk_plan,
@@ -2897,6 +3706,7 @@ pub fn run() {
             set_auto_refresh_settings,
             set_dark_mode,
             set_folder_analysis_included,
+            set_category_analysis_included,
             set_nsfw_threshold,
             set_source_pattern,
             set_text_thresholds,
@@ -3010,7 +3820,7 @@ mod e2e_tests {
             let my_desc = my_description_for(&image.name);
             fs::write(&resp_file, my_desc).unwrap();
 
-            let returned = describe_image(&agent, &endpoint, model, DESCRIBE_PROMPT, Path::new(&image.path))
+            let returned = describe_image(&agent, &endpoint, model, None, DESCRIBE_PROMPT, Path::new(&image.path))
                 .expect("describe_image should reach the stub");
             assert_eq!(returned.trim(), my_desc.trim(), "round-trip must return exactly what the model produced");
 

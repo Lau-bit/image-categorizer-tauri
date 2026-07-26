@@ -12,8 +12,8 @@
       {
         "label": "main",
         "title": "Image Categorizer",
-        "width": 1200,
-        "height": 780,
+        "width": 1500,
+        "height": 880,
         "minWidth": 780,
         "minHeight": 500,
         "decorations": true,

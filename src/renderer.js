@@ -26,6 +26,18 @@ const state = {
   analysisRunning: null, // 'text' | 'nsfw' | 'ocr' | 'chunk' | 'vision' | null
   autoRefresh: null,
   chunkPlan: null,
+  // Geo layer (own sidecars, independent of categories). `geoSetImages` holds the resolved images
+  // of an opened country set — an explicit ordered member list, not a filter over the library.
+  geoSummary: null,
+  geoCoverage: null,
+  geoSets: null,
+  geoSetImages: null,
+  geoSetTitle: null,
+  geoBusy: false,
+  // Scene-kind classification (the "is this a place at all" pass).
+  kindSummary: null,
+  kindRunning: false,
+  kindProgress: null,
 };
 
 const els = {
@@ -33,6 +45,22 @@ const els = {
   allCount: document.getElementById('all-count'),
   unclassifiedTab: document.getElementById('unclassified-tab'),
   unclassifiedCount: document.getElementById('unclassified-count'),
+  geoTab: document.getElementById('geo-tab'),
+  geoCount: document.getElementById('geo-count'),
+  geoView: document.getElementById('geo-view'),
+  geoStats: document.getElementById('geo-stats'),
+  geoLegend: document.getElementById('geo-legend'),
+  geoClusters: document.getElementById('geo-clusters'),
+  geoSets: document.getElementById('geo-sets'),
+  geoWorklist: document.getElementById('geo-worklist'),
+  geoGenerated: document.getElementById('geo-generated'),
+  geoDeriveButton: document.getElementById('geo-derive-button'),
+  geoClassifyButton: document.getElementById('geo-classify-button'),
+  geoCancelClassifyButton: document.getElementById('geo-cancel-classify-button'),
+  geoKinds: document.getElementById('geo-kinds'),
+  geoBuildSetsButton: document.getElementById('geo-build-sets-button'),
+  geoGazetteerButton: document.getElementById('geo-gazetteer-button'),
+  geoSetSize: document.getElementById('geo-set-size'),
   categoryList: document.getElementById('category-list'),
   addCategoryButton: document.getElementById('add-category-button'),
   sourceFolderList: document.getElementById('source-folder-list'),
@@ -45,6 +73,7 @@ const els = {
   loadingState: document.getElementById('loading-state'),
   loadingLabel: document.getElementById('loading-label'),
   statusSpinner: document.getElementById('status-spinner'),
+  main: document.querySelector('.main'),
   mainDropTarget: document.getElementById('main-drop-target'),
   searchInput: document.getElementById('search-input'),
   statusMessage: document.getElementById('status-message'),
@@ -114,18 +143,34 @@ const els = {
   autoRefreshStatus: document.getElementById('auto-refresh-status'),
   visionEndpointInput: document.getElementById('vision-endpoint-input'),
   visionModelInput: document.getElementById('vision-model-input'),
+  visionModelSelect: document.getElementById('vision-model-select'),
+  visionModelStatus: document.getElementById('vision-model-status'),
+  refreshVisionModelsButton: document.getElementById('refresh-vision-models-button'),
+  loadVisionModelButton: document.getElementById('load-vision-model-button'),
+  visionApiKeyInput: document.getElementById('vision-api-key-input'),
   chunkPlanStatus: document.getElementById('chunk-plan-status'),
   regenerateChunkPlanButton: document.getElementById('regenerate-chunk-plan-button'),
   openChunkPlanButton: document.getElementById('open-chunk-plan-button'),
   discardChunkPlanButton: document.getElementById('discard-chunk-plan-button'),
   toast: document.getElementById('toast'),
+  toastText: document.getElementById('toast-text'),
+  toastDismiss: document.getElementById('toast-dismiss'),
 };
 
-function showToast(message) {
-  els.toast.textContent = message;
+// `sticky` messages (errors you actually need to read) stay up for 30s, are selectable/copyable,
+// and dismiss via their ✕ button — instead of the brief 2.4s confirmation used for routine "done"
+// toasts. A long failure message that vanishes before you can read or copy it is useless.
+function showToast(message, { sticky = false } = {}) {
+  els.toastText.textContent = message;
   els.toast.classList.add('visible');
+  els.toast.classList.toggle('sticky', sticky);
   clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(() => els.toast.classList.remove('visible'), 2400);
+  showToast.timer = setTimeout(dismissToast, sticky ? 30000 : 2400);
+}
+
+function dismissToast() {
+  clearTimeout(showToast.timer);
+  els.toast.classList.remove('visible', 'sticky');
 }
 
 // `persist` keeps the message up until it's explicitly replaced — used for the "Scanning…"
@@ -147,7 +192,7 @@ function setStatus(message, persist = false) {
 // analysis pass, so it's driven off both flags rather than tied to one caller.
 function updateActivityIndicator() {
   const active = state.loading || state.analyzing;
-  els.statusSpinner.classList.toggle('hidden', !active);
+  els.statusSpinner.classList.toggle('active', active);
 }
 
 function setLoading(active, label) {
@@ -303,9 +348,12 @@ async function loadVisionAndChunkSettings() {
     const vision = await window.categorizerAPI.getVisionSettings();
     els.visionEndpointInput.value = vision.endpoint || '';
     els.visionModelInput.value = vision.model || '';
+    els.visionApiKeyInput.value = vision.apiKey || '';
   } catch {
     // non-fatal
   }
+  // Fetch the model list in the background so an unreachable endpoint never delays the dialog.
+  refreshVisionModels();
   try {
     state.chunkPlan = state.library?.root
       ? await window.categorizerAPI.getChunkPlan(state.library.root)
@@ -321,9 +369,54 @@ async function saveVisionSettings() {
     await window.categorizerAPI.setVisionSettings(
       els.visionEndpointInput.value.trim(),
       els.visionModelInput.value.trim(),
+      els.visionApiKeyInput.value.trim(),
     );
   } catch (error) {
     showToast(errorText(error));
+  }
+}
+
+// Populates the model dropdown from the endpoint's /v1/models. Uses new Option(text, value) so ids
+// are set as text (no HTML injection). The free-text input stays the source of truth for the saved
+// model — the dropdown just fills it — so a custom id that isn't in the list still works.
+async function refreshVisionModels() {
+  const select = els.visionModelSelect;
+  if (!select) return;
+  const current = els.visionModelInput.value.trim();
+  els.visionModelStatus.textContent = 'Loading model list…';
+  try {
+    const models = await window.categorizerAPI.listVisionModels();
+    select.replaceChildren(new Option('— pick a model —', ''));
+    for (const id of models) select.add(new Option(id, id));
+    if (current) select.value = current; // no-op if current isn't one of the offered ids
+    els.visionModelStatus.textContent = models.length
+      ? `${models.length} model${models.length === 1 ? '' : 's'} available.`
+      : 'Server reachable but no models listed — download or enable one in LM Studio.';
+  } catch (error) {
+    select.replaceChildren(new Option('— couldn’t reach endpoint —', ''));
+    els.visionModelStatus.textContent = errorText(error);
+  }
+}
+
+// Actively load the picked model into LM Studio so Describe won't fail against an empty server.
+async function loadSelectedVisionModel() {
+  const model = (els.visionModelInput.value.trim() || els.visionModelSelect.value).trim();
+  if (!model) {
+    showToast('Pick or type a model first.');
+    return;
+  }
+  els.loadVisionModelButton.disabled = true;
+  els.visionModelStatus.textContent = `Loading “${model}” — a cold model can take a while…`;
+  try {
+    const message = await window.categorizerAPI.loadVisionModel(model);
+    els.visionModelStatus.textContent = message;
+    showToast(message);
+  } catch (error) {
+    const text = errorText(error);
+    els.visionModelStatus.textContent = text;
+    showToast(text, { sticky: true });
+  } finally {
+    els.loadVisionModelButton.disabled = false;
   }
 }
 
@@ -505,6 +598,16 @@ function visibleImages() {
   const library = state.library;
   if (!library) return [];
 
+  // A geo set is an explicit, ordered member list, not a filter over the library: it deliberately
+  // skips the source-folder filter and the sort, because both its membership and its order were
+  // decided when the set was built.
+  if (state.currentView === 'geoSet') {
+    const images = state.geoSetImages || [];
+    const setQuery = state.search.trim().toLowerCase();
+    if (!setQuery) return images;
+    return images.filter(image => `${image.name} ${image.relativePath}`.toLowerCase().includes(setQuery));
+  }
+
   let images = imagesInIncludedSourceFolders(library.images);
   if (state.currentView === 'unclassified') {
     images = images.filter(image => !image.category);
@@ -574,6 +677,9 @@ function renderSidebar() {
   els.unclassifiedCount.textContent = String(unclassifiedCount);
   els.allTab.classList.toggle('active', state.currentView === 'all');
   els.unclassifiedTab.classList.toggle('active', state.currentView === 'unclassified');
+  // An opened set still belongs to Geo, so the tab stays lit while browsing one.
+  els.geoTab.classList.toggle('active', state.currentView === 'geo' || state.currentView === 'geoSet');
+  els.geoCount.textContent = String(state.geoSummary?.stats?.taggedTotal || 0);
 
   els.categoryList.innerHTML = '';
   const categories = library?.categories || [];
@@ -594,7 +700,21 @@ function renderSidebar() {
     for (const category of categories) {
       const row = document.createElement('div');
       row.className = 'category-row';
+      row.classList.toggle('omitted', category.includedInAnalysis === false);
       row.dataset.categoryName = category.name;
+
+      // Leading checkbox: untick to omit these already-categorized images from analysis (chiefly
+      // Describe). Mirrors the per-folder include toggle; reuses its styles.
+      const includeLabel = document.createElement('label');
+      includeLabel.className = 'source-folder-include';
+      includeLabel.title = 'Include this category in analysis. Untick to skip these images (e.g. omit High Text from Describe since OCR already covers it).';
+      const includeCheckbox = document.createElement('input');
+      includeCheckbox.type = 'checkbox';
+      includeCheckbox.checked = category.includedInAnalysis !== false;
+      includeCheckbox.disabled = state.analyzing;
+      includeCheckbox.addEventListener('click', event => event.stopPropagation());
+      includeCheckbox.addEventListener('change', () => setCategoryAnalysisIncluded(category.name, includeCheckbox.checked));
+      includeLabel.append(includeCheckbox);
 
       const button = document.createElement('button');
       button.type = 'button';
@@ -627,7 +747,7 @@ function renderSidebar() {
         deleteCategoryConfirm(category.name);
       });
 
-      row.append(button, renameButton, deleteButton);
+      row.append(includeLabel, button, renameButton, deleteButton);
       els.categoryList.append(row);
     }
   }
@@ -672,6 +792,10 @@ function renderHeader() {
     els.viewTitle.textContent = 'All Images';
   } else if (state.currentView === 'unclassified') {
     els.viewTitle.textContent = 'Unclassified';
+  } else if (state.currentView === 'geo') {
+    els.viewTitle.textContent = 'Geo Coverage';
+  } else if (state.currentView === 'geoSet') {
+    els.viewTitle.textContent = state.geoSetTitle || 'Country Set';
   } else {
     els.viewTitle.textContent = state.currentCategory || 'Category';
   }
@@ -898,7 +1022,13 @@ function render() {
   renderSettings();
   renderSidebar();
   renderHeader();
-  renderImages();
+  // The coverage scoreboard swaps places with the image grid rather than rendering inside it, so
+  // the grid's virtual scrolling and drop handling never see any of this.
+  const geoActive = state.currentView === 'geo';
+  els.mainDropTarget.classList.toggle('hidden', geoActive);
+  els.geoView.classList.toggle('hidden', !geoActive);
+  if (geoActive) renderGeo();
+  else renderImages();
 }
 
 async function loadSettings() {
@@ -945,6 +1075,9 @@ async function refreshAll() {
     state.currentCategory = null;
   }
   render();
+  // Geo is a read of three small sidecars, so the sidebar tally can be filled in without making
+  // the scan wait on it.
+  if (state.library) void loadGeoSummaryOnly();
   if (state.library) {
     setStatus(`Up to date — ${imageCountLabel(state.library.images.length)}.`);
   } else if (state.settings?.lastRoot) {
@@ -973,6 +1106,405 @@ function selectCategory(name) {
   state.currentView = 'category';
   state.currentCategory = name;
   render();
+}
+
+// ==============================
+// Geo coverage
+//
+// A scoreboard against a fixed 109-country reference list, so a country you have NOTHING for still
+// gets a row — showing what is missing is the whole point. Everything is counted in distinct videos
+// rather than images, because variety is what decides whether a set is worth practising on.
+// ==============================
+
+const GEO_TIER_LABELS = {
+  empty: 'Empty',
+  seed: 'Seed (1-3)',
+  thin: 'Thin (4-15)',
+  ready: 'Ready (16+)',
+  deep: 'Deep (32+)',
+};
+
+const GEO_TIER_ORDER = ['empty', 'seed', 'thin', 'ready', 'deep'];
+
+function selectGeo() {
+  cancelPointerDrag();
+  state.currentView = 'geo';
+  state.currentCategory = null;
+  render();
+  // Fire-and-forget: the panel paints immediately from whatever is cached and fills in after.
+  loadGeoData();
+}
+
+// Just the tally for the sidebar pill — cheap enough to run after every scan.
+async function loadGeoSummaryOnly() {
+  const root = state.library?.root;
+  if (!root) return;
+  try {
+    state.geoSummary = await window.categorizerAPI.getGeoSummary(root);
+    renderSidebar();
+  } catch {
+    // A library with no geo sidecar yet is the normal case, not an error worth surfacing.
+  }
+}
+
+async function loadGeoData() {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root) return;
+  try {
+    const [summary, coverage, sets, kinds] = await Promise.all([
+      window.categorizerAPI.getGeoSummary(root),
+      window.categorizerAPI.getGeoCoverage(root),
+      window.categorizerAPI.getGeoSets(root),
+      window.categorizerAPI.getKindSummary(root),
+    ]);
+    state.geoSummary = summary;
+    state.geoCoverage = coverage;
+    state.geoSets = sets;
+    state.kindSummary = kinds;
+  } catch (error) {
+    showToast(errorText(error));
+  }
+  render();
+}
+
+// The scene pass talks to the local model, so it is long-running: progress events and a Stop button
+// rather than an await. Results checkpoint after every batch, so stopping loses at most one batch.
+async function runKindClassification(force = false) {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || state.kindRunning) return;
+  state.kindRunning = true;
+  state.kindProgress = null;
+  render();
+  try {
+    await window.categorizerAPI.classifyKinds(root, force);
+  } catch (error) {
+    state.kindRunning = false;
+    showToast(errorText(error));
+    render();
+  }
+}
+
+async function installKindListeners() {
+  await window.categorizerAPI.onKindProgress(payload => {
+    state.kindProgress = payload;
+    if (state.currentView === 'geo') renderGeo();
+    setStatus(`Classifying scenes — ${payload.processed}/${payload.total}`, true);
+  });
+  await window.categorizerAPI.onKindFinished(payload => {
+    state.kindRunning = false;
+    state.kindProgress = null;
+    setStatus('');
+    if (payload?.message) showToast(payload.message);
+    void loadGeoData();
+  });
+}
+
+const KIND_LABELS = {
+  outdoor: 'outdoor — real places',
+  indoor: 'indoor',
+  person: 'people',
+  screen: 'screens & maps',
+  other: 'other',
+};
+
+function renderGeoKinds() {
+  els.geoKinds.innerHTML = '';
+  const summary = state.kindSummary;
+  if (!summary) return;
+
+  if (state.kindRunning) {
+    const progress = document.createElement('div');
+    progress.className = 'geo-placeholder';
+    progress.textContent = state.kindProgress
+      ? `Classifying scenes — ${state.kindProgress.processed} of ${state.kindProgress.total}…`
+      : 'Starting scene classification…';
+    els.geoKinds.append(progress);
+    return;
+  }
+
+  if (!summary.classified) {
+    const hint = document.createElement('div');
+    hint.className = 'geo-placeholder';
+    hint.textContent = summary.pending
+      ? `Scenes not classified yet — ${summary.pending} geo-tagged images to check. ` +
+        'Until this runs, sets can include mall interiors, portraits and screenshots that happen to carry a country.'
+      : 'Derive geo first, then classify scenes.';
+    els.geoKinds.append(hint);
+    return;
+  }
+
+  const row = document.createElement('div');
+  row.className = 'geo-kind-row';
+  const allowed = new Set(summary.allowedKinds || []);
+  for (const kind of ['outdoor', 'indoor', 'person', 'screen', 'other']) {
+    const count = summary.counts?.[kind] || 0;
+    if (!count) continue;
+    const chip = document.createElement('span');
+    chip.className = `geo-kind-chip${allowed.has(kind) ? ' allowed' : ''}`;
+    chip.textContent = `${KIND_LABELS[kind] || kind} ${count}`;
+    chip.setAttribute(
+      'aria-label',
+      `${count} ${kind}${allowed.has(kind) ? ', used in sets' : ', kept out of sets'}`
+    );
+    row.append(chip);
+  }
+  els.geoKinds.append(row);
+
+  const note = document.createElement('div');
+  note.className = 'geo-placeholder';
+  const kept = (summary.allowedKinds || []).join(', ');
+  note.textContent = summary.pending
+    ? `${summary.pending} still unclassified — those pass through until checked. Sets use: ${kept}.`
+    : `Sets use: ${kept}. Edit "allowedKinds" in the kinds sidecar to change that without reclassifying.`;
+  els.geoKinds.append(note);
+}
+
+async function runGeoDerive() {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || state.geoBusy) return;
+  state.geoBusy = true;
+  setStatus('Deriving geo from descriptions…', true);
+  render();
+  try {
+    state.geoSummary = await window.categorizerAPI.deriveGeo(root);
+    const stats = state.geoSummary.stats;
+    showToast(
+      `Geo derived — ${stats.taggedTotal} images across ${stats.countriesSeen} countries ` +
+      `(${stats.taggedPropagated} from video propagation).`
+    );
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    state.geoBusy = false;
+    setStatus('');
+  }
+  await loadGeoData();
+}
+
+async function runGeoBuildSets() {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || state.geoBusy) return;
+  const targetSize = Math.max(4, Math.min(64, Number(els.geoSetSize.value) || 16));
+  state.geoBusy = true;
+  setStatus('Building country sets…', true);
+  render();
+  try {
+    const built = await window.categorizerAPI.buildGeoSets(root, targetSize);
+    state.geoSets = built;
+    const diverse = built.sets.filter(set => set.quality === 'diverse').length;
+    showToast(`Built ${built.sets.length} sets — ${diverse} fully varied.`);
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    state.geoBusy = false;
+    setStatus('');
+  }
+  render();
+}
+
+async function openGeoSet(set) {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root) return;
+  setStatus(`Opening ${set.title}…`, true);
+  try {
+    state.geoSetImages = await window.categorizerAPI.getGeoSetImages(root, set.id);
+    state.geoSetTitle = `${set.title} — ${set.sources} video${set.sources === 1 ? '' : 's'}`;
+    state.currentView = 'geoSet';
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    setStatus('');
+  }
+  render();
+}
+
+function geoStatCard(label, value, hint) {
+  const card = document.createElement('div');
+  card.className = 'geo-stat';
+  const valueEl = document.createElement('div');
+  valueEl.className = 'geo-stat-value';
+  valueEl.textContent = String(value);
+  const labelEl = document.createElement('div');
+  labelEl.className = 'geo-stat-label';
+  labelEl.textContent = label;
+  card.append(valueEl, labelEl);
+  if (hint) card.setAttribute('aria-label', `${label}: ${value}. ${hint}`);
+  return card;
+}
+
+function renderGeoStats() {
+  els.geoStats.innerHTML = '';
+  const coverage = state.geoCoverage;
+  if (!coverage) {
+    const hint = document.createElement('div');
+    hint.className = 'geo-placeholder';
+    hint.textContent = state.geoSummary?.exists === false
+      ? 'No geo records yet. Press Derive Geo — it reads the descriptions already on disk and needs no model.'
+      : 'Loading geo…';
+    els.geoStats.append(hint);
+    return;
+  }
+  const stats = coverage.stats;
+  els.geoStats.append(
+    geoStatCard('images tagged', stats.taggedTotal),
+    geoStatCard('countries seen', stats.countriesSeen),
+    geoStatCard('from own description', stats.taggedOwn),
+    geoStatCard('from video propagation', stats.taggedPropagated),
+    geoStatCard('unplaceable strings', stats.unresolvedStrings),
+    geoStatCard('fiction videos skipped', stats.fictionGroupsSkipped)
+  );
+}
+
+function renderGeoLegend() {
+  els.geoLegend.innerHTML = '';
+  const tiers = state.geoCoverage?.tiers || {};
+  for (const tier of GEO_TIER_ORDER) {
+    const item = document.createElement('span');
+    item.className = `geo-legend-item tier-${tier}`;
+    item.textContent = `${GEO_TIER_LABELS[tier]} · ${tiers[tier] || 0}`;
+    els.geoLegend.append(item);
+  }
+}
+
+function renderGeoClusters() {
+  els.geoClusters.innerHTML = '';
+  const coverage = state.geoCoverage;
+  if (!coverage) return;
+
+  for (const cluster of coverage.clusters) {
+    const block = document.createElement('div');
+    block.className = 'geo-cluster';
+
+    const head = document.createElement('div');
+    head.className = 'geo-cluster-head';
+    const name = document.createElement('span');
+    name.className = 'geo-cluster-name';
+    name.textContent = cluster.name;
+    const ratio = document.createElement('span');
+    ratio.className = 'geo-cluster-ratio';
+    ratio.classList.toggle('bare', cluster.ready === 0);
+    ratio.textContent = `${cluster.ready}/${cluster.total} ready`;
+    head.append(name, ratio);
+
+    const row = document.createElement('div');
+    row.className = 'geo-country-row';
+    for (const country of cluster.countries) {
+      const chip = document.createElement('span');
+      chip.className = `geo-country tier-${country.tier}`;
+      const label = document.createElement('span');
+      label.className = 'geo-country-name';
+      label.textContent = country.name;
+      const count = document.createElement('span');
+      count.className = 'geo-country-sources';
+      count.textContent = country.sources ? String(country.sources) : '—';
+      chip.append(label, count);
+      if (country.delta > 0) {
+        const delta = document.createElement('span');
+        delta.className = 'geo-country-delta';
+        delta.textContent = `+${country.delta}`;
+        chip.append(delta);
+      }
+      chip.setAttribute(
+        'aria-label',
+        `${country.name}: ${country.sources} videos, ${country.images} images, ${country.tier}`
+      );
+      row.append(chip);
+    }
+
+    block.append(head, row);
+    els.geoClusters.append(block);
+  }
+}
+
+function renderGeoSets() {
+  els.geoSets.innerHTML = '';
+  const sets = state.geoSets?.sets || [];
+  if (!sets.length) {
+    const hint = document.createElement('div');
+    hint.className = 'geo-placeholder';
+    hint.textContent = state.geoCoverage
+      ? 'No sets built yet. Press Build Country Sets.'
+      : 'Derive geo first.';
+    els.geoSets.append(hint);
+    return;
+  }
+
+  for (const set of sets) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'geo-set';
+    row.addEventListener('click', () => openGeoSet(set));
+
+    const title = document.createElement('span');
+    title.className = 'geo-set-title';
+    title.textContent = set.title;
+
+    const meta = document.createElement('span');
+    meta.className = 'geo-set-meta';
+    meta.textContent = `${set.size} images · ${set.sources} video${set.sources === 1 ? '' : 's'}`;
+
+    const badge = document.createElement('span');
+    badge.className = `geo-badge ${set.quality}`;
+    badge.textContent = set.quality;
+
+    row.append(title, meta, badge);
+    els.geoSets.append(row);
+  }
+}
+
+function renderGeoWorklist() {
+  els.geoWorklist.innerHTML = '';
+  const worklist = state.geoCoverage?.worklist || [];
+  if (!worklist.length) return;
+
+  const head = document.createElement('div');
+  head.className = 'geo-section-head';
+  const title = document.createElement('h2');
+  title.textContent = 'Gazetteer worklist';
+  const hint = document.createElement('p');
+  hint.className = 'geo-section-hint';
+  hint.textContent =
+    'Location strings the resolver could not place, and how many images each would tag. Add them to ' +
+    '"overrides" in the gazetteer and re-derive — one line fixes every image that mentions it.';
+  head.append(title, hint);
+
+  const list = document.createElement('div');
+  list.className = 'geo-worklist-items';
+  for (const entry of worklist) {
+    const item = document.createElement('span');
+    item.className = 'geo-worklist-item';
+    const count = document.createElement('span');
+    count.className = 'geo-worklist-count';
+    count.textContent = String(entry.images);
+    const label = document.createElement('span');
+    label.className = 'geo-worklist-label';
+    label.textContent = entry.location;
+    item.append(count, label);
+    list.append(item);
+  }
+
+  els.geoWorklist.append(head, list);
+}
+
+function renderGeo() {
+  els.geoDeriveButton.disabled = state.geoBusy || state.analyzing || state.kindRunning;
+  els.geoBuildSetsButton.disabled =
+    state.geoBusy || state.analyzing || state.kindRunning || !state.geoCoverage;
+  els.geoClassifyButton.disabled =
+    state.geoBusy || state.analyzing || state.kindRunning || !state.geoCoverage;
+  els.geoClassifyButton.textContent = state.kindSummary?.classified
+    ? `Classify Scenes (${state.kindSummary.pending} left)`
+    : 'Classify Scenes';
+  els.geoCancelClassifyButton.classList.toggle('hidden', !state.kindRunning);
+  els.geoGenerated.textContent = state.geoCoverage?.generatedAt
+    ? `Derived ${new Date(state.geoCoverage.generatedAt).toLocaleString()}`
+    : '';
+  renderGeoStats();
+  renderGeoKinds();
+  renderGeoLegend();
+  renderGeoClusters();
+  renderGeoSets();
+  renderGeoWorklist();
 }
 
 // Patches the one image that changed rather than reloading the library. The sidebar's tallies come
@@ -1283,6 +1815,17 @@ async function setFolderAnalysisIncluded(folderName, included) {
   }
 }
 
+async function setCategoryAnalysisIncluded(categoryName, included) {
+  if (!state.library) return;
+  try {
+    state.library = await window.categorizerAPI.setCategoryAnalysisIncluded(state.library.root, categoryName, included);
+    render();
+    showToast(included ? `“${categoryName}” included in analysis` : `“${categoryName}” omitted from analysis`);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
 // ==============================
 // Unified analysis queue
 // ==============================
@@ -1418,7 +1961,7 @@ async function onAnalysisFinished(type, { status, message }) {
     state.analysisRunning = null;
     setInteractionsLocked(false);
     setStatus('');
-    showToast(message || `${analysisTypeLabel(type)} analysis failed`);
+    showToast(message || `${analysisTypeLabel(type)} analysis failed`, { sticky: true });
     // Still refresh so partial results are visible
     if (state.library) {
       try {
@@ -1536,6 +2079,60 @@ function categoryDropTargetFromPoint(x, y) {
   return null;
 }
 
+// Horizontal panning for the overflow a narrow window produces. Worth wiring by hand because the
+// things that overflow first are the topbar's action buttons — exactly what you need when the
+// window is small — and WebView2 gives no middle-click autoscroll of its own. Middle-drag to pan,
+// Shift+wheel as the conventional equivalent. Both no-op when there is nothing to scroll.
+function installHorizontalPan() {
+  const surface = els.main;
+  if (!surface) return;
+  let pan = null;
+
+  const canScroll = () => surface.scrollWidth > surface.clientWidth;
+
+  surface.addEventListener('pointerdown', event => {
+    if (event.button !== 1 || !canScroll()) return;
+    event.preventDefault();
+    pan = { startX: event.clientX, startLeft: surface.scrollLeft, pointerId: event.pointerId };
+    // Capture keeps the pan alive when the cursor crosses a child or leaves the window mid-drag.
+    // It throws if the pointer is no longer active, which must not abort the pan itself.
+    try {
+      surface.setPointerCapture(event.pointerId);
+    } catch {}
+    surface.classList.add('panning');
+  });
+
+  surface.addEventListener('pointermove', event => {
+    if (!pan || event.pointerId !== pan.pointerId) return;
+    surface.scrollLeft = pan.startLeft - (event.clientX - pan.startX);
+  });
+
+  const endPan = event => {
+    if (!pan || (event && event.pointerId !== pan.pointerId)) return;
+    if (surface.hasPointerCapture?.(pan.pointerId)) surface.releasePointerCapture(pan.pointerId);
+    pan = null;
+    surface.classList.remove('panning');
+  };
+  surface.addEventListener('pointerup', endPan);
+  surface.addEventListener('pointercancel', endPan);
+
+  // Without this, releasing the middle button still fires the click that would paste-on-Linux /
+  // open the autoscroll widget, and it can land on whatever button was underneath the drag.
+  surface.addEventListener('auxclick', event => {
+    if (event.button === 1) event.preventDefault();
+  });
+
+  surface.addEventListener(
+    'wheel',
+    event => {
+      if (!event.shiftKey || !canScroll()) return;
+      event.preventDefault();
+      surface.scrollLeft += event.deltaY || event.deltaX;
+    },
+    { passive: false }
+  );
+}
+
 function startPointerDrag(event, card) {
   if (state.analyzing || event.button !== 0 || event.target.closest('button, select, .analysis-summary')) return;
 
@@ -1626,6 +2223,26 @@ function onPointerDragEnd(event) {
 function installEvents() {
   els.allTab.addEventListener('click', selectAll);
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
+  els.geoTab.addEventListener('click', selectGeo);
+  els.geoDeriveButton.addEventListener('click', runGeoDerive);
+  els.geoClassifyButton.addEventListener('click', () => runKindClassification(false));
+  els.geoCancelClassifyButton.addEventListener('click', async () => {
+    try {
+      await window.categorizerAPI.cancelKindClassification();
+    } catch (error) {
+      showToast(errorText(error));
+    }
+  });
+  els.geoBuildSetsButton.addEventListener('click', runGeoBuildSets);
+  els.geoGazetteerButton.addEventListener('click', async () => {
+    const root = state.library?.root || state.settings?.lastRoot;
+    if (!root) return;
+    try {
+      await window.categorizerAPI.openGeoGazetteer(root);
+    } catch (error) {
+      showToast(errorText(error));
+    }
+  });
   els.addCategoryButton.addEventListener('click', openCategoryDialog);
   els.addSourceFolderButton.addEventListener('click', addManualSourceFolder);
   els.rootFolderSelect.addEventListener('change', () => {
@@ -1661,6 +2278,7 @@ function installEvents() {
     renderImages();
   });
   els.mainDropTarget.addEventListener('scroll', onGridScroll, { passive: true });
+  installHorizontalPan();
   window.addEventListener('resize', () => {
     clearTimeout(installEvents.resizeTimer);
     installEvents.resizeTimer = setTimeout(() => {
@@ -1718,6 +2336,16 @@ function installEvents() {
   els.downloadNsfwModelButton.addEventListener('click', downloadNsfwModel);
   els.visionEndpointInput.addEventListener('change', saveVisionSettings);
   els.visionModelInput.addEventListener('change', saveVisionSettings);
+  els.visionApiKeyInput.addEventListener('change', saveVisionSettings);
+  els.visionModelSelect.addEventListener('change', () => {
+    const chosen = els.visionModelSelect.value;
+    if (!chosen) return;
+    els.visionModelInput.value = chosen;
+    saveVisionSettings();
+  });
+  els.refreshVisionModelsButton.addEventListener('click', refreshVisionModels);
+  els.loadVisionModelButton.addEventListener('click', loadSelectedVisionModel);
+  els.toastDismiss.addEventListener('click', dismissToast);
   els.regenerateChunkPlanButton.addEventListener('click', regenerateChunkPlan);
   els.openChunkPlanButton.addEventListener('click', openChunkPlanFile);
   els.discardChunkPlanButton.addEventListener('click', discardChunkPlan);
@@ -1819,6 +2447,7 @@ async function init() {
     showWindowAfterPaint();
 
     await installAnalysisListeners();
+    await installKindListeners();
     await installFileDropListener();
     await refreshAll();
   } catch (error) {
