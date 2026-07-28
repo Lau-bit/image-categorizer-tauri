@@ -77,6 +77,7 @@ const els = {
   mainDropTarget: document.getElementById('main-drop-target'),
   searchInput: document.getElementById('search-input'),
   statusMessage: document.getElementById('status-message'),
+  statusDismiss: document.getElementById('status-dismiss'),
   sortSelect: document.getElementById('sort-select'),
   refreshButton: document.getElementById('refresh-button'),
   analyzeButton: document.getElementById('analyze-button'),
@@ -157,15 +158,21 @@ const els = {
   toastDismiss: document.getElementById('toast-dismiss'),
 };
 
-// `sticky` messages (errors you actually need to read) stay up for 30s, are selectable/copyable,
-// and dismiss via their ✕ button — instead of the brief 2.4s confirmation used for routine "done"
-// toasts. A long failure message that vanishes before you can read or copy it is useless.
+// Every toast now carries a ✕ and sticks around long enough to actually be read — the results
+// that matter ("Geo derived — 7614 images across 53 countries", an import summary) arrive at the
+// end of a long run, when you're looking anywhere but the corner of the screen. 2.4s lost them.
+// `sticky` (errors) additionally wraps its text, makes it selectable/copyable, and stays longer.
+const TOAST_MS = 15000;
+// Deliberately left at 30s: a sticky toast is the one that takes pointer events over the whole box
+// (so its text can be selected), and stretching that further would block the grid corner underneath.
+const TOAST_STICKY_MS = 30000;
+
 function showToast(message, { sticky = false } = {}) {
   els.toastText.textContent = message;
   els.toast.classList.add('visible');
   els.toast.classList.toggle('sticky', sticky);
   clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(dismissToast, sticky ? 30000 : 2400);
+  showToast.timer = setTimeout(dismissToast, sticky ? TOAST_STICKY_MS : TOAST_MS);
 }
 
 function dismissToast() {
@@ -173,19 +180,26 @@ function dismissToast() {
   els.toast.classList.remove('visible', 'sticky');
 }
 
-// `persist` keeps the message up until it's explicitly replaced — used for the "Scanning…"
-// message during a load, which can outlast the 5s auto-clear on a large library and would
-// otherwise vanish mid-scan, making the app look stalled.
+// Same reasoning as the toast: a terminal status ("Analysis complete.") is the one line telling
+// you a long pass finished, so it holds for 45s and offers a ✕ rather than blinking out in 5s.
+// `persist` keeps the message up until it's explicitly replaced — used for in-progress messages
+// like "Scanning…", which can outlast any timeout on a large library and would otherwise vanish
+// mid-scan, making the app look stalled.
+const STATUS_MS = 45000;
+
 function setStatus(message, persist = false) {
   els.statusMessage.textContent = message || '';
   els.statusMessage.title = message || '';
+  // The ✕ only exists to clear a message, so it must not linger once there is nothing to clear.
+  els.statusDismiss.hidden = !message;
   clearTimeout(setStatus.timer);
   if (message && !persist) {
-    setStatus.timer = setTimeout(() => {
-      els.statusMessage.textContent = '';
-      els.statusMessage.title = '';
-    }, 5000);
+    setStatus.timer = setTimeout(clearStatus, STATUS_MS);
   }
+}
+
+function clearStatus() {
+  setStatus('');
 }
 
 // The small topbar spinner signals background activity for both a library scan and an
@@ -388,7 +402,9 @@ async function refreshVisionModels() {
     const models = await window.categorizerAPI.listVisionModels();
     select.replaceChildren(new Option('— pick a model —', ''));
     for (const id of models) select.add(new Option(id, id));
-    if (current) select.value = current; // no-op if current isn't one of the offered ids
+    // Only select a saved model the server actually offers. Assigning an unknown value doesn't
+    // no-op — it sets selectedIndex to -1, leaving the dropdown blank instead of on its placeholder.
+    if (current && models.includes(current)) select.value = current;
     els.visionModelStatus.textContent = models.length
       ? `${models.length} model${models.length === 1 ? '' : 's'} available.`
       : 'Server reachable but no models listed — download or enable one in LM Studio.';
@@ -806,14 +822,15 @@ function renderHeader() {
     (state.loading ? (state.settings?.lastRoot || 'Loading…') : 'No root folder chosen yet');
 }
 
-function categoryOptionsHtml(selected) {
-  const categories = state.library?.categories || [];
-  let html = `<option value="">Unclassified</option>`;
-  for (const category of categories) {
-    const isSelected = category.name === selected ? 'selected' : '';
-    html += `<option value="${category.name}" ${isSelected}>${category.name}</option>`;
+// Built through `new Option(text, value)` rather than an interpolated HTML string: a name is
+// free text, and `&`-sequences in one would be parsed as entities, so the option's value would
+// stop matching the category the backend knows. Same reason as the vision-model dropdown.
+function fillCategorySelect(select, selected) {
+  const options = [new Option('Unclassified', '')];
+  for (const category of state.library?.categories || []) {
+    options.push(new Option(category.name, category.name, false, category.name === selected));
   }
-  return html;
+  select.replaceChildren(...options);
 }
 
 function percent(value) {
@@ -907,7 +924,7 @@ function buildImageCard(image) {
   summary.title = summaryLines.join('\n');
 
   const select = card.querySelector('.category-select');
-  select.innerHTML = categoryOptionsHtml(image.category);
+  fillCategorySelect(select, image.category);
   select.disabled = state.analyzing;
   select.addEventListener('change', () => assignCategory(image.hash, select.value || null));
 
@@ -1049,6 +1066,14 @@ async function refreshLibrary() {
 }
 
 async function refreshAll() {
+  // A scan doesn't just read — `scan_and_reconcile` saves the sidecar back. A running analysis pass
+  // rewrites that same file wholesale from the snapshot it took when it started, so a scan landing
+  // mid-pass gets erased, exactly as an import would. The Rescan button is disabled while analyzing,
+  // but Ctrl+R reaches this directly — so the guard belongs here, on the one path they share.
+  if (state.analyzing) {
+    showToast('Analysis is running — wait for it to finish before rescanning.');
+    return;
+  }
   setLoading(true);
   setStatus('Scanning for new, moved, or deleted images…', true);
   // Paint the loading state before the (potentially slow) scan begins — otherwise the first
@@ -1576,9 +1601,9 @@ function openMoveDialog(image) {
   // Duplicates share a hash, so remember the exact file this card stands for.
   state.pendingMoveRelativePath = image.relativePath;
   const folders = (state.library?.sourceFolders || []).filter(folder => folder.name !== 'Root');
-  els.moveFolderSelect.innerHTML = folders
-    .map(folder => `<option value="${folder.name}" ${folder.name === image.sourceFolder ? 'selected' : ''}>${folder.name}</option>`)
-    .join('');
+  els.moveFolderSelect.replaceChildren(
+    ...folders.map(folder => new Option(folder.name, folder.name, false, folder.name === image.sourceFolder))
+  );
   els.moveNewFolderInput.value = '';
   els.moveDialog.showModal();
 }
@@ -1628,9 +1653,7 @@ function openImportDialog(paths) {
   const suggested = defaultImportFolder();
   els.importCount.textContent =
     paths.length === 1 ? '1 item selected' : `${paths.length} items selected`;
-  els.importFolderSelect.innerHTML = folders
-    .map(folder => `<option value="${folder.name}">${folder.name}</option>`)
-    .join('');
+  els.importFolderSelect.replaceChildren(...folders.map(folder => new Option(folder.name, folder.name)));
   els.importNewFolderInput.value = folders.some(folder => folder.name === suggested) ? '' : suggested;
   els.importDialog.showModal();
   setTimeout(() => els.importNewFolderInput.focus(), 0);
@@ -2346,6 +2369,7 @@ function installEvents() {
   els.refreshVisionModelsButton.addEventListener('click', refreshVisionModels);
   els.loadVisionModelButton.addEventListener('click', loadSelectedVisionModel);
   els.toastDismiss.addEventListener('click', dismissToast);
+  els.statusDismiss.addEventListener('click', clearStatus);
   els.regenerateChunkPlanButton.addEventListener('click', regenerateChunkPlan);
   els.openChunkPlanButton.addEventListener('click', openChunkPlanFile);
   els.discardChunkPlanButton.addEventListener('click', discardChunkPlan);

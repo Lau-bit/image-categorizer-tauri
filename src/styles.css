@@ -543,8 +543,10 @@ h1 {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 0 0 260px;
-  width: 260px;
+  /* 260px of text + the 16px ✕ and its gap, so adding the button didn't cost the message any
+     width — messages that fit before still fit. */
+  flex: 0 0 284px;
+  width: 284px;
   min-width: 0;
 }
 
@@ -556,6 +558,40 @@ h1 {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Results worth reading are often worth copying (counts, folder names), and the slot truncates
+     with an ellipsis — so the text is selectable and the full string lives in its title tooltip. */
+  user-select: text;
+  cursor: default;
+}
+
+.status-dismiss {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.status-dismiss:hover {
+  background: var(--panel-soft);
+  color: var(--text);
+  opacity: 1;
+}
+
+/* Must out-specify the `display: inline-flex` above, or the UA `[hidden] { display: none }`
+   loses the cascade and the ✕ sits in the topbar with no message to dismiss. */
+.status-dismiss[hidden] {
+  display: none;
 }
 
 .drop-target {
@@ -1001,9 +1037,10 @@ input[type="range"] {
   transform: translateY(0);
 }
 
-/* The ✕ only applies to sticky error toasts; brief confirmations auto-hide and hide it. */
+/* Every toast is dismissable now that they all linger — a confirmation you've already read
+   sitting in the corner for 15s is exactly the itch the ✕ scratches. */
 .toast-dismiss {
-  display: none;
+  display: inline-block;
   flex: 0 0 auto;
   min-height: 0;
   padding: 0 4px;
@@ -1014,6 +1051,9 @@ input[type="range"] {
   line-height: 1.2;
   cursor: pointer;
   opacity: 0.7;
+  /* The toast body stays click-through (see `.toast`) so a lingering confirmation never blocks
+     the image tiles it floats over — the ✕ opts itself back in as the one hit target on it. */
+  pointer-events: auto;
 }
 
 .toast-dismiss:hover {
@@ -1033,10 +1073,6 @@ input[type="range"] {
   white-space: pre-wrap;
   user-select: text;
   cursor: text;
-}
-
-.toast.sticky .toast-dismiss {
-  display: inline-block;
 }
 
 /* ==============================
