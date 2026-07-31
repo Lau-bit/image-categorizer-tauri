@@ -52,9 +52,21 @@
 
       <main class="main">
         <header class="topbar">
-          <div class="title-block">
-            <h1 id="view-title">All Images</h1>
-            <div class="path-line" id="view-subtitle"></div>
+          <div class="topbar-head">
+            <!-- Only rendered by the stacked (narrow) layout, where the sidebar costs the grid its
+                 vertical space; the stylesheet hides it again once there is room for both. -->
+            <button
+              class="icon-button sidebar-toggle"
+              id="sidebar-toggle"
+              type="button"
+              title="Hide the sidebar"
+              aria-label="Show or hide the sidebar"
+              aria-expanded="true"
+            >&#9776;</button>
+            <div class="title-block">
+              <h1 id="view-title">All Images</h1>
+              <div class="path-line" id="view-subtitle"></div>
+            </div>
           </div>
           <div class="top-actions">
             <input id="search-input" class="search-input" type="search" placeholder="Search images">

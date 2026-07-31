@@ -43,8 +43,11 @@ body.light-mode {
 
 body {
   margin: 0;
-  min-width: 780px;
-  min-height: 500px;
+  /* Only a floor for the point past which the controls genuinely cannot be laid out, not the width
+     the layout is designed around — the narrow tiers below reflow rather than overflow, so the old
+     780px floor was doing nothing but forcing a horizontal scrollbar on any smaller window. */
+  min-width: 360px;
+  min-height: 420px;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -216,7 +219,11 @@ body.light-mode .count-pill {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-height: 0;
+  /* Must NOT shrink. As shrinkable flex children of the sidebar column they collapsed to height 0
+     once the sidebar was shorter than its content, and their rows then drew straight over the
+     following section heading instead of the sidebar scrolling. Refusing to shrink is what hands
+     the overflow to the sidebar's own `overflow-y: auto`. */
+  flex: 0 0 auto;
 }
 
 .source-folder-row {
@@ -261,6 +268,7 @@ body.light-mode .count-pill {
 .sidebar-footer {
   display: flex;
   flex-direction: column;
+  flex: 0 0 auto;
   gap: 10px;
   margin-top: auto;
   padding-top: 12px;
@@ -298,11 +306,12 @@ body.light-mode .count-pill {
   position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  /* One column that never shrinks below the widest child's min-content — in practice the topbar,
-     whose action buttons don't wrap away. Narrower than that and the column overflows instead of
-     being clipped, which is what gives `overflow-x` something to scroll. Above it, `1fr` fills as
-     before, so at the default window size nothing changes. */
-  grid-template-columns: minmax(min-content, 1fr);
+  /* Free to shrink to whatever the window gives it: the topbar's action bar wraps and its widest
+     controls are allowed to shrink (see the narrow tiers at the end of this file), so there is
+     nothing left that has to be scrolled sideways to be reached. `overflow-x` below stays as a
+     safety net for content that still can't fit — a scrollbar beats silent clipping — but in the
+     normal case it never appears. */
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow-x: auto;
@@ -386,10 +395,39 @@ body.light-mode .drop-overlay {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 18px;
   padding: 16px 18px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+  /* Without this the topbar is the one thing that can still force a horizontal scrollbar. A grid
+     item defaults to `min-width: auto`, so its used width becomes its own min-content width rather
+     than the track's — and its min-content is set by `.path-line`, a `nowrap` full library path that
+     is happy to be 400px wide. `min-width: 0` makes the track's width flow down instead, and the
+     path then ellipsizes the way it was always styled to. */
+  min-width: 0;
+}
+
+/* Keeps the sidebar toggle beside the view title, so the stacked layout's extra control shares the
+   title's row instead of claiming one of its own. */
+.topbar-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Offered only in the stacked layout, where the sidebar spends the grid's vertical space rather
+   than its horizontal space. Deliberately absent at wide widths: the collapse rules are scoped to
+   the same media query, so a window can never be left sidebar-less with no button to bring it back. */
+.sidebar-toggle {
+  display: none;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  background: var(--panel-soft);
+  font-size: 15px;
 }
 
 .title-block {
@@ -422,6 +460,10 @@ h1 {
 .analysis-controls {
   display: flex;
   align-items: center;
+  /* Its eight controls are the single widest thing in the action bar. Wrapping them inside their
+     own bordered group keeps the group's min-content down to one checkbox, so a narrow window
+     reflows the analysis controls instead of pushing the whole topbar past the window edge. */
+  flex-wrap: wrap;
   gap: 6px;
   padding: 4px 8px;
   border: 1px solid var(--border);
@@ -474,6 +516,7 @@ h1 {
 
 .search-input {
   width: 220px;
+  max-width: 100%;
   padding: 0 10px;
 }
 
@@ -1018,7 +1061,7 @@ input[type="range"] {
   position: fixed;
   right: 18px;
   bottom: 18px;
-  max-width: 360px;
+  max-width: min(360px, calc(100vw - 36px));
   padding: 10px 12px;
   border-radius: 8px;
   background: var(--text);
@@ -1065,7 +1108,7 @@ input[type="range"] {
    text doesn't dismiss them. */
 .toast.sticky {
   pointer-events: auto;
-  max-width: 440px;
+  max-width: min(440px, calc(100vw - 36px));
   border-left: 4px solid var(--danger);
 }
 
@@ -1464,29 +1507,83 @@ body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
   }
 }
 
-@media (max-width: 980px) {
-  body {
-    overflow: auto;
-  }
+/* ==============================
+   Narrow windows
+   The window gets dragged down to a third of the screen routinely, so nothing below may depend on
+   horizontal overflow to stay reachable: the action bar wraps, its two fixed-width controls become
+   shrinkable, and the sidebar stacks above the grid instead of competing with it for width.
+   The shell stays exactly 100vh at every width — see the note on `grid-template-rows`.
+   ============================== */
 
+@media (max-width: 980px) {
   .app-shell {
-    grid-template-columns: 1fr;
-    height: auto;
-    min-height: 100vh;
+    grid-template-columns: minmax(0, 1fr);
+    /* Rows rather than `height: auto` + a scrolling body. Letting the shell grow to fit its content
+       put the whole image grid below the fold (the sidebar alone is taller than a narrow window),
+       and left `.drop-target` with no definite height — which the virtual scroller reads as its
+       viewport via `clientHeight`, so it was sizing the window from the content it was supposed to
+       be windowing. `auto` bounded by the sidebar's `max-height`, then the grid takes the rest. */
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .sidebar {
+    /* Capped so the grid is always on screen; the sidebar scrolls within the cap, which it is
+       already set up to do. Drag-to-categorize keeps working because both stay visible. */
+    max-height: 40vh;
+    padding: 12px 14px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
 
-  .topbar {
-    align-items: flex-start;
-    flex-direction: column;
+  .sidebar-toggle {
+    display: grid;
   }
 
-  .top-actions,
+  /* Collapsed: the sidebar's row goes with it, or the grid would land in the leftover `auto` row
+     and lose the definite height it needs. */
+  body.sidebar-collapsed .app-shell {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  body.sidebar-collapsed .sidebar {
+    display: none;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+    /* `wrap` is for the row layout only. Wrapping a COLUMN flex container makes it multi-*column*,
+       and a stretched item then fills its line rather than the container — so the line grew to the
+       widest child's content width and the whole topbar overflowed sideways again, which is exactly
+       what the column layout exists to prevent. */
+    flex-wrap: nowrap;
+    gap: 10px;
+    padding: 12px 14px 10px;
+  }
+
+  h1 {
+    font-size: 19px;
+  }
+
+  .top-actions {
+    justify-content: flex-start;
+  }
+
+  /* Both of these are declared at a fixed width for the wide layout, and both are wider than a
+     narrow window's whole action bar. Allowed to shrink here instead of setting the floor. */
   .search-input {
-    width: 100%;
+    flex: 1 1 170px;
+    width: auto;
+    min-width: 0;
+  }
+
+  .status-area {
+    flex: 1 1 100%;
+    width: auto;
+  }
+
+  .drop-target,
+  .geo-view {
+    padding: 12px 14px 14px;
   }
 }

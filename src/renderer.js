@@ -74,6 +74,7 @@ const els = {
   loadingLabel: document.getElementById('loading-label'),
   statusSpinner: document.getElementById('status-spinner'),
   main: document.querySelector('.main'),
+  sidebarToggle: document.getElementById('sidebar-toggle'),
   mainDropTarget: document.getElementById('main-drop-target'),
   searchInput: document.getElementById('search-input'),
   statusMessage: document.getElementById('status-message'),
@@ -2156,6 +2157,41 @@ function installHorizontalPan() {
   );
 }
 
+// A narrow window stacks the sidebar above the grid, so it spends the grid's vertical space rather
+// than its horizontal space — which makes it worth being able to put away while browsing. Stored in
+// localStorage rather than the app settings file: it's a per-window-shape view preference, not
+// library state, and it needs no round trip to Rust. The stylesheet honours the class only in the
+// stacked layout, so widening the window always brings the sidebar back whether or not it's set.
+const SIDEBAR_COLLAPSED_KEY = 'imageCategorizer.sidebarCollapsed';
+
+function applySidebarCollapsed(collapsed) {
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  els.sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
+  els.sidebarToggle.title = collapsed ? 'Show the sidebar' : 'Hide the sidebar';
+}
+
+function installSidebarToggle() {
+  let collapsed = false;
+  // Private-mode/partitioned webviews can throw on either access; the toggle still works, it just
+  // won't be remembered.
+  try {
+    collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+  } catch {}
+  applySidebarCollapsed(collapsed);
+
+  els.sidebarToggle.addEventListener('click', () => {
+    const next = !document.body.classList.contains('sidebar-collapsed');
+    applySidebarCollapsed(next);
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? '1' : '0');
+    } catch {}
+    // The grid just gained or lost the sidebar's height, so its column count and the virtual
+    // window's row maths both need recomputing — same work the resize handler does.
+    state.cardHeight = null;
+    renderImages();
+  });
+}
+
 function startPointerDrag(event, card) {
   if (state.analyzing || event.button !== 0 || event.target.closest('button, select, .analysis-summary')) return;
 
@@ -2302,6 +2338,7 @@ function installEvents() {
   });
   els.mainDropTarget.addEventListener('scroll', onGridScroll, { passive: true });
   installHorizontalPan();
+  installSidebarToggle();
   window.addEventListener('resize', () => {
     clearTimeout(installEvents.resizeTimer);
     installEvents.resizeTimer = setTimeout(() => {
