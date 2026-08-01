@@ -93,6 +93,21 @@ window.categorizerAPI = {
   getGeoSets: root => invoke('get_geo_sets', { root }),
   getGeoSetImages: (root, setId) => invoke('get_geo_set_images', { root, setId }),
   openGeoGazetteer: root => invoke('open_geo_gazetteer', { root }),
+  // The worklist's decision table. `setGeoOverride` writes the gazetteer and nothing else — the
+  // decision reaches the records on the next derive, which the worklist says out loud.
+  // action: 'place' (with a country, or "A, B" for a route) | 'reject' | 'clear'.
+  getGeoOverrides: root => invoke('get_geo_overrides', { root }),
+  // The frames a worklist string actually came from, for deciding it by eye. Returns hashes +
+  // descriptions; the caller resolves the hashes against the library it already holds.
+  getGeoLocationImages: (root, location, limit) =>
+    invoke('get_geo_location_images', { root, location, limit }),
+  setGeoOverride: (root, location, action, country) =>
+    invoke('set_geo_override', { root, location, action, country: country ?? null }),
+  // Post-build review: what is wrong with the sets that already exist, and the fixes for it.
+  // `applyGeoReview` only writes the exclusion list and the gazetteer — re-deriving and rebuilding
+  // stay separate calls so the user sees them happen.
+  reviewGeoSets: root => invoke('review_geo_sets', { root }),
+  applyGeoReview: (root, fixes) => invoke('apply_geo_review', { root, fixes }),
 
   // Category management
   createCategory: (root, name) => invoke('create_category', { root, name }),

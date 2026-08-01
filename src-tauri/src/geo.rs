@@ -654,6 +654,48 @@ const JUNK_EXACT: &[&str] = &[
     "indoors",
 ];
 
+/// Ports of registry painted on a ship's stern. The vision model reads that text and dutifully
+/// answers `Location: Panama` for a container ship filmed on the Elbe or the Congo, which is how a
+/// library of European shipspotting footage grew a "Liberia" and a "Panama".
+///
+/// These reject ONLY when the whole location line is the bare port/flag AND the description is
+/// about a vessel — "Panama City", "Colón, Panama" and "Panama Canal" all normalize differently and
+/// survive, and a bare "Panama" in a description with no ship in it is left alone. Narrow on
+/// purpose: this is a false-positive filter, not a country ban.
+const REGISTRY_PORTS: &[&str] = &[
+    "panama",
+    "liberia",
+    "monrovia",
+    "majuro",
+    "valletta",
+    "limassol",
+    "nassau",
+    "road town",
+    "port vila",
+    "willemstad",
+    "bridgetown",
+    "marshall islands",
+];
+
+/// Words that make a description maritime enough for the registry-port rule to fire.
+const VESSEL_WORDS: &[&str] = &[
+    "ship",
+    "ships",
+    "vessel",
+    "vessels",
+    "tanker",
+    "freighter",
+    "barge",
+    "tugboat",
+    "shipspotting",
+    "stern",
+    "hull",
+    "maersk",
+    "cargo",
+    "port of registry",
+    "home port",
+];
+
 /// Phrases that are a non-answer however they continue — the model declining to name a place. Safe
 /// to prefix-match because no real location line starts with one.
 const JUNK_PREFIXES: &[&str] = &[
@@ -769,6 +811,63 @@ pub fn save_gazetteer(root: &Path, gazetteer: &Gazetteer) -> Result<(), String> 
         .map_err(|error| format!("Failed to serialize gazetteer: {error}"))?;
     std::fs::write(gazetteer_path(root), json)
         .map_err(|error| format!("Failed to save gazetteer: {error}"))
+}
+
+/// The hand-decision table on its own, for the worklist UI to show what has already been decided.
+/// Read straight off disk rather than cached, so decisions made by hand-editing the file show up
+/// in the app too — the file stays the single store, exactly as the review panel treats it.
+pub fn overrides(root: &Path) -> BTreeMap<String, Option<String>> {
+    load_gazetteer(root).overrides
+}
+
+/// Record one decision about one location string — the same edit `overrides` takes by hand, made
+/// from the worklist instead. `action` is `place` (with `country`, or `"A, B"` for a route),
+/// `reject` (non-geographic), or `clear` (hand it back to the resolver's own judgement).
+///
+/// Keys are stored lowercased, matching the hand-edit contract in `GAZETTEER_NOTE`; the resolver
+/// runs `normalize()` over both sides at lookup time, so that is all the canonicalization needed.
+/// Returns the whole table so a caller can repaint every row from one round trip.
+pub fn set_override(
+    root: &Path,
+    location: &str,
+    action: &str,
+    country: Option<&str>,
+) -> Result<BTreeMap<String, Option<String>>, String> {
+    let key = location.trim().to_lowercase();
+    if key.is_empty() {
+        return Err("No location string to decide about.".to_string());
+    }
+
+    let mut gazetteer = load_gazetteer(root);
+    match action {
+        "place" => {
+            // Stored in the same shape a hand-editor would write, so re-reading the file and
+            // re-saving it from the UI can never rewrite someone's routes into another format.
+            let parts: Vec<String> = country
+                .unwrap_or("")
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
+            if parts.is_empty() {
+                return Err("Type a country before saving.".to_string());
+            }
+            gazetteer.overrides.insert(key, Some(parts.join(", ")));
+        }
+        "reject" => {
+            gazetteer.overrides.insert(key, None);
+        }
+        "clear" => {
+            gazetteer.overrides.remove(&key);
+        }
+        other => return Err(format!("Unknown override action: {other}")),
+    }
+
+    if gazetteer.note.is_empty() {
+        gazetteer.note = GAZETTEER_NOTE.to_string();
+    }
+    save_gazetteer(root, &gazetteer)?;
+    Ok(gazetteer.overrides)
 }
 
 /// A cheap stable fingerprint of the hand-edited parts of the gazetteer. Stored on every derived
@@ -1008,6 +1107,188 @@ impl Resolver {
     }
 }
 
+/// True when a location line is a ship's port of registry read off its stern rather than the place
+/// the footage was shot. Needs both halves: the answer must be the bare port/flag *and* the
+/// description must be about a vessel.
+pub fn is_registry_port_reading(description: &str, raw: &str) -> bool {
+    let normalized = normalize(raw);
+    let dearticled = normalized
+        .strip_prefix("the ")
+        .unwrap_or(&normalized);
+    if !REGISTRY_PORTS.iter().any(|port| dearticled == *port) {
+        return false;
+    }
+    let lowered = description.to_lowercase();
+    VESSEL_WORDS.iter().any(|word| contains_word(&lowered, word))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Source identity — collapsing OCR readings of one video title into one video
+// ---------------------------------------------------------------------------------------------
+
+/// Fraction of words two title readings must share — after allowing for OCR mangling — to be
+/// judged the same video. High on purpose: two videos from one channel differ by only their place
+/// name ("[4K] PARIS Aerial Drone Film" / "[4K] LONDON Aerial Drone Film"), and merging *those*
+/// would be far worse than leaving a title split, so the margin has to sit above that case.
+const TITLE_MERGE_SIMILARITY: f64 = 0.8;
+/// Below this many usable tokens a title is too short to identify anything, so it is never merged.
+const TITLE_MIN_TOKENS: usize = 3;
+/// A token in more groups than this ("driving", "youtube") tells us nothing and would only make the
+/// candidate scan quadratic over the whole library.
+const TITLE_COMMON_TOKEN_LIMIT: usize = 200;
+
+/// The words a title reading is identified by: four characters or more, no digits.
+///
+/// Digits are the first thing that varies between readings of one title — YouTube's own "(1)"
+/// notification prefix, a "4K60" badge, a year — and the first thing OCR mangles. What survives is
+/// the prose.
+fn title_tokens(title: &str) -> BTreeSet<String> {
+    title
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter_map(|word| {
+            let lower = word.to_lowercase();
+            if lower.chars().count() < 4 || lower.chars().any(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            Some(lower)
+        })
+        .collect()
+}
+
+/// Levenshtein distance, abandoned as soon as it provably exceeds `budget`.
+fn within_edit_distance(a: &str, b: &str, budget: usize) -> bool {
+    let left: Vec<char> = a.chars().collect();
+    let right: Vec<char> = b.chars().collect();
+    if left.len().abs_diff(right.len()) > budget {
+        return false;
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, lc) in left.iter().enumerate() {
+        current[0] = i + 1;
+        let mut row_best = current[0];
+        for (j, rc) in right.iter().enumerate() {
+            let cost = usize::from(lc != rc);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+            row_best = row_best.min(current[j + 1]);
+        }
+        if row_best > budget {
+            return false;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()] <= budget
+}
+
+/// Whether two words are the same word as far as a title-bar OCR is concerned.
+///
+/// The distinction this draws is the whole reason merging is safe: a *mangled* word still looks
+/// like its original ("Vlew"/"View", "Railwayto"/"Railway", "Segway"/"Skagway"), whereas a word
+/// that genuinely differs between two videos does not ("Paris"/"London"). Everything else here
+/// rests on that being able to tell them apart.
+fn words_match(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // One reading ran two words together or clipped a suffix.
+    if short.chars().count() >= 4 && long.starts_with(short) {
+        return true;
+    }
+    // Otherwise a few mangled characters, budgeted against the shorter word's length.
+    within_edit_distance(a, b, (short.chars().count() / 3).max(1))
+}
+
+/// Whether two title readings are the same video.
+///
+/// Two conditions, and the second is the one doing the real work. A high shared-word share alone
+/// still merges "Tirana to Saranda" with "Tirana to Vlora" — six of seven words agree. What
+/// separates them is *where* the disagreement sits: OCR either mangles a word (which
+/// [`words_match`] absorbs) or drops one, so its leftovers pile up on ONE side. A word swapped for
+/// a different word leaves an orphan on BOTH sides, and that is a different video every time.
+fn titles_match(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let right: Vec<&String> = b.iter().collect();
+    let mut taken = vec![false; right.len()];
+    let mut matched = 0usize;
+    for word in a {
+        for (index, other) in right.iter().enumerate() {
+            if taken[index] || !words_match(word, other) {
+                continue;
+            }
+            taken[index] = true;
+            matched += 1;
+            break;
+        }
+    }
+    if a.len() - matched > 0 && b.len() - matched > 0 {
+        return false;
+    }
+    (2 * matched) as f64 / (a.len() + b.len()) as f64 >= TITLE_MERGE_SIMILARITY
+}
+
+/// Collapses title readings that are the same video into one source, returning `group index ->
+/// representative group index`.
+///
+/// **This is the single biggest correctness fix in the layer.** Grouping keys titles exactly (after
+/// stripping punctuation), so every OCR wobble in a title bar splits one video into another
+/// "source": measured on the live library, `Mountain Railway to ALASKA | White Pass & Yukon Route`
+/// alone occupied seventeen groups — "Rail-way", "Railwayto", "Vlew", "Segway", plus YouTube's own
+/// "(1)" prefix appearing on some frames and not others. Since variety here is *counted in sources*,
+/// that inflated every diversity number the layer produces: a set could report sixteen videos and
+/// show five near-identical frames of one train ride, which is precisely the false prior the whole
+/// design exists to avoid.
+///
+/// Deliberately conservative — a high overlap threshold, digits ignored, short titles never merged —
+/// because merging two genuinely different videos costs more than leaving one split.
+pub fn canonical_groups(titles: &[&str]) -> Vec<usize> {
+    let mut parent: Vec<usize> = (0..titles.len()).collect();
+    fn find(parent: &mut Vec<usize>, mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+
+    let tokens: Vec<BTreeSet<String>> = titles.iter().map(|title| title_tokens(title)).collect();
+
+    // Inverted index: only titles sharing at least one distinctive word are ever compared.
+    let mut buckets: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, set) in tokens.iter().enumerate() {
+        if set.len() < TITLE_MIN_TOKENS {
+            continue;
+        }
+        for token in set {
+            buckets.entry(token.as_str()).or_default().push(index);
+        }
+    }
+
+    for (_token, candidates) in &buckets {
+        if candidates.len() > TITLE_COMMON_TOKEN_LIMIT {
+            continue;
+        }
+        for (offset, left) in candidates.iter().enumerate() {
+            for right in candidates.iter().skip(offset + 1) {
+                if find(&mut parent, *left) == find(&mut parent, *right) {
+                    continue;
+                }
+                if titles_match(&tokens[*left], &tokens[*right]) {
+                    let a = find(&mut parent, *left);
+                    let b = find(&mut parent, *right);
+                    parent[b] = a;
+                }
+            }
+        }
+    }
+
+    (0..titles.len()).map(|index| find(&mut parent, index)).collect()
+}
+
 /// Pulls the `Location:` line the describe prompt asks for out of a description.
 pub fn extract_location_line(description: &str) -> Option<String> {
     for line in description.lines() {
@@ -1058,10 +1339,22 @@ pub struct GeoStats {
     pub tagged_propagated: usize,
     pub tagged_total: usize,
     pub rejected_junk: usize,
+    /// Location lines that were a ship's port of registry rather than a place — see
+    /// [`is_registry_port_reading`].
+    #[serde(default)]
+    pub rejected_registry_port: usize,
     pub unresolved_images: usize,
     pub unresolved_strings: usize,
     pub fiction_groups_skipped: usize,
     pub countries_seen: usize,
+    /// Distinct videos after collapsing OCR readings of one title — the real denominator behind
+    /// every "N videos" figure in the app.
+    #[serde(default)]
+    pub sources: usize,
+    /// How many chunk-plan groups those videos were spread across before merging. The gap is pure
+    /// OCR jitter, and it is what used to be counted as variety.
+    #[serde(default)]
+    pub source_groups: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1120,15 +1413,44 @@ pub fn derive(
 ) -> GeoFile {
     let resolver = Resolver::new(gazetteer);
 
-    let mut hash_to_group: HashMap<&str, usize> = HashMap::new();
-    for (index, group) in groups.iter().enumerate() {
-        for hash in group.member_hashes {
-            hash_to_group.insert(hash.as_str(), index);
+    // One video, one source — however many ways OCR read its title bar. Everything downstream
+    // (propagation, variety counts, set building) works on these merged sources, never on raw plan
+    // groups, because a raw group is a *title reading* and variety has to be counted in videos.
+    let titles: Vec<&str> = groups.iter().map(|group| group.title).collect();
+    let canonical = canonical_groups(&titles);
+    // Within each cluster the group with the most frames speaks for it: its index is what records
+    // record, its title is what the fiction denylist and the `via` audit trail see.
+    let mut representative: HashMap<usize, usize> = HashMap::new();
+    for (index, root) in canonical.iter().enumerate() {
+        let entry = representative.entry(*root).or_insert(index);
+        if groups[index].member_hashes.len() > groups[*entry].member_hashes.len() {
+            *entry = index;
+        }
+    }
+    // Cluster root -> (representative group index, every member hash in the cluster).
+    let mut clusters: Vec<(usize, Vec<&str>)> = Vec::new();
+    let mut cluster_of_root: HashMap<usize, usize> = HashMap::new();
+    for (index, root) in canonical.iter().enumerate() {
+        let slot = *cluster_of_root.entry(*root).or_insert_with(|| {
+            clusters.push((representative[root], Vec::new()));
+            clusters.len() - 1
+        });
+        for hash in groups[index].member_hashes {
+            clusters[slot].1.push(hash.as_str());
+        }
+    }
+
+    let mut hash_to_cluster: HashMap<&str, usize> = HashMap::new();
+    for (index, (_representative, members)) in clusters.iter().enumerate() {
+        for hash in members {
+            hash_to_cluster.insert(hash, index);
         }
     }
 
     let mut stats = GeoStats {
         described: descriptions.len(),
+        source_groups: groups.len(),
+        sources: clusters.len(),
         ..GeoStats::default()
     };
     let mut unresolved: BTreeMap<String, u32> = BTreeMap::new();
@@ -1141,6 +1463,13 @@ pub fn derive(
             continue;
         };
         stats.with_location += 1;
+        // A flag of convenience read off a stern is not a location. Rejected before resolution so
+        // the reading never seeds its group either — one such frame used to tag a whole video, and
+        // through propagation an entire country.
+        if is_registry_port_reading(&image.description, &raw) {
+            stats.rejected_registry_port += 1;
+            continue;
+        }
         match resolver.resolve(&raw) {
             Resolution::Countries(countries) => {
                 own.insert(image.hash.as_str(), (countries.clone(), raw.clone()));
@@ -1156,7 +1485,8 @@ pub fn derive(
     // Own-description tags first — they always beat a propagated guess.
     for image in descriptions {
         if let Some((countries, raw)) = own.get(image.hash.as_str()) {
-            let group_index = hash_to_group.get(image.hash.as_str()).copied();
+            let cluster = hash_to_cluster.get(image.hash.as_str()).copied();
+            let group_index = cluster.map(|index| clusters[index].0);
             // A frame from a fictional video is fictional even when it describes a real-looking place.
             if let Some(index) = group_index {
                 if resolver.is_fiction_title(groups[index].title) {
@@ -1178,8 +1508,12 @@ pub fn derive(
     }
     stats.tagged_own = records.len();
 
-    // Then propagate each group's resolved countries onto its unsampled members.
-    for (index, group) in groups.iter().enumerate() {
+    // Then propagate each video's resolved countries onto its unsampled frames. Merged sources pay
+    // off twice here: a reading that got its own fragment group now inherits from the sampled
+    // frames of the rest of its video instead of going untagged.
+    for (index, members) in clusters.iter() {
+        let index = *index;
+        let group = &groups[index];
         if resolver.is_fiction_title(group.title) {
             stats.fiction_groups_skipped += 1;
             continue;
@@ -1187,8 +1521,8 @@ pub fn derive(
         let mut countries: BTreeSet<String> = BTreeSet::new();
         let mut representative: Option<String> = None;
         let mut distinct_answers = 0usize;
-        for hash in group.member_hashes {
-            if let Some((resolved, raw)) = own.get(hash.as_str()) {
+        for hash in members {
+            if let Some((resolved, raw)) = own.get(*hash) {
                 distinct_answers += 1;
                 if representative.is_none() {
                     representative = Some(raw.clone());
@@ -1211,12 +1545,12 @@ pub fn derive(
         };
         let countries: Vec<String> = countries.into_iter().collect();
         let raw = representative.unwrap_or_default();
-        for hash in group.member_hashes {
-            if records.contains_key(hash) {
+        for hash in members {
+            if records.contains_key(*hash) {
                 continue;
             }
             records.insert(
-                hash.clone(),
+                (*hash).to_string(),
                 GeoRecord {
                     countries: countries.clone(),
                     raw: raw.clone(),
@@ -1754,6 +2088,131 @@ mod tests {
         assert_eq!(
             r.resolve("Border run"),
             Resolution::Countries(vec!["Finland".into(), "Sweden".into()])
+        );
+    }
+
+    #[test]
+    fn worklist_decisions_write_the_same_file_a_hand_edit_would() {
+        let dir = std::env::temp_dir().join(format!("icat-override-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seeded = Gazetteer::default();
+        seeded.fiction_title_patterns.push("exploring empty maps".into());
+        seeded.overrides.insert("kept by hand".into(), Some("Finland".into()));
+        save_gazetteer(&dir, &seeded).unwrap();
+
+        // Case, surrounding whitespace and a sloppy route separator all normalize on the way in, so
+        // the stored line is indistinguishable from one typed into the file.
+        set_override(&dir, "  Skagway, Alaska ", "place", Some(" United States ")).unwrap();
+        set_override(&dir, "Border Run", "place", Some("Finland ,, Sweden,")).unwrap();
+        set_override(&dir, "A Marble Quarry", "reject", None).unwrap();
+
+        let after = load_gazetteer(&dir);
+        assert_eq!(after.overrides.get("skagway, alaska"), Some(&Some("United States".to_string())));
+        assert_eq!(after.overrides.get("border run"), Some(&Some("Finland, Sweden".to_string())));
+        assert_eq!(after.overrides.get("a marble quarry"), Some(&None));
+        assert_eq!(
+            after.overrides.get("kept by hand"),
+            Some(&Some("Finland".to_string())),
+            "an unrelated hand-written line must survive a decision made from the UI"
+        );
+        assert_eq!(after.fiction_title_patterns, vec!["exploring empty maps".to_string()]);
+
+        // And the resolver reads back exactly what the UI wrote — the point of the whole loop.
+        let resolver = Resolver::new(&after);
+        assert_eq!(
+            resolver.resolve("Skagway, Alaska"),
+            Resolution::Countries(vec!["United States".into()])
+        );
+        assert_eq!(
+            resolver.resolve("Border run"),
+            Resolution::Countries(vec!["Finland".into(), "Sweden".into()])
+        );
+        assert_eq!(resolver.resolve("A marble quarry"), Resolution::Junk);
+
+        // Undo deletes the line rather than recording a decision of its own.
+        set_override(&dir, "Skagway, Alaska", "clear", None).unwrap();
+        assert!(!load_gazetteer(&dir).overrides.contains_key("skagway, alaska"));
+
+        // A place with nothing typed in it must not be stored as a rejection by accident.
+        assert!(set_override(&dir, "Somewhere", "place", Some("  ,  ")).is_err());
+        assert!(set_override(&dir, "   ", "reject", None).is_err());
+        assert!(set_override(&dir, "Somewhere", "sideways", None).is_err());
+        assert!(!load_gazetteer(&dir).overrides.contains_key("somewhere"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_registry_port_only_rejects_when_there_is_a_ship_in_frame() {
+        let ship = "A container ship rounds a tight river bend, MONROVIA painted on her stern.";
+        let street = "A busy street in Monrovia with market stalls along the roadside.";
+        assert!(is_registry_port_reading(ship, "Monrovia"));
+        assert!(is_registry_port_reading(ship, "Panama"));
+        // No vessel in the description: the place is taken at its word.
+        assert!(!is_registry_port_reading(street, "Monrovia"));
+        // A real place that merely contains the flag word survives even with ships around.
+        assert!(!is_registry_port_reading(ship, "Panama Canal"));
+        assert!(!is_registry_port_reading(ship, "Colón, Panama"));
+    }
+
+    #[test]
+    fn ocr_readings_of_one_title_collapse_into_one_source() {
+        // Every one of these is the same video: YouTube's "(1)" prefix comes and goes, a badge is
+        // dropped, and OCR mangles a letter or two. Exact keying filed them as five videos, which
+        // is five times the variety the library actually has.
+        let titles = vec![
+            "(1) Mountain Railway to ALASKA I White Pass & Yukon Route Driver's View to Skagway",
+            "Mountain Railway to ALASKA | White Pass & Yukon Route Driver's View to Skagway",
+            "(1) 4K60 Mountain Rail-way to ALASKA I White Pass & Yukon Route Driver's Vlew to Skagway",
+            "(1) Mountain Railwayto ALASKA I White pass & Yukon Route Driver•s View to Segway",
+            "Walking in Kyoto at night - a completely different video",
+        ];
+        let canonical = canonical_groups(&titles);
+        assert_eq!(canonical[0], canonical[1]);
+        assert_eq!(canonical[0], canonical[2]);
+        assert_eq!(canonical[0], canonical[3]);
+        assert_ne!(canonical[0], canonical[4], "an unrelated title must not be swallowed");
+    }
+
+    #[test]
+    fn two_videos_from_one_series_are_not_merged() {
+        // The failure mode that decides the threshold: same channel, same wording, different
+        // country. Merging these would hand one video's frames to the other's country.
+        let titles = vec![
+            "[4K] PARIS 2025 Aerial Drone Relaxation Film UHD FRANCE",
+            "[4K] LONDON 2025 Aerial Drone Relaxation Film UHD ENGLAND",
+            "Driving from Tirana to Saranda Albania real time",
+            "Driving from Tirana to Vlora Albania real time",
+        ];
+        let canonical = canonical_groups(&titles);
+        assert_ne!(canonical[0], canonical[1], "different country, same series");
+        assert_ne!(canonical[2], canonical[3], "different route, same series");
+    }
+
+    #[test]
+    fn merged_titles_count_as_one_video_and_propagate_across_fragments() {
+        // Two fragment groups of one video; only the first has a described frame.
+        let a: Vec<String> = (0..4).map(|i| format!("a{i}")).collect();
+        let b: Vec<String> = (0..3).map(|i| format!("b{i}")).collect();
+        let descriptions = vec![DescribedImage {
+            hash: "a0".into(),
+            description: "Location: Kyoto, Japan".into(),
+        }];
+        let groups = vec![
+            SourceGroup { title: "Mountain Railway to Kyoto Driver's View", member_hashes: &a },
+            SourceGroup { title: "(1) Mountain Rail-way to Kyoto Driver's Vlew", member_hashes: &b },
+        ];
+        let mut gazetteer = Gazetteer::default();
+        let geo = derive(&descriptions, &groups, &mut gazetteer, None, "now".into());
+
+        assert_eq!(geo.stats.source_groups, 2);
+        assert_eq!(geo.stats.sources, 1, "two readings of one title are one video");
+        // The second fragment's frames inherit too — that only works because they share a source.
+        assert_eq!(geo.images.len(), 7);
+        assert_eq!(
+            geo.coverage.get("Japan"),
+            Some(&1),
+            "one video must count once however many ways its title was read"
         );
     }
 

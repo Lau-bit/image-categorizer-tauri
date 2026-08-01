@@ -31,6 +31,16 @@ const state = {
   geoSummary: null,
   geoCoverage: null,
   geoSets: null,
+  // The gazetteer's `overrides` table, so the worklist can show what each string was decided to
+  // mean — including decisions made by hand-editing the file. `geoOverrideBusy` holds the one
+  // location string currently being written, so only its own row goes inert.
+  geoOverrides: null,
+  geoOverrideBusy: null,
+  // Worklist rows expanded to show the frames behind them, and the frames themselves once fetched.
+  // Cached per location string so collapsing and re-opening a row costs nothing — the descriptions
+  // read behind it is the expensive half.
+  geoWorklistOpen: new Set(),
+  geoWorklistImages: new Map(),
   geoSetImages: null,
   geoSetTitle: null,
   geoBusy: false,
@@ -38,9 +48,22 @@ const state = {
   kindSummary: null,
   kindRunning: false,
   kindProgress: null,
+  // Post-build set review. `geoReviewSelected` holds finding ids, not fixes, so a refreshed review
+  // re-resolves what each tick means instead of applying a fix computed against older records.
+  geoReview: null,
+  geoReviewSelected: new Set(),
+  geoReviewBusy: false,
+  // Browser-style view history. Entries are view DESCRIPTORS plus the scroll offsets they were
+  // left at — never snapshots of the images, so going Back re-resolves the view against the
+  // current library instead of resurrecting a deleted image or a rebuilt set.
+  nav: { entries: [], index: -1, restoring: false },
 };
 
 const els = {
+  brand: document.querySelector('.brand'),
+  navButtons: document.getElementById('nav-buttons'),
+  navBackButton: document.getElementById('nav-back-button'),
+  navForwardButton: document.getElementById('nav-forward-button'),
   allTab: document.getElementById('all-tab'),
   allCount: document.getElementById('all-count'),
   unclassifiedTab: document.getElementById('unclassified-tab'),
@@ -53,12 +76,15 @@ const els = {
   geoClusters: document.getElementById('geo-clusters'),
   geoSets: document.getElementById('geo-sets'),
   geoWorklist: document.getElementById('geo-worklist'),
+  geoCountryOptions: document.getElementById('geo-country-options'),
   geoGenerated: document.getElementById('geo-generated'),
   geoDeriveButton: document.getElementById('geo-derive-button'),
   geoClassifyButton: document.getElementById('geo-classify-button'),
   geoCancelClassifyButton: document.getElementById('geo-cancel-classify-button'),
   geoKinds: document.getElementById('geo-kinds'),
   geoBuildSetsButton: document.getElementById('geo-build-sets-button'),
+  geoReviewButton: document.getElementById('geo-review-button'),
+  geoReview: document.getElementById('geo-review'),
   geoGazetteerButton: document.getElementById('geo-gazetteer-button'),
   geoSetSize: document.getElementById('geo-set-size'),
   categoryList: document.getElementById('category-list'),
@@ -683,6 +709,26 @@ function renderSettings() {
   syncSettingsDialog();
 }
 
+// Sidebar pills sit in a 280px column that also has to fit a category name and its controls, so a
+// six-digit count is not a display problem but a layout one — it squeezes the name to nothing.
+// Full precision below 100k, where the number is still something you read digit by digit; thousands
+// above it, where only the magnitude is being read anyway. The exact figure goes in the tooltip.
+function countLabel(value) {
+  const count = Number(value) || 0;
+  if (count < 100000) return String(count);
+  // Rounded first, then range-checked: 999,999 rounds to 1000k, which is the one number this scale
+  // must never print.
+  const thousands = Math.round(count / 1000);
+  if (thousands < 1000) return `${thousands}k`;
+  return `${(count / 1000000).toFixed(count < 10000000 ? 1 : 0)}M`;
+}
+
+function setCountPill(element, value) {
+  const count = Number(value) || 0;
+  element.textContent = countLabel(count);
+  element.title = count.toLocaleString();
+}
+
 function renderSidebar() {
   const library = state.library;
   const includedImages = imagesInIncludedSourceFolders();
@@ -690,13 +736,13 @@ function renderSidebar() {
   const allCount = includedImages.length;
   const unclassifiedCount = unclassified;
 
-  els.allCount.textContent = String(allCount);
-  els.unclassifiedCount.textContent = String(unclassifiedCount);
+  setCountPill(els.allCount, allCount);
+  setCountPill(els.unclassifiedCount, unclassifiedCount);
   els.allTab.classList.toggle('active', state.currentView === 'all');
   els.unclassifiedTab.classList.toggle('active', state.currentView === 'unclassified');
   // An opened set still belongs to Geo, so the tab stays lit while browsing one.
   els.geoTab.classList.toggle('active', state.currentView === 'geo' || state.currentView === 'geoSet');
-  els.geoCount.textContent = String(state.geoSummary?.stats?.taggedTotal || 0);
+  setCountPill(els.geoCount, state.geoSummary?.stats?.taggedTotal || 0);
 
   els.categoryList.innerHTML = '';
   const categories = library?.categories || [];
@@ -739,14 +785,19 @@ function renderSidebar() {
       button.classList.toggle('active', state.currentView === 'category' && state.currentCategory === category.name);
       button.innerHTML = '<span class="category-name"></span><span class="count-pill"></span>';
       button.querySelector('.category-name').textContent = category.name;
-      button.querySelector('.count-pill').textContent = String(categoryCounts.get(category.name) || 0);
+      button.title = category.name;
+      setCountPill(button.querySelector('.count-pill'), categoryCounts.get(category.name) || 0);
       button.addEventListener('click', () => selectCategory(category.name));
 
+      // Icons, not the words "Rename"/"Delete": those two labels cost 109px of a 232px row, which
+      // is why every category name was ellipsed to four characters. The names are the thing being
+      // read here; the actions are already explained by their tooltips.
       const renameButton = document.createElement('button');
       renameButton.type = 'button';
       renameButton.className = 'category-rename-button';
       renameButton.title = `Rename ${category.name}`;
-      renameButton.textContent = 'Rename';
+      renameButton.setAttribute('aria-label', `Rename ${category.name}`);
+      renameButton.textContent = '✎';
       renameButton.disabled = state.analyzing;
       renameButton.addEventListener('click', event => {
         event.stopPropagation();
@@ -757,7 +808,8 @@ function renderSidebar() {
       deleteButton.type = 'button';
       deleteButton.className = 'category-rename-button';
       deleteButton.title = `Delete ${category.name}`;
-      deleteButton.textContent = 'Delete';
+      deleteButton.setAttribute('aria-label', `Delete ${category.name}`);
+      deleteButton.textContent = '✕';
       deleteButton.disabled = state.analyzing;
       deleteButton.addEventListener('click', event => {
         event.stopPropagation();
@@ -797,7 +849,8 @@ function renderSidebar() {
       checkbox.disabled = state.analyzing;
       checkbox.addEventListener('change', () => setFolderAnalysisIncluded(folder.name, checkbox.checked));
       row.querySelector('.category-name').textContent = folder.name;
-      row.querySelector('.count-pill').textContent = String(folder.imageCount);
+      row.querySelector('.category-name').title = folder.name;
+      setCountPill(row.querySelector('.count-pill'), folder.imageCount);
       els.sourceFolderList.append(row);
     }
   }
@@ -1040,6 +1093,7 @@ function render() {
   renderSettings();
   renderSidebar();
   renderHeader();
+  renderNavButtons();
   // The coverage scoreboard swaps places with the image grid rather than rendering inside it, so
   // the grid's virtual scrolling and drop handling never see any of this.
   const geoActive = state.currentView === 'geo';
@@ -1097,8 +1151,11 @@ async function refreshAll() {
   }
   setLoading(false);
   if (state.currentView === 'category' && !(state.library?.categories || []).some(c => c.name === state.currentCategory)) {
+    const gone = state.currentCategory;
     state.currentView = 'all';
     state.currentCategory = null;
+    pruneNavEntries(entry => !(entry.view === 'category' && entry.category === gone));
+    pushNavEntry(navEntry('all'));
   }
   render();
   // Geo is a read of three small sidecars, so the sidebar tally can be filled in without making
@@ -1115,6 +1172,7 @@ async function refreshAll() {
 
 function selectAll() {
   cancelPointerDrag();
+  pushNavEntry(navEntry('all'));
   state.currentView = 'all';
   state.currentCategory = null;
   render();
@@ -1122,6 +1180,7 @@ function selectAll() {
 
 function selectUnclassified() {
   cancelPointerDrag();
+  pushNavEntry(navEntry('unclassified'));
   state.currentView = 'unclassified';
   state.currentCategory = null;
   render();
@@ -1129,9 +1188,228 @@ function selectUnclassified() {
 
 function selectCategory(name) {
   cancelPointerDrag();
+  pushNavEntry(navEntry('category', { category: name }));
   state.currentView = 'category';
   state.currentCategory = name;
   render();
+}
+
+// ==============================
+// View history — Back / Forward
+//
+// The friction this exists for: opening a country set out of a 200-row list is one click, and
+// getting back to the same place in that list was none — re-entering Geo Coverage rebuilds the
+// list at the top, so the row you came from has to be hunted down again. So an entry carries the
+// scroll offsets of the surfaces it was left at, and restoring one puts them back.
+//
+// An entry is a descriptor, not a snapshot: a set's MEMBERS are re-fetched on the way back, and an
+// entry whose category or set no longer exists is dropped rather than restored, because these
+// views outlive the data behind them (a rebuild mints new set ids).
+// ==============================
+
+const NAV_HISTORY_LIMIT = 100;
+
+function navEntry(view, extra = {}) {
+  return {
+    view,
+    category: extra.category ?? null,
+    geoSetId: extra.geoSetId ?? null,
+    geoSetTitle: extra.geoSetTitle ?? null,
+    scroll: { main: 0, geo: 0, geoSets: 0 },
+  };
+}
+
+function navKey(entry) {
+  return `${entry.view}|${entry.category || ''}|${entry.geoSetId || ''}`;
+}
+
+function currentNavEntry() {
+  return state.nav.entries[state.nav.index] || null;
+}
+
+function navEntryLabel(entry) {
+  if (!entry) return null;
+  if (entry.view === 'all') return 'All Images';
+  if (entry.view === 'unclassified') return 'Unclassified';
+  if (entry.view === 'geo') return 'Geo Coverage';
+  if (entry.view === 'geoSet') return entry.geoSetTitle || 'country set';
+  return entry.category || 'category';
+}
+
+// Offsets live on the entry rather than in one map keyed by view, because the same view can sit in
+// the history twice at two different offsets — Geo Coverage before and after a detour through a set.
+function captureNavScroll() {
+  const entry = currentNavEntry();
+  if (!entry) return;
+  // A hidden surface reports 0; only overwrite what is actually on screen, or opening a set from
+  // Geo Coverage would record the grid's 0 over the set list's real offset.
+  const geoActive = state.currentView === 'geo';
+  entry.scroll = {
+    main: geoActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
+    geo: geoActive ? els.geoView.scrollTop : entry.scroll.geo,
+    geoSets: geoActive ? els.geoSets.scrollTop : entry.scroll.geoSets,
+  };
+}
+
+function pushNavEntry(entry) {
+  if (state.nav.restoring) return;
+  captureNavScroll();
+  const current = currentNavEntry();
+  if (current && navKey(current) === navKey(entry)) {
+    // Re-selecting the view you are already on is not a navigation: keep the entry, its offsets,
+    // and the forward tail. Only the label can have gone stale (a set rebuilt at a new size).
+    current.geoSetTitle = entry.geoSetTitle ?? current.geoSetTitle;
+    renderNavButtons();
+    return;
+  }
+  state.nav.entries.length = state.nav.index + 1;   // a new branch drops the forward tail
+  state.nav.entries.push(entry);
+  if (state.nav.entries.length > NAV_HISTORY_LIMIT) state.nav.entries.shift();
+  state.nav.index = state.nav.entries.length - 1;
+  renderNavButtons();
+}
+
+// Switching root folder means a different library entirely — every entry describes a place in the
+// old one, so the trail starts over rather than pointing at categories that may not exist here.
+function resetNavHistory(view = 'all') {
+  state.nav.entries = [navEntry(view)];
+  state.nav.index = 0;
+  renderNavButtons();
+}
+
+// Deleting a category leaves entries pointing at something gone. Dropping them beats letting Back
+// land on an error. Adjacent duplicates are collapsed so the removal doesn't leave a dead press.
+function pruneNavEntries(keep) {
+  const entries = [];
+  let index = 0;
+  state.nav.entries.forEach((entry, i) => {
+    if (!keep(entry)) return;
+    const previous = entries[entries.length - 1];
+    if (!previous || navKey(previous) !== navKey(entry)) entries.push(entry);
+    if (i <= state.nav.index) index = entries.length - 1;
+  });
+  state.nav.entries = entries;
+  state.nav.index = entries.length ? Math.min(index, entries.length - 1) : -1;
+  renderNavButtons();
+}
+
+function renderNavButtons() {
+  const back = state.nav.entries[state.nav.index - 1] || null;
+  const forward = state.nav.entries[state.nav.index + 1] || null;
+  els.navBackButton.disabled = !back;
+  els.navForwardButton.disabled = !forward;
+  els.navBackButton.title = back
+    ? `Back to ${navEntryLabel(back)} (Alt+← or Mouse 4)`
+    : 'Back (Alt+← or Mouse 4)';
+  els.navForwardButton.title = forward
+    ? `Forward to ${navEntryLabel(forward)} (Alt+→ or Mouse 5)`
+    : 'Forward (Alt+→ or Mouse 5)';
+}
+
+// Applied after layout: the grid is virtualised, so its full scroll height only exists once the
+// padded window has been rendered, and assigning scrollTop before that would clamp to nothing.
+function restoreNavScroll(entry) {
+  requestAnimationFrame(() => {
+    const scroll = entry.scroll || {};
+    els.mainDropTarget.scrollTop = scroll.main || 0;
+    els.geoView.scrollTop = scroll.geo || 0;
+    els.geoSets.scrollTop = scroll.geoSets || 0;
+    // The grid only rendered the rows around offset 0; the scroll event that would widen the
+    // virtual window fires after this frame, so ask for the recompute directly.
+    onGridScroll();
+  });
+}
+
+async function applyNavEntry(entry) {
+  const root = state.library?.root || state.settings?.lastRoot;
+  // Held across the whole restore, not just the render: re-reading a set's members takes a
+  // second or two on a large library, and a second press landing in the middle of that would
+  // move the index out from under the navigation already in flight.
+  state.nav.restoring = true;
+  try {
+    if (entry.view === 'category' && !(state.library?.categories || []).some(c => c.name === entry.category)) {
+      showToast(`“${entry.category}” no longer exists.`);
+      pruneNavEntries(e => !(e.view === 'category' && e.category === entry.category));
+      // Step past it to whatever survived, so a dead entry costs one press rather than swallowing
+      // it. Terminates: every pass removes at least the entry it was handed.
+      const next = currentNavEntry();
+      if (next) await applyNavEntry(next);
+      return;
+    }
+
+    let images = null;
+    if (entry.view === 'geoSet') {
+      // Members come off disk on every open, so this is visibly not instant — say what is
+      // happening, exactly as opening the set from the list does.
+      setStatus(`Opening ${entry.geoSetTitle || 'set'}…`, true);
+      try {
+        images = root ? await window.categorizerAPI.getGeoSetImages(root, entry.geoSetId) : null;
+      } catch {
+        images = null;
+      } finally {
+        setStatus('');
+      }
+      if (!images) {
+        // Sets are rebuilt with fresh ids, so a set from before a rebuild is gone for good:
+        // replace the entry with the coverage view it was opened from, rather than leaving a
+        // dead step in the trail.
+        showToast('That set has been rebuilt — showing Geo Coverage.');
+        const replacement = navEntry('geo');
+        replacement.scroll = entry.scroll;
+        state.nav.entries[state.nav.index] = replacement;
+        entry = replacement;
+      }
+    }
+
+    state.currentView = entry.view;
+    state.currentCategory = entry.view === 'category' ? entry.category : null;
+    if (entry.view === 'geoSet') {
+      state.geoSetImages = images;
+      state.geoSetTitle = entry.geoSetTitle;
+    }
+    render();
+    restoreNavScroll(entry);
+    if (entry.view === 'geo') {
+      // The panel paints from cache first and again when the sidecars land — the second paint
+      // rebuilds the set list from scratch, taking its scroll offset back to 0 with it.
+      await loadGeoData();
+      restoreNavScroll(entry);
+    }
+  } finally {
+    state.nav.restoring = false;
+  }
+}
+
+async function navigateBy(delta) {
+  if (state.nav.restoring) return;
+  const target = state.nav.index + delta;
+  if (target < 0 || target >= state.nav.entries.length) return;
+  cancelPointerDrag();
+  captureNavScroll();
+  state.nav.index = target;
+  renderNavButtons();
+  await applyNavEntry(state.nav.entries[state.nav.index]);
+  renderNavButtons();
+}
+
+function installNavShortcuts() {
+  els.navBackButton.addEventListener('click', () => navigateBy(-1));
+  els.navForwardButton.addEventListener('click', () => navigateBy(1));
+
+  // The thumb buttons are the point of the feature — this app is browsed like a browser, and that
+  // is where the hand already is. Captured on `mousedown`, which is where WebView2 would otherwise
+  // start a history navigation of its own inside the webview; cancelling `auxclick` as well stops
+  // the release landing as a click on whatever button is under the cursor.
+  const NAV_MOUSE_DELTAS = { 3: -1, 4: 1 };
+  for (const type of ['mousedown', 'mouseup', 'auxclick']) {
+    window.addEventListener(type, event => {
+      const delta = NAV_MOUSE_DELTAS[event.button];
+      if (delta === undefined) return;
+      event.preventDefault();
+      if (type !== 'mousedown' || document.querySelector('dialog[open]')) return;
+      navigateBy(delta);
+    }, { capture: true });
+  }
 }
 
 // ==============================
@@ -1154,6 +1432,7 @@ const GEO_TIER_ORDER = ['empty', 'seed', 'thin', 'ready', 'deep'];
 
 function selectGeo() {
   cancelPointerDrag();
+  pushNavEntry(navEntry('geo'));
   state.currentView = 'geo';
   state.currentCategory = null;
   render();
@@ -1177,16 +1456,18 @@ async function loadGeoData() {
   const root = state.library?.root || state.settings?.lastRoot;
   if (!root) return;
   try {
-    const [summary, coverage, sets, kinds] = await Promise.all([
+    const [summary, coverage, sets, kinds, overrides] = await Promise.all([
       window.categorizerAPI.getGeoSummary(root),
       window.categorizerAPI.getGeoCoverage(root),
       window.categorizerAPI.getGeoSets(root),
       window.categorizerAPI.getKindSummary(root),
+      window.categorizerAPI.getGeoOverrides(root),
     ]);
     state.geoSummary = summary;
     state.geoCoverage = coverage;
     state.geoSets = sets;
     state.kindSummary = kinds;
+    state.geoOverrides = overrides;
   } catch (error) {
     showToast(errorText(error));
   }
@@ -1288,6 +1569,10 @@ function renderGeoKinds() {
 async function runGeoDerive() {
   const root = state.library?.root || state.settings?.lastRoot;
   if (!root || state.geoBusy) return;
+  // A derive regenerates the worklist wholesale, so every expanded row and cached strip describes
+  // a list that is about to stop existing.
+  state.geoWorklistOpen.clear();
+  state.geoWorklistImages.clear();
   state.geoBusy = true;
   setStatus('Deriving geo from descriptions…', true);
   render();
@@ -1335,6 +1620,10 @@ async function openGeoSet(set) {
   try {
     state.geoSetImages = await window.categorizerAPI.getGeoSetImages(root, set.id);
     state.geoSetTitle = `${set.title} — ${set.sources} video${set.sources === 1 ? '' : 's'}`;
+    // Pushed only once the members are in hand, so a set that fails to open leaves no step to
+    // walk back through. Recorded before the view switches, so the entry it leaves behind keeps
+    // the set list's scroll offset — the whole point of Back here.
+    pushNavEntry(navEntry('geoSet', { geoSetId: set.id, geoSetTitle: state.geoSetTitle }));
     state.currentView = 'geoSet';
   } catch (error) {
     showToast(errorText(error));
@@ -1478,6 +1767,298 @@ function renderGeoSets() {
   }
 }
 
+// ==============================
+// Set review — the post-build cleanup pass
+//
+// Everything the forward pipeline gets wrong lands in a built set, and a set is looked at for weeks
+// after it is built. This is the one place that walks what is on disk and argues against it, with
+// the fix attached to each complaint. Nothing here edits records: a fix is a write to the exclusion
+// list or the gazetteer, and it becomes permanent by re-deriving.
+// ==============================
+
+const GEO_REVIEW_KIND_LABELS = {
+  'duplicate-video': 'Repeat frames of one video',
+  'registry-port': 'Tagged off a ship’s flag',
+  'wrong-kind': 'Not an allowed scene kind',
+  people: 'People, not a place',
+  unclassified: 'Never scene-classified',
+  'single-video-country': 'Country rests on one video',
+  'short-set': 'Set is short',
+};
+
+async function runGeoReview() {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || state.geoReviewBusy) return;
+  state.geoReviewBusy = true;
+  setStatus('Reviewing country sets…', true);
+  render();
+  try {
+    state.geoReview = await window.categorizerAPI.reviewGeoSets(root);
+    // Findings are re-resolved on every run, so a tick that no longer exists must not survive.
+    const live = new Set(state.geoReview.findings.map(finding => finding.id));
+    state.geoReviewSelected = new Set([...state.geoReviewSelected].filter(id => live.has(id)));
+    if (!state.geoReview.findings.length) showToast('Nothing to fix — every set checked out.');
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    state.geoReviewBusy = false;
+    setStatus('');
+  }
+  render();
+}
+
+// Unions the ticked findings' fixes. Two findings that both want the same image excluded cost one
+// write, and the backend is idempotent anyway — this just keeps the confirmation honest.
+function selectedGeoReviewFix() {
+  const excludeHashes = new Set();
+  const rejectLocations = new Set();
+  const fictionTitles = new Set();
+  for (const finding of state.geoReview?.findings || []) {
+    if (!state.geoReviewSelected.has(finding.id) || !finding.fix) continue;
+    for (const hash of finding.fix.excludeHashes || []) excludeHashes.add(hash);
+    for (const location of finding.fix.rejectLocations || []) rejectLocations.add(location);
+    for (const title of finding.fix.fictionTitles || []) fictionTitles.add(title);
+  }
+  return {
+    excludeHashes: [...excludeHashes],
+    rejectLocations: [...rejectLocations],
+    fictionTitles: [...fictionTitles],
+  };
+}
+
+async function applyGeoReviewSelection() {
+  const root = state.library?.root || state.settings?.lastRoot;
+  const fixes = selectedGeoReviewFix();
+  if (!root || state.geoReviewBusy) return;
+  if (!fixes.excludeHashes.length && !fixes.rejectLocations.length && !fixes.fictionTitles.length) return;
+
+  state.geoReviewBusy = true;
+  setStatus('Applying fixes…', true);
+  render();
+  try {
+    const applied = await window.categorizerAPI.applyGeoReview(root, fixes);
+    showToast(
+      `Applied — ${applied.excluded} image${applied.excluded === 1 ? '' : 's'} excluded, ` +
+      `${applied.rejected} location string${applied.rejected === 1 ? '' : 's'} rejected. ` +
+      'Re-derive and rebuild to see it in the sets.'
+    );
+    state.geoReviewSelected = new Set();
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    state.geoReviewBusy = false;
+    setStatus('');
+  }
+  // Re-derive picks up the rejected strings; rebuilding picks up the exclusions. Chained here
+  // rather than inside the apply command so both passes stay visible in the status line.
+  await runGeoDerive();
+  await runGeoBuildSets();
+  await runGeoReview();
+}
+
+function geoReviewImageLine(image) {
+  const row = document.createElement('div');
+  row.className = 'geo-review-image';
+  const name = document.createElement('span');
+  name.className = 'geo-review-image-name';
+  // The path is the only handle the user has on the actual file; the location string is what the
+  // finding is arguing about. Both, in that order.
+  name.textContent = image.path || image.hash;
+  const why = document.createElement('span');
+  why.className = 'geo-review-image-why';
+  const parts = [];
+  if (image.raw) parts.push(`“${image.raw}”`);
+  if (image.kind) parts.push(image.kind);
+  if (image.via) parts.push(image.via);
+  why.textContent = parts.join(' · ');
+  row.append(name, why);
+  return row;
+}
+
+function renderGeoReviewFinding(finding) {
+  const card = document.createElement('div');
+  card.className = `geo-review-finding severity-${finding.severity}`;
+
+  const head = document.createElement('div');
+  head.className = 'geo-review-head';
+
+  const label = document.createElement('label');
+  label.className = 'geo-review-tick';
+  const tick = document.createElement('input');
+  tick.type = 'checkbox';
+  tick.checked = state.geoReviewSelected.has(finding.id);
+  tick.disabled = !finding.fix || state.geoReviewBusy;
+  tick.addEventListener('change', () => {
+    if (tick.checked) state.geoReviewSelected.add(finding.id);
+    else state.geoReviewSelected.delete(finding.id);
+    renderGeoReview();
+  });
+  const tickText = document.createElement('span');
+  tickText.textContent = finding.fix ? finding.fix.label : 'No automatic fix';
+  tickText.className = finding.fix ? '' : 'geo-review-nofix';
+  label.append(tick, tickText);
+  label.setAttribute(
+    'aria-label',
+    `${finding.setTitle}: ${finding.title}. ${finding.fix ? finding.fix.label : 'No automatic fix'}`
+  );
+
+  const heading = document.createElement('div');
+  heading.className = 'geo-review-title';
+  const where = document.createElement('span');
+  where.className = 'geo-review-where';
+  where.textContent = finding.setTitle;
+  const what = document.createElement('span');
+  what.className = 'geo-review-what';
+  what.textContent = finding.title;
+  heading.append(where, what);
+
+  head.append(heading, label);
+
+  const detail = document.createElement('p');
+  detail.className = 'geo-review-detail';
+  detail.textContent = finding.detail;
+
+  card.append(head, detail);
+
+  if (finding.images.length) {
+    const list = document.createElement('div');
+    list.className = 'geo-review-images';
+    for (const image of finding.images.slice(0, 6)) list.append(geoReviewImageLine(image));
+    if (finding.images.length > 6) {
+      const more = document.createElement('div');
+      more.className = 'geo-review-image-why';
+      more.textContent = `… and ${finding.images.length - 6} more`;
+      list.append(more);
+    }
+    card.append(list);
+  }
+  return card;
+}
+
+function renderGeoReview() {
+  els.geoReview.innerHTML = '';
+  const review = state.geoReview;
+  els.geoReview.classList.toggle('hidden', !review && !state.geoReviewBusy);
+  if (!review) {
+    if (state.geoReviewBusy) {
+      const busy = document.createElement('div');
+      busy.className = 'geo-placeholder';
+      busy.textContent = 'Reading every set member…';
+      els.geoReview.append(busy);
+    }
+    return;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'geo-section-head';
+  const title = document.createElement('h2');
+  title.textContent = 'Set review';
+  const hint = document.createElement('p');
+  hint.className = 'geo-section-hint';
+  hint.textContent =
+    `${review.setsReviewed} sets, ${review.membersReviewed} members. Tick the fixes you agree with, ` +
+    'then apply — every fix is a line in the exclusion list or the gazetteer, so re-deriving makes ' +
+    'it permanent and deleting the line undoes it.';
+  head.append(title, hint);
+  els.geoReview.append(head);
+
+  if (review.stale) {
+    const warn = document.createElement('div');
+    warn.className = 'geo-review-stale';
+    warn.textContent = review.staleDetail;
+    els.geoReview.append(warn);
+  }
+
+  if (!review.findings.length) {
+    const clean = document.createElement('div');
+    clean.className = 'geo-placeholder';
+    clean.textContent = 'No findings — every set is one frame per video, every member is a place.';
+    els.geoReview.append(clean);
+    return;
+  }
+
+  const summary = document.createElement('div');
+  summary.className = 'geo-review-summary';
+  for (const [kind, count] of Object.entries(review.counts)) {
+    const chip = document.createElement('span');
+    chip.className = 'geo-review-chip';
+    chip.textContent = `${GEO_REVIEW_KIND_LABELS[kind] || kind} · ${count}`;
+    summary.append(chip);
+  }
+  els.geoReview.append(summary);
+
+  const actions = document.createElement('div');
+  actions.className = 'geo-review-actions';
+  const fixable = review.findings.filter(finding => finding.fix);
+  const allTicked = fixable.length > 0 && fixable.every(f => state.geoReviewSelected.has(f.id));
+
+  const toggleAll = document.createElement('button');
+  toggleAll.type = 'button';
+  toggleAll.className = 'button secondary';
+  toggleAll.textContent = allTicked ? 'Untick all' : `Tick all ${fixable.length} fixable`;
+  toggleAll.disabled = state.geoReviewBusy || !fixable.length;
+  toggleAll.addEventListener('click', () => {
+    if (allTicked) state.geoReviewSelected.clear();
+    else for (const finding of fixable) state.geoReviewSelected.add(finding.id);
+    renderGeoReview();
+  });
+
+  const fixes = selectedGeoReviewFix();
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.className = 'button';
+  apply.textContent = fixes.excludeHashes.length || fixes.rejectLocations.length
+    ? `Apply ${state.geoReviewSelected.size} fix${state.geoReviewSelected.size === 1 ? '' : 'es'} & rebuild`
+    : 'Apply & rebuild';
+  apply.disabled = state.geoReviewBusy || !state.geoReviewSelected.size;
+  apply.addEventListener('click', () => void applyGeoReviewSelection());
+
+  const note = document.createElement('span');
+  note.className = 'geo-review-note';
+  note.textContent = fixes.excludeHashes.length
+    ? `${fixes.excludeHashes.length} images, ${fixes.rejectLocations.length} location strings`
+    : 'Nothing ticked';
+
+  actions.append(toggleAll, apply, note);
+  els.geoReview.append(actions);
+
+  const list = document.createElement('div');
+  list.className = 'geo-review-list';
+  for (const finding of review.findings) list.append(renderGeoReviewFinding(finding));
+  els.geoReview.append(list);
+}
+
+// The decision recorded for a worklist string, or undefined if it has never been decided. The
+// gazetteer keys on the lowercased string, exactly as the worklist reports it.
+function geoDecisionFor(location) {
+  const overrides = state.geoOverrides;
+  if (!overrides) return undefined;
+  const key = location.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(overrides, key) ? overrides[key] : undefined;
+}
+
+// A decided string that is STILL on the worklist has not been through a derive yet — the worklist
+// is regenerated wholesale on every derive, so its mere presence is the pending signal. No extra
+// flag to keep in sync, and it survives a restart because both halves come off disk.
+function geoPendingDecisions() {
+  return (state.geoCoverage?.worklist || []).filter(entry => geoDecisionFor(entry.location) !== undefined);
+}
+
+async function applyGeoDecision(location, action, country) {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || state.geoOverrideBusy) return;
+  state.geoOverrideBusy = location;
+  renderGeoWorklist();
+  try {
+    state.geoOverrides = await window.categorizerAPI.setGeoOverride(root, location, action, country);
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    state.geoOverrideBusy = null;
+  }
+  renderGeoWorklist();
+}
+
 function renderGeoWorklist() {
   els.geoWorklist.innerHTML = '';
   const worklist = state.geoCoverage?.worklist || [];
@@ -1490,26 +2071,216 @@ function renderGeoWorklist() {
   const hint = document.createElement('p');
   hint.className = 'geo-section-hint';
   hint.textContent =
-    'Location strings the resolver could not place, and how many images each would tag. Add them to ' +
-    '"overrides" in the gazetteer and re-derive — one line fixes every image that mentions it.';
+    'Location strings the resolver could not place, biggest payoff first — one decision here fixes ' +
+    'every image that mentions the string. Name the country (or “A, B” for a border crossing), or ' +
+    'reject it as non-geographic.';
   head.append(title, hint);
+
+  // Deciding writes the gazetteer; only a derive pushes it into the records. Saying so — with the
+  // button right here — is the difference between a decision made and a decision applied.
+  const pending = geoPendingDecisions();
+  if (pending.length) {
+    const bar = document.createElement('div');
+    bar.className = 'geo-worklist-pending';
+    const label = document.createElement('span');
+    const images = pending.reduce((total, entry) => total + entry.images, 0);
+    label.textContent =
+      `${pending.length} decision${pending.length === 1 ? '' : 's'} saved, ` +
+      `covering ${countLabel(images)} image${images === 1 ? '' : 's'} — re-derive to apply.`;
+    const deriveButton = document.createElement('button');
+    deriveButton.type = 'button';
+    deriveButton.className = 'button compact';
+    deriveButton.textContent = 'Re-derive Now';
+    deriveButton.disabled = state.geoBusy || state.analyzing || state.kindRunning;
+    deriveButton.addEventListener('click', runGeoDerive);
+    bar.append(label, deriveButton);
+    head.append(bar);
+  }
 
   const list = document.createElement('div');
   list.className = 'geo-worklist-items';
   for (const entry of worklist) {
-    const item = document.createElement('span');
-    item.className = 'geo-worklist-item';
-    const count = document.createElement('span');
-    count.className = 'geo-worklist-count';
-    count.textContent = String(entry.images);
-    const label = document.createElement('span');
-    label.className = 'geo-worklist-label';
-    label.textContent = entry.location;
-    item.append(count, label);
-    list.append(item);
+    list.append(buildWorklistRow(entry));
   }
 
   els.geoWorklist.append(head, list);
+}
+
+// How many frames one string gets to show. Enough to see whether they agree with each other, few
+// enough that opening a row is not a scroll of its own.
+const WORKLIST_PREVIEW_LIMIT = 24;
+
+async function toggleWorklistImages(location) {
+  if (state.geoWorklistOpen.has(location)) {
+    state.geoWorklistOpen.delete(location);
+    renderGeoWorklist();
+    return;
+  }
+  state.geoWorklistOpen.add(location);
+  renderGeoWorklist();
+  if (state.geoWorklistImages.has(location)) return;
+
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root) return;
+  try {
+    const found = await window.categorizerAPI.getGeoLocationImages(root, location, WORKLIST_PREVIEW_LIMIT);
+    // Hashes are resolved against the library already in memory rather than asking the backend to
+    // re-scan 33k files for a preview strip.
+    const byHash = new Map((state.library?.images || []).map(image => [image.hash, image]));
+    state.geoWorklistImages.set(location, {
+      total: found.total,
+      // A description with no file behind it any more is not evidence of anything.
+      items: found.images
+        .map(item => ({ image: byHash.get(item.hash), description: item.description }))
+        .filter(item => item.image),
+    });
+  } catch (error) {
+    state.geoWorklistImages.set(location, { total: 0, items: [], error: errorText(error) });
+  }
+  if (state.geoWorklistOpen.has(location)) renderGeoWorklist();
+}
+
+// The evidence strip: the frames that produced the string, each opening full-size on click, each
+// carrying its own description as a tooltip. This is the whole point of a worklist row — "apache
+// canyon" is unanswerable as text and obvious as pictures.
+function buildWorklistImages(entry) {
+  const strip = document.createElement('div');
+  strip.className = 'geo-worklist-shots';
+  const found = state.geoWorklistImages.get(entry.location);
+
+  if (!found) {
+    strip.textContent = 'Loading images…';
+    strip.classList.add('loading');
+    return strip;
+  }
+  if (found.error) {
+    strip.textContent = found.error;
+    strip.classList.add('loading');
+    return strip;
+  }
+  if (!found.items.length) {
+    strip.textContent = 'No described frames carry this string any more — re-derive to refresh the worklist.';
+    strip.classList.add('loading');
+    return strip;
+  }
+
+  for (const { image, description } of found.items) {
+    const shot = document.createElement('button');
+    shot.type = 'button';
+    shot.className = 'geo-worklist-shot';
+    shot.title = `${image.name}\n\n${description.trim()}`;
+    shot.addEventListener('click', () => openImage(image.path));
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = '';
+    img.src = window.categorizerAPI.getFileUrl(image.thumbnailPath || image.path);
+    shot.append(img);
+    strip.append(shot);
+  }
+
+  if (found.total > found.items.length) {
+    const more = document.createElement('span');
+    more.className = 'geo-worklist-more';
+    more.textContent = `+${found.total - found.items.length} more`;
+    strip.append(more);
+  }
+  return strip;
+}
+
+function buildWorklistRow(entry) {
+  // The row and its evidence strip share one wrapper so the strip can span the full width instead
+  // of having to fit the row's control columns.
+  const wrapper = document.createElement('div');
+  wrapper.className = 'geo-worklist-entry';
+  const row = document.createElement('div');
+  row.className = 'geo-worklist-item';
+  wrapper.append(row);
+  const busy = state.geoOverrideBusy === entry.location;
+  const decision = geoDecisionFor(entry.location);
+  const open = state.geoWorklistOpen.has(entry.location);
+  row.classList.toggle('decided', decision !== undefined);
+
+  const count = document.createElement('button');
+  count.type = 'button';
+  count.className = 'geo-worklist-count';
+  count.textContent = countLabel(entry.images);
+  // The count IS the way in: it already says how much evidence there is, so it is the thing to
+  // press to see it. A separate "view images" button would just repeat the number.
+  count.title = `${entry.images.toLocaleString()} images use this location string — click to see them`;
+  count.setAttribute('aria-expanded', String(open));
+  count.addEventListener('click', () => toggleWorklistImages(entry.location));
+  count.classList.toggle('open', open);
+
+  const label = document.createElement('span');
+  label.className = 'geo-worklist-label';
+  label.textContent = entry.location;
+  label.title = entry.location;
+  row.append(count, label);
+
+  if (open) wrapper.append(buildWorklistImages(entry));
+
+  if (decision !== undefined) {
+    const verdict = document.createElement('span');
+    verdict.className = `geo-worklist-verdict ${decision === null ? 'rejected' : 'placed'}`;
+    verdict.textContent = decision === null ? 'not a place' : decision;
+    const undo = document.createElement('button');
+    undo.type = 'button';
+    undo.className = 'button compact ghost';
+    undo.textContent = 'Undo';
+    undo.disabled = busy;
+    // Deleting the line is the undo — the same property the file has by hand.
+    undo.addEventListener('click', () => applyGeoDecision(entry.location, 'clear'));
+    row.append(verdict, undo);
+    return wrapper;
+  }
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'geo-worklist-input';
+  input.placeholder = 'Country';
+  input.disabled = busy;
+  // Suggestions, not a whitelist: a country outside the 109-name reference list is legitimate and
+  // the coverage view already reports those separately as `off-reference`.
+  input.setAttribute('list', 'geo-country-options');
+  input.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    if (input.value.trim()) applyGeoDecision(entry.location, 'place', input.value);
+  });
+
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'button compact';
+  save.textContent = 'Place';
+  save.disabled = busy;
+  save.addEventListener('click', () => {
+    if (!input.value.trim()) {
+      input.focus();
+      return;
+    }
+    applyGeoDecision(entry.location, 'place', input.value);
+  });
+
+  const reject = document.createElement('button');
+  reject.type = 'button';
+  reject.className = 'button compact secondary';
+  reject.textContent = 'Not a place';
+  reject.title = 'Record this string as non-geographic, so it stops returning to the worklist';
+  reject.disabled = busy;
+  reject.addEventListener('click', () => applyGeoDecision(entry.location, 'reject'));
+
+  row.append(input, save, reject);
+  return wrapper;
+}
+
+// Country suggestions for the worklist inputs, taken from the coverage clusters so the spellings
+// offered are exactly the ones the resolver and the coverage scoreboard already agree on — typing
+// "USA" into an override would place images under a country the reference list has never heard of.
+function renderGeoCountryOptions() {
+  const names = (state.geoCoverage?.clusters || []).flatMap(cluster =>
+    (cluster.countries || []).map(country => country.name));
+  if (els.geoCountryOptions.childElementCount === names.length) return;
+  els.geoCountryOptions.replaceChildren(...names.sort().map(name => new Option(name)));
 }
 
 function renderGeo() {
@@ -1522,14 +2293,19 @@ function renderGeo() {
     ? `Classify Scenes (${state.kindSummary.pending} left)`
     : 'Classify Scenes';
   els.geoCancelClassifyButton.classList.toggle('hidden', !state.kindRunning);
+  els.geoReviewButton.disabled =
+    state.geoBusy || state.analyzing || state.kindRunning || state.geoReviewBusy || !state.geoSets?.sets?.length;
+  els.geoReviewButton.textContent = state.geoReview ? 'Re-review Sets' : 'Review Sets…';
   els.geoGenerated.textContent = state.geoCoverage?.generatedAt
     ? `Derived ${new Date(state.geoCoverage.generatedAt).toLocaleString()}`
     : '';
+  renderGeoCountryOptions();
   renderGeoStats();
   renderGeoKinds();
   renderGeoLegend();
   renderGeoClusters();
   renderGeoSets();
+  renderGeoReview();
   renderGeoWorklist();
 }
 
@@ -1556,7 +2332,18 @@ async function assignCategory(hash, category) {
   }
 }
 
+// Every open goes through the shell, which starts a whole viewer process per
+// call — so a double-click on a thumbnail fired two of them ~40 ms apart, and
+// the second one is pure waste however the viewer handles it. Collapse repeats
+// of the same file within roughly the OS double-click threshold: one gesture,
+// one window. One slot is enough, since a double-click is the same path twice.
+const OPEN_IMAGE_REPEAT_MS = 750;
+let lastImageOpen = { path: '', at: 0 };
+
 async function openImage(filePath) {
+  const now = Date.now();
+  if (filePath === lastImageOpen.path && now - lastImageOpen.at < OPEN_IMAGE_REPEAT_MS) return;
+  lastImageOpen = { path: filePath, at: now };
   try {
     await window.categorizerAPI.openImage(filePath);
   } catch (error) {
@@ -1737,6 +2524,11 @@ async function renamePendingCategory(newName) {
     const wasCurrent = state.currentCategory === oldName;
     closeCategoryRenameDialog();
     if (wasCurrent) state.currentCategory = newName.trim();
+    // A history entry names its category, so a rename has to follow it into the trail — otherwise
+    // Back lands on a name the library no longer has and the entry gets dropped.
+    for (const entry of state.nav.entries) {
+      if (entry.view === 'category' && entry.category === oldName) entry.category = newName.trim();
+    }
     render();
     showToast(`Renamed to ${newName.trim()}`);
   } catch (error) {
@@ -1749,10 +2541,13 @@ async function deleteCategoryConfirm(name) {
   if (!window.confirm(`Delete category "${name}"? Images in it become unclassified.`)) return;
   try {
     state.library = await window.categorizerAPI.deleteCategory(state.library.root, name);
-    if (state.currentCategory === name) {
+    const wasCurrent = state.currentCategory === name;
+    if (wasCurrent) {
       state.currentView = 'all';
       state.currentCategory = null;
     }
+    pruneNavEntries(entry => !(entry.view === 'category' && entry.category === name));
+    if (wasCurrent) pushNavEntry(navEntry('all'));
     render();
     showToast(`Deleted ${name}`);
   } catch (error) {
@@ -2053,6 +2848,7 @@ async function changeRootFolder() {
     state.settings = await window.categorizerAPI.getSettings();
     state.currentView = 'all';
     state.currentCategory = null;
+    resetNavHistory();
     render();
     setStatus(`Loaded ${imageCountLabel(state.library.images.length)}.`);
   } catch (error) {
@@ -2069,6 +2865,7 @@ async function selectRootFolder(rootPath) {
     state.settings = await window.categorizerAPI.getSettings();
     state.currentView = 'all';
     state.currentCategory = null;
+    resetNavHistory();
     render();
     setStatus(`Loaded ${imageCountLabel(state.library.images.length)}.`);
   } catch (error) {
@@ -2168,6 +2965,11 @@ function applySidebarCollapsed(collapsed) {
   document.body.classList.toggle('sidebar-collapsed', collapsed);
   els.sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
   els.sidebarToggle.title = collapsed ? 'Show the sidebar' : 'Hide the sidebar';
+  // Back/Forward live in the sidebar head, which the narrow layout hides entirely — so the group
+  // is MOVED rather than duplicated. One node keeps one set of ids, so nothing else has to know
+  // which layout is in force. It lands after the toggle that produced the collapse.
+  if (collapsed) els.sidebarToggle.after(els.navButtons);
+  else els.brand.prepend(els.navButtons);
 }
 
 function installSidebarToggle() {
@@ -2280,6 +3082,8 @@ function onPointerDragEnd(event) {
 }
 
 function installEvents() {
+  resetNavHistory(state.currentView);
+  installNavShortcuts();
   els.allTab.addEventListener('click', selectAll);
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
   els.geoTab.addEventListener('click', selectGeo);
@@ -2293,6 +3097,7 @@ function installEvents() {
     }
   });
   els.geoBuildSetsButton.addEventListener('click', runGeoBuildSets);
+  els.geoReviewButton.addEventListener('click', runGeoReview);
   els.geoGazetteerButton.addEventListener('click', async () => {
     const root = state.library?.root || state.settings?.lastRoot;
     if (!root) return;
@@ -2429,6 +3234,14 @@ function installEvents() {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
       event.preventDefault();
       refreshAll();
+    }
+    // The keyboard equivalent of the thumb buttons. Safe inside the search box — Alt+Arrow does
+    // nothing to a text field — but not while a dialog owns the screen.
+    if (event.altKey && !event.ctrlKey && !event.metaKey &&
+        (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      if (document.querySelector('dialog[open]')) return;
+      event.preventDefault();
+      navigateBy(event.key === 'ArrowLeft' ? -1 : 1);
     }
   });
 }

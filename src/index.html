@@ -11,9 +11,29 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar">
+        <!-- No app name or logo here: the OS title bar already carries both, right above this row.
+             The space goes to navigation instead, which is where a browser puts it too. When the
+             narrow layout collapses the sidebar, applySidebarCollapsed() moves this group into the
+             topbar so Back never leaves with it. -->
         <div class="brand">
-          <span class="brand-mark"></span>
-          <span>Image Categorizer</span>
+          <div class="nav-buttons" id="nav-buttons">
+            <button
+              class="icon-button nav-button"
+              id="nav-back-button"
+              type="button"
+              title="Back (Alt+&#8592; or Mouse 4)"
+              aria-label="Back"
+              disabled
+            >&#8592;</button>
+            <button
+              class="icon-button nav-button"
+              id="nav-forward-button"
+              type="button"
+              title="Forward (Alt+&#8594; or Mouse 5)"
+              aria-label="Forward"
+              disabled
+            >&#8594;</button>
+          </div>
           <button class="icon-button settings-icon" id="settings-button" type="button" title="Settings">⚙</button>
         </div>
 
@@ -161,6 +181,7 @@
             <button id="geo-classify-button" class="button secondary" type="button">Classify Scenes</button>
             <button id="geo-cancel-classify-button" class="button secondary hidden" type="button">Stop</button>
             <button id="geo-build-sets-button" class="button secondary" type="button">Build Country Sets</button>
+            <button id="geo-review-button" class="button secondary" type="button">Review Sets…</button>
             <label class="geo-inline-field">
               <span>Set size</span>
               <input id="geo-set-size" class="geo-number-input" type="number" min="4" max="64" step="1" value="16">
@@ -200,7 +221,15 @@
             </div>
           </div>
 
+          <!-- Post-build review. Hidden until asked for: it re-reads every set member's
+               description, and it is a cleanup sitting you choose to have, not a dashboard. -->
+          <div class="geo-review hidden" id="geo-review"></div>
+
           <div class="geo-worklist" id="geo-worklist"></div>
+          <!-- Suggestions for the worklist's country inputs, filled from the same reference list the
+               coverage view is scored against. Deliberately a datalist and not a <select>: a country
+               outside those 109 is a legitimate answer, and coverage already reports them. -->
+          <datalist id="geo-country-options"></datalist>
         </section>
         <div class="drop-overlay hidden" id="drop-overlay">
           <div class="drop-overlay-inner">

@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 pub const KINDS_FILE_NAME: &str = ".image-categorizer-kinds.json";
 pub const KIND_SCHEMA_VERSION: u32 = 1;
-pub const KIND_PROMPT_VERSION: u32 = 1;
+/// v2 added the reposted-clip and person-in-front-of-a-street rules — see `CLASSIFY_PROMPT`.
+/// Bumping this makes the next run clear every stored label and reclassify, which is the point: a
+/// library labelled half by one prompt and half by another cannot be reasoned about.
+pub const KIND_PROMPT_VERSION: u32 = 2;
 
 /// How many descriptions go into one request. Each is a few hundred characters, so twenty is a
 /// comfortable prompt while cutting the request count by 20x versus one-at-a-time.
@@ -72,7 +75,14 @@ Rules:
 - Judge the SCENE THAT IS DESCRIBED, never the video title. A description whose title names a \
 country but whose scene is a shop interior is indoor, not outdoor.
 - A photographed outdoor place stays outdoor even when a person is in it, as long as the place is \
-still visible.
+still visible AND the people are incidental - passers-by, traffic, a crowd in a square.
+- If the people are the SUBJECT and the street is merely behind them - posing, a fashion or \
+nightlife clip, a music video, an interview, a performance - that is person, not outdoor, however \
+much of the street is visible.
+- A clip reposted from another platform is screen: a burned-in headline or caption bar across the \
+frame, a platform watermark or @handle (TikTok, Instagram, Shorts), or a thumbnail-style title card \
+over the picture. These are edited graphics, not a photographed place, even when the footage \
+underneath is outdoors.
 - A map or satellite view of a country is screen, not outdoor.
 
 Answer with exactly one line per numbered input, formatted \"<number>: <label>\", using only the \

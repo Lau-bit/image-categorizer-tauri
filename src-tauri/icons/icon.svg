@@ -1,0 +1,56 @@
+<!-- Source art for the app icon. icon.png / icon.ico / icon.rgba are all generated from this — the
+     two commands are in build-icons.py's docstring. Drawn for 16px first: one silhouette (a fanned
+     stack of photo cards), no detail that dies below 24px. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <!-- Lifted off true black on purpose: the Windows 11 taskbar is dark, and a near-black tile
+           reads as a photo floating in nothing rather than as an app tile. -->
+      <stop offset="0" stop-color="#2a3852"/>
+      <stop offset="1" stop-color="#111826"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7cc4ff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#1c4f8f" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="photo" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#63b8ff"/>
+      <stop offset="1" stop-color="#2a63c4"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dbe6f4"/>
+    </linearGradient>
+    <clipPath id="photo-clip">
+      <rect x="-208" y="-150" width="416" height="300" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <rect x="40" y="40" width="944" height="944" rx="214" fill="url(#tile)"/>
+  <rect x="45" y="45" width="934" height="934" rx="209" fill="none" stroke="url(#rim)" stroke-width="10"/>
+
+  <!-- Offset right of centre on purpose: the back cards are dark against a dark tile, so centring
+       the geometry would leave the bright front card sitting visibly right of the middle. This
+       splits the difference between geometric and optical centre. -->
+  <g transform="translate(524 518) scale(1.18)">
+    <!-- Two cards behind, fanned up-left: the stack is what says "many images", and it survives
+         downscaling as a single thicker shape rather than as three readable cards. -->
+    <g transform="rotate(-16) translate(-44 -22)">
+      <rect x="-238" y="-180" width="476" height="360" rx="46" fill="#33445f"/>
+    </g>
+    <g transform="rotate(-8) translate(-22 -11)">
+      <rect x="-238" y="-180" width="476" height="360" rx="46" fill="#51688c"/>
+    </g>
+
+    <!-- Front card: the universal photo glyph, so the icon reads as images and not as documents. -->
+    <g transform="translate(28 24)">
+      <rect x="-244" y="-186" width="488" height="372" rx="50" fill="url(#card)"/>
+      <rect x="-208" y="-150" width="416" height="300" rx="28" fill="url(#photo)"/>
+      <g clip-path="url(#photo-clip)">
+        <circle cx="108" cy="-76" r="43" fill="#ffe6a3"/>
+        <path d="M -208 150 L -66 -34 L 62 150 Z" fill="#eaf6ff"/>
+        <path d="M 6 150 L 116 8 L 208 150 Z" fill="#bfe0ff"/>
+      </g>
+    </g>
+  </g>
+</svg>

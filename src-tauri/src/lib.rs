@@ -1,7 +1,10 @@
+mod sidecar_lock;
+use sidecar_lock::SidecarLock;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, Read},
@@ -38,6 +41,8 @@ use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROM
 mod geo;
 
 mod kinds;
+
+mod review;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "heic", "heif"];
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
@@ -715,6 +720,9 @@ fn commit_analysis<F>(root: &Path, apply: F) -> Result<(), String>
 where
     F: FnOnce(&mut LibraryConfig),
 {
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(root);
     let mut config = load_library_config(root);
     apply(&mut config);
     reclassify_nsfw_categories(&mut config);
@@ -865,6 +873,9 @@ fn reclassify_text_categories(config: &mut LibraryConfig) {
 }
 
 fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(root);
     let mut config = load_library_config(root);
     let source_folders = detect_source_folders(root, &config)?;
 
@@ -1113,6 +1124,9 @@ fn set_source_pattern(
     regex: Option<String>,
 ) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     config.source_pattern_preset = preset;
     config.source_pattern_regex = regex.filter(|value| !value.trim().is_empty());
@@ -1250,6 +1264,9 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 #[tauri::command]
 fn set_text_thresholds(root: String, word_threshold: u32, area_threshold: f32) -> Result<LibraryView, String> {
     let root_buf = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root_buf);
     let mut config = load_library_config(&root_buf);
     config.ocr_word_threshold = Some(word_threshold);
     config.ocr_area_threshold = Some(area_threshold.clamp(0.0, 1.0));
@@ -1403,6 +1420,9 @@ fn add_manual_source_folder(root: String, folder_path: String) -> Result<Library
     }
     let name = relative.to_string_lossy().to_string();
 
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     if !config.manual_source_folders.iter().any(|item| item == &name) {
         config.manual_source_folders.push(name);
@@ -1414,6 +1434,9 @@ fn add_manual_source_folder(root: String, folder_path: String) -> Result<Library
 #[tauri::command]
 fn remove_manual_source_folder(root: String, folder_name: String) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     config.manual_source_folders.retain(|item| item != &folder_name);
     save_library_config(&root, &config)?;
@@ -1423,6 +1446,9 @@ fn remove_manual_source_folder(root: String, folder_name: String) -> Result<Libr
 #[tauri::command]
 fn set_folder_analysis_included(root: String, folder_name: String, included: bool) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     config.excluded_analysis_folders.retain(|item| item != &folder_name);
     if !included {
@@ -1435,6 +1461,9 @@ fn set_folder_analysis_included(root: String, folder_name: String, included: boo
 #[tauri::command]
 fn set_category_analysis_included(root: String, category_name: String, included: bool) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     config.excluded_analysis_categories.retain(|item| item != &category_name);
     if !included {
@@ -1471,6 +1500,9 @@ fn category_is_excluded(
 fn create_category(root: String, name: String) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
     let name = validate_child_name(&name, "Category")?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     if config.categories.iter().any(|item| item.eq_ignore_ascii_case(&name)) {
         return Err("A category with that name already exists.".to_string());
@@ -1484,6 +1516,9 @@ fn create_category(root: String, name: String) -> Result<LibraryView, String> {
 fn rename_category(root: String, old_name: String, new_name: String) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
     let new_name = validate_child_name(&new_name, "Category")?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
 
     if !config.categories.iter().any(|item| item == &old_name) {
@@ -1510,6 +1545,9 @@ fn rename_category(root: String, old_name: String, new_name: String) -> Result<L
 #[tauri::command]
 fn delete_category(root: String, name: String) -> Result<LibraryView, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
     config.categories.retain(|item| item != &name);
     for record in config.images.values_mut() {
@@ -1529,6 +1567,9 @@ fn delete_category(root: String, name: String) -> Result<LibraryView, String> {
 #[tauri::command]
 fn assign_category(root: String, hash: String, category: Option<String>) -> Result<AssignResult, String> {
     let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
     let mut config = load_library_config(&root);
 
     if let Some(category) = &category {
@@ -1660,6 +1701,9 @@ fn import_images(root: String, target_folder: String, paths: Vec<String>) -> Res
     }
 
     if imported > 0 {
+        // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+        // a second instance of this app. Held for the whole read-modify-write.
+        let _sidecar_lock = SidecarLock::acquire(&root_buf);
         let mut config = load_library_config(&root_buf);
         if !config.manual_source_folders.iter().any(|item| item == &target_name) {
             config.manual_source_folders.push(target_name.clone());
@@ -1735,6 +1779,9 @@ fn move_image(
         .map(|value| value.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| format!("{target_name}/{}", path_name(&destination)));
 
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root_buf);
     let mut config = load_library_config(&root_buf);
     if let Some(record) = config.images.get_mut(&hash) {
         // Only re-point the record if it was tracking the file we actually moved; with duplicates it
@@ -2109,6 +2156,9 @@ fn cancel_nsfw_analysis(control: tauri::State<'_, NsfwControl>) -> Result<(), St
 #[tauri::command]
 fn set_nsfw_threshold(root: String, threshold: f32) -> Result<LibraryView, String> {
     let root_buf = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does
+    // a second instance of this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root_buf);
     let mut config = load_library_config(&root_buf);
     config.nsfw_score_threshold = Some(threshold.clamp(0.0, 1.0));
     reclassify_nsfw_categories(&mut config);
@@ -3402,8 +3452,168 @@ fn get_geo_set_images(root: String, set_id: String) -> Result<Vec<ImageView>, St
         .collect())
 }
 
-/// Opens the gazetteer in whatever the OS associates with .json — the intended way to work the
-/// unresolved list down.
+// ---- Set review ---------------------------------------------------------------------------
+//
+// The backward pass over the forward pipeline: what is wrong with the sets that already exist. See
+// `review.rs`. Descriptions are read for set members only (a few thousand small files) rather than
+// for the whole library, so opening the panel costs a fraction of a derive.
+
+/// Reads relative path -> hash from the description index and inverts it, so a finding can say
+/// which file it is about without a full library scan.
+fn description_paths(root: &Path) -> HashMap<String, String> {
+    let index_path = root.join(VISION_DESC_DIR_NAME).join(VISION_INDEX_FILE_NAME);
+    let Ok(text) = fs::read_to_string(index_path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(by_path) = value.get("byPath").and_then(|value| value.as_object()) else {
+        return HashMap::new();
+    };
+    by_path
+        .iter()
+        .filter_map(|(path, hash)| Some((hash.as_str()?.to_string(), path.clone())))
+        .collect()
+}
+
+#[tauri::command]
+fn review_geo_sets(root: String) -> Result<review::SetReview, String> {
+    let root_buf = root_path(&root)?;
+    let geo_file = geo::load_geo(&root_buf)
+        .ok_or_else(|| "No geo records yet. Run Derive Geo first.".to_string())?;
+    let sets = geo::load_sets(&root_buf)
+        .ok_or_else(|| "No country sets have been built yet.".to_string())?;
+    let kind_file = kinds::load_kinds(&root_buf);
+    let kinds_map = kind_file.effective();
+    let allowed = kinds::allowed_kinds(&kind_file);
+    let group_titles: Vec<String> = load_chunk_plan(&root_buf)
+        .map(|plan| plan.groups.into_iter().map(|group| group.title).collect())
+        .unwrap_or_default();
+
+    let desc_dir = root_buf.join(VISION_DESC_DIR_NAME);
+    let mut members: Vec<&String> = sets
+        .sets
+        .iter()
+        .flat_map(|set| set.members.iter())
+        .collect();
+    members.sort();
+    members.dedup();
+    let descriptions: HashMap<String, String> = members
+        .into_iter()
+        .filter_map(|hash| {
+            fs::read_to_string(desc_dir.join(format!("{hash}.txt")))
+                .ok()
+                .map(|text| (hash.clone(), text))
+        })
+        .collect();
+
+    let paths = description_paths(&root_buf);
+    let input = review::ReviewInput {
+        geo: &geo_file,
+        sets: &sets,
+        kinds: &kinds_map,
+        allowed_kinds: &allowed,
+        group_titles: &group_titles,
+        descriptions: &descriptions,
+        paths: &paths,
+    };
+    Ok(review::review(&input, now_iso()))
+}
+
+/// Writes the ticked fixes. Deliberately does NOT re-derive or rebuild: the frontend chains those
+/// through the existing commands, so a fix and a rebuild stay separately visible (and separately
+/// cancellable) rather than hiding a two-minute pipeline inside a checkbox.
+#[tauri::command]
+fn apply_geo_review(root: String, fixes: review::ReviewApply) -> Result<review::ReviewApplied, String> {
+    let root_buf = root_path(&root)?;
+    review::apply(&root_buf, &fixes, &now_iso())
+}
+
+/// One image behind a worklist string: the hash the frontend resolves against the library it is
+/// already holding, plus what the model actually said about it. The description is the other half
+/// of the evidence — a frame can be unreadable on its own and obvious from the sentence that
+/// produced the location line.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoLocationImage {
+    hash: String,
+    description: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoLocationImages {
+    /// Everything that carries the string, even when `images` was capped.
+    total: usize,
+    images: Vec<GeoLocationImage>,
+}
+
+/// The images whose OWN description carries one worklist string, so a decision can be made by
+/// looking at them instead of guessing at the words. Matched exactly the way `derive` matches —
+/// the raw `Location:` line, lowercased — so this is precisely the set that decision will retag.
+///
+/// Returns hashes rather than resolved paths: the frontend is already holding the scanned library,
+/// so this stays a description read (parallel, no library walk) instead of a second full scan.
+/// Frames that merely inherit the location from their video are deliberately absent — they are not
+/// evidence for what the string means.
+#[tauri::command]
+fn get_geo_location_images(
+    root: String,
+    location: String,
+    limit: usize,
+) -> Result<GeoLocationImages, String> {
+    let root_buf = root_path(&root)?;
+    let needle = location.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(GeoLocationImages { total: 0, images: Vec::new() });
+    }
+
+    let mut matches: Vec<GeoLocationImage> = load_descriptions(&root_buf)
+        .into_iter()
+        .filter(|described| {
+            geo::extract_location_line(&described.description)
+                .is_some_and(|raw| raw.trim().to_lowercase() == needle)
+        })
+        .map(|described| GeoLocationImage {
+            hash: described.hash,
+            description: described.description,
+        })
+        .collect();
+
+    // Hash order is directory order, i.e. arbitrary and unstable between calls. Sorting keeps the
+    // strip in the same order every time it is opened, so "the third one" stays the third one.
+    matches.sort_by(|a, b| a.hash.cmp(&b.hash));
+    let total = matches.len();
+    if limit > 0 {
+        matches.truncate(limit);
+    }
+    Ok(GeoLocationImages { total, images: matches })
+}
+
+/// The hand-decision table, so the worklist can show what each unresolved string has already been
+/// decided to mean — including decisions made by editing the file directly.
+#[tauri::command]
+fn get_geo_overrides(root: String) -> Result<BTreeMap<String, Option<String>>, String> {
+    let root_buf = root_path(&root)?;
+    Ok(geo::overrides(&root_buf))
+}
+
+/// Decide one worklist line in place. Writing the gazetteer is the whole fix — the decision only
+/// reaches the records on the next derive, which is why the UI counts undrived decisions.
+#[tauri::command]
+fn set_geo_override(
+    root: String,
+    location: String,
+    action: String,
+    country: Option<String>,
+) -> Result<BTreeMap<String, Option<String>>, String> {
+    let root_buf = root_path(&root)?;
+    geo::set_override(&root_buf, &location, &action, country.as_deref())
+}
+
+/// Opens the gazetteer in whatever the OS associates with .json — for bulk edits and for the parts
+/// the worklist UI does not cover (`fictionTitlePatterns`).
 #[tauri::command]
 fn open_geo_gazetteer(root: String) -> Result<(), String> {
     let root_buf = root_path(&root)?;
@@ -3448,6 +3658,29 @@ mod geo_real_library_tests {
             })
             .unwrap_or_default();
 
+        // Which title readings were judged the same video. Merging is the one step here that can
+        // silently lose information, so the harness prints its biggest decisions to be eyeballed
+        // rather than trusted.
+        let titles: Vec<&str> = groups.iter().map(|group| group.title).collect();
+        let canonical = geo::canonical_groups(&titles);
+        let mut merged: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (index, root_index) in canonical.iter().enumerate() {
+            merged.entry(*root_index).or_default().push(index);
+        }
+        let mut biggest: Vec<&Vec<usize>> = merged.values().filter(|list| list.len() > 1).collect();
+        biggest.sort_by_key(|list| std::cmp::Reverse(list.len()));
+        println!("\nlargest title merges (verify these really are one video each):");
+        for list in biggest.iter().take(8) {
+            println!("  {} readings:", list.len());
+            for index in list.iter().take(4) {
+                println!("      {:?}", titles[*index]);
+            }
+            if list.len() > 4 {
+                println!("      … and {} more", list.len() - 4);
+            }
+        }
+        println!();
+
         let mut gazetteer = geo::load_gazetteer(&root);
         let derived = geo::derive(&descriptions, &groups, &mut gazetteer, None, "test".into());
         let coverage = geo::coverage_view(&root, &derived);
@@ -3459,6 +3692,13 @@ mod geo_real_library_tests {
         println!("tagged (propagated)    {}", stats.tagged_propagated);
         println!("TAGGED TOTAL           {}", stats.tagged_total);
         println!("rejected as junk       {}", stats.rejected_junk);
+        println!("rejected ship registry {}", stats.rejected_registry_port);
+        println!(
+            "videos                 {} (from {} title readings — {} were OCR splits)",
+            stats.sources,
+            stats.source_groups,
+            stats.source_groups.saturating_sub(stats.sources)
+        );
         println!("unresolved images      {}", stats.unresolved_images);
         println!("unresolved strings     {}", stats.unresolved_strings);
         println!("fiction videos skipped {}", stats.fiction_groups_skipped);
@@ -3596,6 +3836,17 @@ mod kind_sample_tests {
     }
 }
 
+// A RUNNING window's taskbar icon comes from WM_SETICON, not from the exe's embedded .ico — Tauri
+// seeds it from the .ico unless it is overridden, and Windows then upscales a too-small entry at
+// scaled DPI, which is what a fuzzy taskbar icon actually is. Handing it a 1024x1024 buffer lets
+// Windows do the downscale itself, crisply, at whatever in-between size it asks for. The raw RGBA
+// blob is generated from icon.png by icons/build-icons.py; `include_bytes!` gives a `'static` slice
+// so `Image::new` borrows it rather than allocating 4 MB at startup.
+fn apply_window_icon(window: &tauri::WebviewWindow) {
+    let bytes = include_bytes!("../icons/icon.rgba");
+    let _ = window.set_icon(tauri::image::Image::new(bytes, 1024, 1024));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let headless_refresh = std::env::args().any(|arg| arg == HEADLESS_REFRESH_ARG);
@@ -3620,6 +3871,9 @@ pub fn run() {
         .manage(VisionControl::default())
         .manage(KindControl::default())
         .setup(move |app| {
+            if let Some(window) = app.get_webview_window("main") {
+                apply_window_icon(&window);
+            }
             if headless_refresh {
                 let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
                 let cancel_item_id = cancel_item.id().clone();
@@ -3661,6 +3915,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             add_manual_source_folder,
             analyze_nsfw,
+            apply_geo_review,
             analyze_text,
             analyze_vision,
             assign_category,
@@ -3684,6 +3939,8 @@ pub fn run() {
             get_auto_refresh_settings,
             get_chunk_plan,
             get_geo_coverage,
+            get_geo_location_images,
+            get_geo_overrides,
             get_geo_set_images,
             get_geo_sets,
             get_geo_summary,
@@ -3700,6 +3957,7 @@ pub fn run() {
             regenerate_chunk_plan,
             remove_manual_source_folder,
             rename_category,
+            review_geo_sets,
             reveal_image,
             scan_library,
             select_root_folder,
@@ -3707,6 +3965,7 @@ pub fn run() {
             set_dark_mode,
             set_folder_analysis_included,
             set_category_analysis_included,
+            set_geo_override,
             set_nsfw_threshold,
             set_source_pattern,
             set_text_thresholds,

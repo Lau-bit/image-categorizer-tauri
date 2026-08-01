@@ -86,22 +86,15 @@ button {
   overflow-y: auto;
 }
 
+/* Was the app name + logo; both are duplicates of the title bar directly above, so the row now
+   holds navigation on the left and settings on the right. */
 .brand {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
   gap: 9px;
   margin-bottom: 8px;
   font-size: 15px;
   font-weight: 720;
-}
-
-.brand-mark {
-  width: 14px;
-  height: 14px;
-  border-radius: 4px;
-  background: var(--accent);
-  box-shadow: inset 0 0 0 3px rgba(255, 255, 255, 0.24);
 }
 
 .settings-icon {
@@ -161,14 +154,19 @@ button {
   outline-offset: -2px;
 }
 
+/* Icon-sized on purpose: as the words "Rename" and "Delete" these two took 109px of a 232px row and
+   left four characters of the category name visible. Their tooltips carry the meaning. */
 .category-rename-button {
-  min-height: 30px;
-  padding: 0 8px;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  min-height: 26px;
+  padding: 0;
   border-radius: 7px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .count-pill {
@@ -428,6 +426,34 @@ body.light-mode .drop-overlay {
   border: 1px solid var(--border);
   background: var(--panel-soft);
   font-size: 15px;
+}
+
+/* Never shrinks: whether it sits in the sidebar head or (collapsed) beside the view title, the text
+   next to it is the flexible thing — a Back button squeezed to a sliver is worse than wrapped text. */
+.nav-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.nav-button {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  background: var(--panel-soft);
+  font-size: 16px;
+}
+
+/* Kept visible rather than hidden at the ends of the history — a control that disappears reads as a
+   layout glitch, and its position is what makes it findable. */
+.nav-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+  color: var(--muted-strong);
+}
+
+.nav-button:disabled:hover {
+  background: var(--panel-soft);
 }
 
 .title-block {
@@ -1449,31 +1475,153 @@ body.light-mode .geo-kind-chip.allowed {
   border-top: 1px solid var(--border);
 }
 
+/* Was a wrapping row of read-only chips next to an instruction to go and edit a JSON file. It is a
+   worklist, so it is now a list of rows you can actually work: count, string, and the decision. */
 .geo-worklist-items {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 5px;
+  max-width: 900px;
 }
 
 .geo-worklist-item {
-  display: inline-flex;
+  display: grid;
+  /* The string is the flexible column; the controls keep a fixed footprint so the rows line up into
+     readable columns rather than each finding its own layout. */
+  grid-template-columns: 52px minmax(0, 1fr) auto auto auto;
   align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
+  gap: 8px;
+  padding: 5px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--panel-soft);
+  font-size: 12px;
+}
+
+.geo-worklist-item.decided {
+  border-color: rgba(90, 160, 90, 0.45);
+  background: rgba(70, 140, 70, 0.09);
+}
+
+.geo-worklist-entry {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The count doubles as the disclosure for the evidence strip — it is already the "how much is
+   behind this string" control, so it is also the way to look at it. */
+.geo-worklist-count {
+  padding: 2px 4px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.geo-worklist-count:hover,
+.geo-worklist-count.open {
+  background: var(--accent-soft);
+}
+
+.geo-worklist-shots {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: -1px 0 5px;
+  padding: 9px 10px 10px;
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  background: var(--panel);
+}
+
+.geo-worklist-shots.loading {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Fixed box, cover-cropped: these are being scanned for "which country is this", so an even grid
+   compares far better than thumbnails that each take their own aspect ratio. */
+.geo-worklist-shot {
+  width: 104px;
+  height: 68px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.geo-worklist-shot:hover {
+  border-color: var(--accent);
+}
+
+.geo-worklist-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.geo-worklist-more {
+  color: var(--muted);
   font-size: 11.5px;
 }
 
-.geo-worklist-count {
-  color: var(--accent);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+.geo-worklist-label {
+  overflow: hidden;
+  color: var(--muted-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.geo-worklist-label {
-  color: var(--muted-strong);
+.geo-worklist-input {
+  min-width: 0;
+  width: 190px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.geo-worklist-verdict {
+  grid-column: 3 / span 2;
+  justify-self: end;
+  font-weight: 600;
+}
+
+.geo-worklist-verdict.placed {
+  color: #7fca86;
+}
+
+.geo-worklist-verdict.rejected {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* A decision is only written to the gazetteer — it reaches the images on the next derive. This bar
+   is the difference between "saved" and "applied", so it carries the button rather than a sentence
+   telling you to go and find one. */
+.geo-worklist-pending {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 12px;
 }
 
 .geo-placeholder {
@@ -1483,6 +1631,149 @@ body.light-mode .geo-kind-chip.allowed {
   max-width: 66ch;
   line-height: 1.5;
 }
+
+/* Set review — a worklist of complaints about sets that already exist, each with its fix. Reads
+   top-to-bottom worst-first, so the severity stripe is the only colour it needs. */
+.geo-review {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.geo-review-stale {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid #a5813a;
+  border-radius: 7px;
+  background: rgba(190, 140, 50, 0.12);
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 80ch;
+}
+
+.geo-review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.geo-review-chip {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.geo-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.geo-review-note {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.geo-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.geo-review-finding {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.geo-review-finding.severity-high { border-left-color: #c2553f; }
+.geo-review-finding.severity-medium { border-left-color: #a5813a; }
+.geo-review-finding.severity-low { border-left-color: var(--border-strong); }
+
+.geo-review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.geo-review-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.geo-review-where {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.geo-review-what {
+  color: var(--muted-strong);
+  font-size: 12.5px;
+}
+
+.geo-review-tick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: var(--muted-strong);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.geo-review-tick input[disabled] { cursor: default; }
+.geo-review-nofix { color: var(--muted); font-style: italic; }
+
+.geo-review-detail {
+  margin: 6px 0 0;
+  max-width: 84ch;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.geo-review-images {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.geo-review-image {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.geo-review-image-name {
+  color: var(--muted-strong);
+  font-family: var(--mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+
+.geo-review-image-why { color: var(--muted); }
 
 body.light-mode .geo-country-delta { color: #2f7d3a; }
 body.light-mode .geo-country.tier-thin { background: #fbf1d8; border-color: #d8bd7a; }
