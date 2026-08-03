@@ -176,20 +176,39 @@
              a list of images, and keeping it separate means the grid's virtual scrolling and drop
              handling are untouched by any of this. -->
         <section class="geo-view hidden" id="geo-view">
+          <!-- One process, not six buttons. The parts run in dependency order and each one's output
+               is the next one's input, so the only real choice is HOW FAR to go — which is what the
+               tick boxes express. Same grammar as the Analyze row above, deliberately. -->
           <div class="geo-toolbar">
-            <button id="geo-derive-button" class="button" type="button">Derive Geo</button>
-            <button id="geo-classify-button" class="button secondary" type="button">Classify Scenes</button>
-            <button id="geo-cancel-classify-button" class="button secondary hidden" type="button">Stop</button>
-            <button id="geo-build-sets-button" class="button secondary" type="button">Build Country Sets</button>
-            <button id="geo-review-button" class="button secondary" type="button">Review Sets…</button>
+            <div class="geo-pipeline-picker">
+              <span class="geo-pipeline-label">Run:</span>
+              <label class="geo-step-check"><input type="checkbox" id="geo-step-derive" checked><span>Derive</span></label>
+              <label class="geo-step-check"><input type="checkbox" id="geo-step-classify" checked><span>Classify Scenes</span></label>
+              <label class="geo-step-check"><input type="checkbox" id="geo-step-repropagate" checked><span>Re-propagate</span></label>
+              <label class="geo-step-check"><input type="checkbox" id="geo-step-build" checked><span>Build Sets</span></label>
+              <label class="geo-step-check"><input type="checkbox" id="geo-step-review"><span>Review</span></label>
+            </div>
+            <button id="geo-run-button" class="button" type="button">Run</button>
+            <button id="geo-stop-button" class="button secondary hidden" type="button">Stop</button>
             <label class="geo-inline-field">
               <span>Set size</span>
               <input id="geo-set-size" class="geo-number-input" type="number" min="4" max="64" step="1" value="16">
             </label>
             <button id="geo-gazetteer-button" class="button secondary" type="button">Edit Gazetteer…</button>
+            <button id="geo-refresh-button" class="button secondary" type="button"
+                    title="Re-read every geo sidecar from disk: coverage, sets, exclusions, scene kinds and the gazetteer.">Refresh</button>
             <span class="geo-toolbar-spacer"></span>
             <span class="geo-generated" id="geo-generated"></span>
           </div>
+
+          <!-- Which part is running now, what each finished one actually did, and what is still to
+               come. Survives the run so the last result stays readable. -->
+          <div class="geo-pipeline hidden" id="geo-pipeline"></div>
+
+          <!-- The vintages on this screen (records, sets, exclusions) are written by separate
+               actions and one of them by a separate app, so "half of what you are looking at is out
+               of date" has to be said out loud rather than left to be inferred from two timestamps. -->
+          <div class="geo-freshness hidden" id="geo-freshness"></div>
 
           <div class="geo-stats" id="geo-stats"></div>
           <div class="geo-kinds" id="geo-kinds"></div>

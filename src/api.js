@@ -85,12 +85,20 @@ window.categorizerAPI = {
   classifyKinds: (root, force) => invoke('classify_kinds', { root, force }),
   cancelKindClassification: () => invoke('cancel_kind_classification'),
   getKindSummary: root => invoke('get_kind_summary', { root }),
+  // Re-runs only the inheritance step (which unlooked-at frames may take their video's kind) from
+  // the labels already on disk. No model, instant — the way a changed propagation rule reaches a
+  // library without re-classifying it.
+  repropagateKinds: root => invoke('repropagate_kinds', { root }),
   onKindProgress: callback => event.listen('kind-classification-progress', message => callback(message.payload)),
   onKindFinished: callback => event.listen('kind-classification-finished', message => callback(message.payload)),
   getGeoSummary: root => invoke('get_geo_summary', { root }),
   getGeoCoverage: root => invoke('get_geo_coverage', { root }),
   buildGeoSets: (root, targetSize) => invoke('build_geo_sets', { root, targetSize }),
   getGeoSets: root => invoke('get_geo_sets', { root }),
+  // Whether what the panel is showing has been overtaken by something written since — including by
+  // super-image-viewer, which writes the exclusion list. Cheap (never parses the records file), so
+  // it can be re-checked whenever the window comes back rather than only on a full reload.
+  getGeoStatus: root => invoke('get_geo_status', { root }),
   getGeoSetImages: (root, setId) => invoke('get_geo_set_images', { root, setId }),
   openGeoGazetteer: root => invoke('open_geo_gazetteer', { root }),
   // The worklist's decision table. `setGeoOverride` writes the gazetteer and nothing else — the

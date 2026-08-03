@@ -44,6 +44,22 @@ const state = {
   geoSetImages: null,
   geoSetTitle: null,
   geoBusy: false,
+  // Freshness of the vintages on the Geo panel, plus proof the panel actually re-read them.
+  // `geoCheckedAt` is stamped on every load so the toolbar can say WHEN it last looked — without it
+  // a refresh that changed nothing is indistinguishable from a refresh that never happened.
+  // `geoStatus.fingerprint` is what a focus check compares against to notice a write made by
+  // another app (super-image-viewer owns the exclusion list) while this window was in the background.
+  geoStatus: null,
+  geoCheckedAt: null,
+  geoRefreshing: false,
+  // The one long process the panel's parts were collapsed into. `steps` is the chosen run, each
+  // entry carrying its own state and a one-line result, so the strip can say what a finished part
+  // actually did rather than just that it finished. Kept after the run ends — the last result is
+  // the thing you come back to read.
+  geoPipeline: { steps: [], active: false, cancelled: false },
+  // Bridges the event-driven scene pass into the sequential runner: held while a classify step is
+  // in flight, resolved by the finished event.
+  kindWaiter: null,
   // Scene-kind classification (the "is this a place at all" pass).
   kindSummary: null,
   kindRunning: false,
@@ -78,14 +94,19 @@ const els = {
   geoWorklist: document.getElementById('geo-worklist'),
   geoCountryOptions: document.getElementById('geo-country-options'),
   geoGenerated: document.getElementById('geo-generated'),
-  geoDeriveButton: document.getElementById('geo-derive-button'),
-  geoClassifyButton: document.getElementById('geo-classify-button'),
-  geoCancelClassifyButton: document.getElementById('geo-cancel-classify-button'),
   geoKinds: document.getElementById('geo-kinds'),
-  geoBuildSetsButton: document.getElementById('geo-build-sets-button'),
-  geoReviewButton: document.getElementById('geo-review-button'),
   geoReview: document.getElementById('geo-review'),
   geoGazetteerButton: document.getElementById('geo-gazetteer-button'),
+  geoRefreshButton: document.getElementById('geo-refresh-button'),
+  geoRunButton: document.getElementById('geo-run-button'),
+  geoStopButton: document.getElementById('geo-stop-button'),
+  geoPipeline: document.getElementById('geo-pipeline'),
+  geoStepDerive: document.getElementById('geo-step-derive'),
+  geoStepClassify: document.getElementById('geo-step-classify'),
+  geoStepRepropagate: document.getElementById('geo-step-repropagate'),
+  geoStepBuild: document.getElementById('geo-step-build'),
+  geoStepReview: document.getElementById('geo-step-review'),
+  geoFreshness: document.getElementById('geo-freshness'),
   geoSetSize: document.getElementById('geo-set-size'),
   categoryList: document.getElementById('category-list'),
   addCategoryButton: document.getElementById('add-category-button'),
@@ -1452,48 +1473,118 @@ async function loadGeoSummaryOnly() {
   }
 }
 
+// Re-reads every sidecar the panel shows, in one pass, and stamps when that happened. Returns
+// whether it worked, so a caller that wants to report the outcome does not announce a success the
+// catch block just swallowed.
 async function loadGeoData() {
   const root = state.library?.root || state.settings?.lastRoot;
-  if (!root) return;
+  if (!root) return false;
+  let ok = true;
   try {
-    const [summary, coverage, sets, kinds, overrides] = await Promise.all([
+    const [summary, coverage, sets, kinds, overrides, status] = await Promise.all([
       window.categorizerAPI.getGeoSummary(root),
       window.categorizerAPI.getGeoCoverage(root),
       window.categorizerAPI.getGeoSets(root),
       window.categorizerAPI.getKindSummary(root),
       window.categorizerAPI.getGeoOverrides(root),
+      window.categorizerAPI.getGeoStatus(root),
     ]);
     state.geoSummary = summary;
     state.geoCoverage = coverage;
     state.geoSets = sets;
     state.kindSummary = kinds;
     state.geoOverrides = overrides;
+    state.geoStatus = status;
+    state.geoCheckedAt = Date.now();
   } catch (error) {
+    ok = false;
     showToast(errorText(error));
+  }
+  render();
+  return ok;
+}
+
+// The manual re-read. Everything on this panel comes off disk, three of the five files can be
+// rewritten by something other than this window, and until now the only way to make it look again
+// was to navigate away and back — which is why it seemed to refresh "at times".
+async function refreshGeoData() {
+  if (state.geoRefreshing || state.geoBusy) return;
+  const before = state.geoStatus?.fingerprint ?? null;
+  state.geoRefreshing = true;
+  setStatus('Re-reading geo sidecars…', true);
+  render();
+  const ok = await loadGeoData();
+  state.geoRefreshing = false;
+  setStatus('');
+  if (ok) {
+    const after = state.geoStatus?.fingerprint ?? null;
+    // "Nothing changed" is a real answer and has to be said, or a refresh that found nothing looks
+    // exactly like a button that does nothing.
+    showToast(before !== null && after === before
+      ? `Nothing has changed on disk — ${geoContentsLabel()}.`
+      : `Geo refreshed — ${geoContentsLabel()}.`);
   }
   render();
 }
 
-// The scene pass talks to the local model, so it is long-running: progress events and a Stop button
-// rather than an await. Results checkpoint after every batch, so stopping loses at most one batch.
-async function runKindClassification(force = false) {
+function geoContentsLabel() {
+  const stats = state.geoCoverage?.stats;
+  const sets = state.geoStatus?.setsCount ?? state.geoSets?.sets?.length ?? 0;
+  if (!stats) return 'nothing derived yet';
+  return `${stats.taggedTotal} images across ${stats.countriesSeen} countries, ` +
+    `${sets} set${sets === 1 ? '' : 's'}`;
+}
+
+// The exclusion list is written by super-image-viewer and the gazetteer can be edited in a text
+// editor — both while this window sits in the background showing what it last read. Coming back to
+// the window is the moment to check, and the check costs one stat of five files plus a parse of the
+// small ones, never the multi-megabyte records file.
+async function checkGeoFreshness() {
+  if (state.currentView !== 'geo') return;
+  if (state.geoBusy || state.geoRefreshing || state.kindRunning || state.geoReviewBusy) return;
   const root = state.library?.root || state.settings?.lastRoot;
-  if (!root || state.kindRunning) return;
-  state.kindRunning = true;
-  state.kindProgress = null;
-  render();
+  if (!root) return;
+  let status = null;
   try {
-    await window.categorizerAPI.classifyKinds(root, force);
-  } catch (error) {
-    state.kindRunning = false;
-    showToast(errorText(error));
-    render();
+    status = await window.categorizerAPI.getGeoStatus(root);
+  } catch {
+    return; // a library that has gone away is not worth a toast on every focus
   }
+  const changed = state.geoStatus && status.fingerprint !== state.geoStatus.fingerprint;
+  state.geoStatus = status;
+  state.geoCheckedAt = Date.now();
+  if (!changed) {
+    renderGeo();
+    return;
+  }
+  // Read-only panel, so reloading under the user is safe — but it must be visible that it happened,
+  // because the numbers moving on their own is otherwise indistinguishable from a bug.
+  await loadGeoData();
+  showToast('Geo sidecars changed on disk — reloaded.');
+}
+
+// The scene pass talks to the local model, so it is the one part that reports by event rather than
+// returning. This wraps it back into something awaitable, so the runner can treat all five parts
+// alike instead of special-casing the long one. Results checkpoint after every batch, so a Stop
+// loses at most one batch.
+function classifyScenes(root, step) {
+  return new Promise((resolve, reject) => {
+    state.kindWaiter = { resolve, reject, step };
+    state.kindRunning = true;
+    state.kindProgress = null;
+    window.categorizerAPI.classifyKinds(root, false).catch(error => {
+      state.kindWaiter = null;
+      state.kindRunning = false;
+      reject(error);
+    });
+  });
 }
 
 async function installKindListeners() {
   await window.categorizerAPI.onKindProgress(payload => {
     state.kindProgress = payload;
+    // Feed the running chip too, so "which part is happening now" carries its own count.
+    if (state.kindWaiter) state.kindWaiter.step.detail = `${payload.processed} / ${payload.total}`;
     if (state.currentView === 'geo') renderGeo();
     setStatus(`Classifying scenes — ${payload.processed}/${payload.total}`, true);
   });
@@ -1501,9 +1592,199 @@ async function installKindListeners() {
     state.kindRunning = false;
     state.kindProgress = null;
     setStatus('');
-    if (payload?.message) showToast(payload.message);
-    void loadGeoData();
+    const waiter = state.kindWaiter;
+    state.kindWaiter = null;
+    if (!waiter) {
+      if (payload?.message) showToast(payload.message);
+      void loadGeoData();
+      return;
+    }
+    // A failure has to stop the chain: building sets on a half-classified library would bake the
+    // very guesses the classify step exists to remove.
+    if (payload?.status === 'error') {
+      waiter.reject(new Error(payload.message || 'Scene classification failed.'));
+    } else {
+      waiter.resolve(payload);
+    }
   });
+}
+
+// ==============================
+// The geo pipeline
+//
+// These five parts were five buttons, which made the common case — "bring everything up to date" —
+// a five-click sequence you had to know the order of. They are a strict chain: each one's output is
+// the next one's input, so the only genuine choice is how far along it to go. That is what the tick
+// boxes are, and the order below is the dependency order, not a preference.
+// ==============================
+
+const GEO_PIPELINE_STEPS = [
+  {
+    id: 'derive',
+    label: 'Derive',
+    checkbox: 'geoStepDerive',
+    status: 'Deriving geo from descriptions…',
+    async run(root, step) {
+      // A derive regenerates the worklist wholesale, so every expanded row and cached strip
+      // describes a list that is about to stop existing.
+      state.geoWorklistOpen.clear();
+      state.geoWorklistImages.clear();
+      state.geoSummary = await window.categorizerAPI.deriveGeo(root);
+      const stats = state.geoSummary.stats;
+      step.detail = `${stats.taggedTotal} images · ${stats.countriesSeen} countries`;
+    },
+  },
+  {
+    id: 'classify',
+    label: 'Classify Scenes',
+    checkbox: 'geoStepClassify',
+    status: 'Classifying scenes…',
+    cancellable: true,
+    async run(root, step) {
+      const outcome = await classifyScenes(root, step);
+      if (outcome?.status === 'cancelled') {
+        // A stop is a decision, not a failure — but the parts after this would run on a
+        // half-classified library, so the chain ends here rather than baking that in.
+        step.state = 'stopped';
+        step.detail = state.kindProgress ? 'stopped part-way' : 'stopped';
+        state.geoPipeline.cancelled = true;
+        return;
+      }
+      step.detail = outcome?.message || 'done';
+    },
+  },
+  {
+    id: 'repropagate',
+    label: 'Re-propagate',
+    checkbox: 'geoStepRepropagate',
+    status: 'Re-deciding inherited scene kinds…',
+    async run(root, step) {
+      const result = await window.categorizerAPI.repropagateKinds(root);
+      step.detail = `${result.mixed} held out as mixed` +
+        (result.corrected ? ` · ${result.corrected} corrected` : '');
+    },
+  },
+  {
+    id: 'build',
+    label: 'Build Sets',
+    checkbox: 'geoStepBuild',
+    status: 'Building country sets…',
+    async run(root, step) {
+      const targetSize = Math.max(4, Math.min(64, Number(els.geoSetSize.value) || 16));
+      const built = await window.categorizerAPI.buildGeoSets(root, targetSize);
+      state.geoSets = built;
+      // Any review on screen argued about member lists that have just been replaced.
+      state.geoReview = null;
+      state.geoReviewSelected = new Set();
+      const diverse = built.sets.filter(set => set.quality === 'diverse').length;
+      step.detail = `${built.sets.length} sets · ${diverse} fully varied`;
+    },
+  },
+  {
+    id: 'review',
+    label: 'Review',
+    checkbox: 'geoStepReview',
+    status: 'Reviewing country sets…',
+    async run(root, step) {
+      state.geoReviewBusy = true;
+      try {
+        state.geoReview = await window.categorizerAPI.reviewGeoSets(root);
+        // Findings are re-resolved on every run, so a tick that no longer exists must not survive.
+        const live = new Set(state.geoReview.findings.map(finding => finding.id));
+        state.geoReviewSelected = new Set([...state.geoReviewSelected].filter(id => live.has(id)));
+        step.detail = state.geoReview.findings.length
+          ? `${state.geoReview.findings.length} findings`
+          : 'nothing to fix';
+      } finally {
+        state.geoReviewBusy = false;
+      }
+    },
+  },
+];
+
+function geoPipelineBusy() {
+  return state.geoPipeline.active || state.geoBusy || state.kindRunning;
+}
+
+/// Runs the named parts in dependency order. Used both by the Run button and by the apply-fixes
+/// chain, so there is exactly one thing that knows how these parts follow each other.
+async function runGeoPipeline(ids) {
+  const root = state.library?.root || state.settings?.lastRoot;
+  if (!root || geoPipelineBusy()) return;
+  const chosen = GEO_PIPELINE_STEPS.filter(step => ids.includes(step.id));
+  if (!chosen.length) {
+    showToast('Tick at least one part to run.');
+    return;
+  }
+
+  state.geoPipeline = {
+    steps: chosen.map(step => ({ id: step.id, label: step.label, state: 'pending', detail: '' })),
+    active: true,
+    cancelled: false,
+  };
+  state.geoBusy = true;
+  render();
+
+  let failed = null;
+  for (let index = 0; index < chosen.length; index += 1) {
+    const entry = state.geoPipeline.steps[index];
+    if (state.geoPipeline.cancelled) {
+      entry.state = 'skipped';
+      continue;
+    }
+    entry.state = 'running';
+    setStatus(`${index + 1}/${chosen.length} · ${chosen[index].status}`, true);
+    render();
+    try {
+      await chosen[index].run(root, entry);
+      // A step may name its own outcome (the scene pass does, when stopped part-way); anything
+      // that simply returned is done.
+      if (entry.state === 'running') entry.state = 'done';
+    } catch (error) {
+      entry.state = 'failed';
+      entry.detail = errorText(error);
+      failed = chosen[index].label;
+      // Every later part reads what this one was supposed to write, so carrying on would produce
+      // confident output from stale input — the exact failure this panel already has a banner for.
+      state.geoPipeline.cancelled = true;
+    }
+    render();
+  }
+
+  state.geoPipeline.active = false;
+  state.geoBusy = false;
+  setStatus('');
+  await loadGeoData();
+
+  const done = state.geoPipeline.steps.filter(step => step.state === 'done').length;
+  if (failed) {
+    showToast(`Stopped at ${failed} — ${done} of ${state.geoPipeline.steps.length} parts finished.`, { sticky: true });
+  } else if (state.geoPipeline.cancelled) {
+    showToast(`Stopped — ${done} of ${state.geoPipeline.steps.length} parts finished.`);
+  } else {
+    showToast(`Done — ${state.geoPipeline.steps.map(step => `${step.label}: ${step.detail}`).join(' · ')}`);
+  }
+}
+
+function runSelectedGeoPipeline() {
+  const ids = GEO_PIPELINE_STEPS.filter(step => els[step.checkbox].checked).map(step => step.id);
+  return runGeoPipeline(ids);
+}
+
+// Stop applies to the part actually running. Only the scene pass is interruptible; for the short
+// ones this just prevents the parts after them from starting.
+async function stopGeoPipeline() {
+  if (!state.geoPipeline.active) return;
+  state.geoPipeline.cancelled = true;
+  setStatus('Stopping…', true);
+  if (state.kindRunning) {
+    try {
+      await window.categorizerAPI.cancelKindClassification();
+    } catch (error) {
+      showToast(errorText(error));
+    }
+  }
+  render();
 }
 
 const KIND_LABELS = {
@@ -1512,7 +1793,12 @@ const KIND_LABELS = {
   person: 'people',
   screen: 'screens & maps',
   other: 'other',
+  // Not a scene the model ever answers: a frame nobody looked at, in a video whose described frames
+  // disagreed. Shown so the held-out population is visible rather than silently missing.
+  mixed: 'mixed video — held out',
 };
+
+const KIND_ORDER = ['outdoor', 'indoor', 'person', 'screen', 'other', 'mixed'];
 
 function renderGeoKinds() {
   els.geoKinds.innerHTML = '';
@@ -1543,7 +1829,7 @@ function renderGeoKinds() {
   const row = document.createElement('div');
   row.className = 'geo-kind-row';
   const allowed = new Set(summary.allowedKinds || []);
-  for (const kind of ['outdoor', 'indoor', 'person', 'screen', 'other']) {
+  for (const kind of KIND_ORDER) {
     const count = summary.counts?.[kind] || 0;
     if (!count) continue;
     const chip = document.createElement('span');
@@ -1564,53 +1850,6 @@ function renderGeoKinds() {
     ? `${summary.pending} still unclassified — those pass through until checked. Sets use: ${kept}.`
     : `Sets use: ${kept}. Edit "allowedKinds" in the kinds sidecar to change that without reclassifying.`;
   els.geoKinds.append(note);
-}
-
-async function runGeoDerive() {
-  const root = state.library?.root || state.settings?.lastRoot;
-  if (!root || state.geoBusy) return;
-  // A derive regenerates the worklist wholesale, so every expanded row and cached strip describes
-  // a list that is about to stop existing.
-  state.geoWorklistOpen.clear();
-  state.geoWorklistImages.clear();
-  state.geoBusy = true;
-  setStatus('Deriving geo from descriptions…', true);
-  render();
-  try {
-    state.geoSummary = await window.categorizerAPI.deriveGeo(root);
-    const stats = state.geoSummary.stats;
-    showToast(
-      `Geo derived — ${stats.taggedTotal} images across ${stats.countriesSeen} countries ` +
-      `(${stats.taggedPropagated} from video propagation).`
-    );
-  } catch (error) {
-    showToast(errorText(error));
-  } finally {
-    state.geoBusy = false;
-    setStatus('');
-  }
-  await loadGeoData();
-}
-
-async function runGeoBuildSets() {
-  const root = state.library?.root || state.settings?.lastRoot;
-  if (!root || state.geoBusy) return;
-  const targetSize = Math.max(4, Math.min(64, Number(els.geoSetSize.value) || 16));
-  state.geoBusy = true;
-  setStatus('Building country sets…', true);
-  render();
-  try {
-    const built = await window.categorizerAPI.buildGeoSets(root, targetSize);
-    state.geoSets = built;
-    const diverse = built.sets.filter(set => set.quality === 'diverse').length;
-    showToast(`Built ${built.sets.length} sets — ${diverse} fully varied.`);
-  } catch (error) {
-    showToast(errorText(error));
-  } finally {
-    state.geoBusy = false;
-    setStatus('');
-  }
-  render();
 }
 
 async function openGeoSet(set) {
@@ -1786,27 +2025,6 @@ const GEO_REVIEW_KIND_LABELS = {
   'short-set': 'Set is short',
 };
 
-async function runGeoReview() {
-  const root = state.library?.root || state.settings?.lastRoot;
-  if (!root || state.geoReviewBusy) return;
-  state.geoReviewBusy = true;
-  setStatus('Reviewing country sets…', true);
-  render();
-  try {
-    state.geoReview = await window.categorizerAPI.reviewGeoSets(root);
-    // Findings are re-resolved on every run, so a tick that no longer exists must not survive.
-    const live = new Set(state.geoReview.findings.map(finding => finding.id));
-    state.geoReviewSelected = new Set([...state.geoReviewSelected].filter(id => live.has(id)));
-    if (!state.geoReview.findings.length) showToast('Nothing to fix — every set checked out.');
-  } catch (error) {
-    showToast(errorText(error));
-  } finally {
-    state.geoReviewBusy = false;
-    setStatus('');
-  }
-  render();
-}
-
 // Unions the ticked findings' fixes. Two findings that both want the same image excluded cost one
 // write, and the backend is idempotent anyway — this just keeps the confirmation honest.
 function selectedGeoReviewFix() {
@@ -1849,11 +2067,10 @@ async function applyGeoReviewSelection() {
     state.geoReviewBusy = false;
     setStatus('');
   }
-  // Re-derive picks up the rejected strings; rebuilding picks up the exclusions. Chained here
-  // rather than inside the apply command so both passes stay visible in the status line.
-  await runGeoDerive();
-  await runGeoBuildSets();
-  await runGeoReview();
+  // Re-derive picks up the rejected strings; rebuilding picks up the exclusions. Run through the
+  // pipeline rather than as its own private chain, so there is one thing that knows the order —
+  // and so applying fixes reports its progress the same way every other run does.
+  await runGeoPipeline(['derive', 'build', 'review']);
 }
 
 function geoReviewImageLine(image) {
@@ -2091,8 +2308,8 @@ function renderGeoWorklist() {
     deriveButton.type = 'button';
     deriveButton.className = 'button compact';
     deriveButton.textContent = 'Re-derive Now';
-    deriveButton.disabled = state.geoBusy || state.analyzing || state.kindRunning;
-    deriveButton.addEventListener('click', runGeoDerive);
+    deriveButton.disabled = geoPipelineBusy() || state.analyzing;
+    deriveButton.addEventListener('click', () => void runGeoPipeline(['derive']));
     bar.append(label, deriveButton);
     head.append(bar);
   }
@@ -2283,22 +2500,105 @@ function renderGeoCountryOptions() {
   els.geoCountryOptions.replaceChildren(...names.sort().map(name => new Option(name)));
 }
 
+function geoTimeLabel(iso) {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? null : formatDate(ms);
+}
+
+// Three dates rather than one: when the coverage was derived, when the sets beside it were built,
+// and when this window last looked at the disk. The third is there because "did pressing that
+// actually re-read anything" had no answer on screen before — which is most of the complaint.
+function geoStampLine() {
+  const parts = [];
+  const derived = geoTimeLabel(state.geoCoverage?.generatedAt);
+  if (derived) parts.push(`Derived ${derived}`);
+  const built = geoTimeLabel(state.geoStatus?.setsBuiltAt);
+  if (built) parts.push(`sets built ${built}`);
+  if (state.geoCheckedAt) parts.push(`checked ${new Date(state.geoCheckedAt).toLocaleTimeString()}`);
+  return parts.join(' · ');
+}
+
+// Which half of the panel has been overtaken, and by what. Hidden entirely when the sidecars agree:
+// a banner that is always there is a banner nobody reads.
+function renderGeoFreshness() {
+  const status = state.geoStatus;
+  const reasons = status?.reasons || [];
+  els.geoFreshness.innerHTML = '';
+  els.geoFreshness.classList.toggle('hidden', !reasons.length);
+  if (!reasons.length) return;
+
+  const head = document.createElement('div');
+  head.className = 'geo-freshness-head';
+  head.textContent = status.recordsStale && status.setsStale
+    ? 'Coverage and country sets are both out of date'
+    : status.recordsStale
+      ? 'Coverage is out of date'
+      : 'The country sets are out of date';
+
+  const list = document.createElement('ul');
+  list.className = 'geo-freshness-reasons';
+  for (const reason of reasons) {
+    const item = document.createElement('li');
+    item.textContent = reason;
+    list.append(item);
+  }
+  els.geoFreshness.append(head, list);
+}
+
+// One chip per chosen part, left to right in execution order. A finished chip keeps its result, so
+// the strip doubles as the record of what the last run actually did.
+function renderGeoPipeline() {
+  const steps = state.geoPipeline.steps;
+  els.geoPipeline.innerHTML = '';
+  els.geoPipeline.classList.toggle('hidden', !steps.length);
+  if (!steps.length) return;
+
+  const marks = { pending: '·', running: '▸', done: '✓', failed: '!', skipped: '–', stopped: '■' };
+  steps.forEach((step, index) => {
+    const chip = document.createElement('div');
+    chip.className = `geo-pipeline-step ${step.state}`;
+
+    const mark = document.createElement('span');
+    mark.className = 'geo-pipeline-mark';
+    mark.textContent = marks[step.state] || '·';
+
+    const label = document.createElement('span');
+    label.textContent = `${index + 1}. ${step.label}`;
+
+    chip.append(mark, label);
+    if (step.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'geo-pipeline-detail';
+      detail.textContent = step.detail;
+      chip.append(detail);
+    }
+    chip.setAttribute('aria-label', `Step ${index + 1} ${step.label}: ${step.state}. ${step.detail}`);
+    els.geoPipeline.append(chip);
+  });
+}
+
 function renderGeo() {
-  els.geoDeriveButton.disabled = state.geoBusy || state.analyzing || state.kindRunning;
-  els.geoBuildSetsButton.disabled =
-    state.geoBusy || state.analyzing || state.kindRunning || !state.geoCoverage;
-  els.geoClassifyButton.disabled =
-    state.geoBusy || state.analyzing || state.kindRunning || !state.geoCoverage;
-  els.geoClassifyButton.textContent = state.kindSummary?.classified
-    ? `Classify Scenes (${state.kindSummary.pending} left)`
-    : 'Classify Scenes';
-  els.geoCancelClassifyButton.classList.toggle('hidden', !state.kindRunning);
-  els.geoReviewButton.disabled =
-    state.geoBusy || state.analyzing || state.kindRunning || state.geoReviewBusy || !state.geoSets?.sets?.length;
-  els.geoReviewButton.textContent = state.geoReview ? 'Re-review Sets' : 'Review Sets…';
-  els.geoGenerated.textContent = state.geoCoverage?.generatedAt
-    ? `Derived ${new Date(state.geoCoverage.generatedAt).toLocaleString()}`
-    : '';
+  const busy = geoPipelineBusy() || state.analyzing;
+  const chosen = GEO_PIPELINE_STEPS.filter(step => els[step.checkbox].checked).length;
+  els.geoRunButton.disabled = busy || !chosen;
+  els.geoRunButton.textContent = state.geoPipeline.active
+    ? 'Running…'
+    : chosen === GEO_PIPELINE_STEPS.length
+      ? 'Run all'
+      : `Run ${chosen}`;
+  els.geoStopButton.classList.toggle('hidden', !state.geoPipeline.active);
+  els.geoStopButton.disabled = state.geoPipeline.cancelled;
+  // The pending count is the reason to tick Classify at all, so it belongs on the tick box.
+  const pending = state.kindSummary?.pending;
+  els.geoStepClassify.nextElementSibling.textContent =
+    pending ? `Classify Scenes (${pending} left)` : 'Classify Scenes';
+  for (const step of GEO_PIPELINE_STEPS) els[step.checkbox].disabled = busy;
+  renderGeoPipeline();
+  els.geoRefreshButton.disabled = busy || state.geoRefreshing;
+  els.geoRefreshButton.textContent = state.geoRefreshing ? 'Refreshing…' : 'Refresh';
+  els.geoGenerated.textContent = geoStampLine();
+  renderGeoFreshness();
   renderGeoCountryOptions();
   renderGeoStats();
   renderGeoKinds();
@@ -3087,17 +3387,19 @@ function installEvents() {
   els.allTab.addEventListener('click', selectAll);
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
   els.geoTab.addEventListener('click', selectGeo);
-  els.geoDeriveButton.addEventListener('click', runGeoDerive);
-  els.geoClassifyButton.addEventListener('click', () => runKindClassification(false));
-  els.geoCancelClassifyButton.addEventListener('click', async () => {
-    try {
-      await window.categorizerAPI.cancelKindClassification();
-    } catch (error) {
-      showToast(errorText(error));
-    }
+  els.geoRunButton.addEventListener('click', () => void runSelectedGeoPipeline());
+  els.geoStopButton.addEventListener('click', () => void stopGeoPipeline());
+  for (const step of GEO_PIPELINE_STEPS) {
+    els[step.checkbox].addEventListener('change', () => renderGeo());
+  }
+  els.geoRefreshButton.addEventListener('click', () => void refreshGeoData());
+  // Both, because neither is reliable alone in WebView2: `focus` misses a re-show that never took
+  // keyboard focus, and `visibilitychange` does not fire for a window merely raised over another.
+  // `checkGeoFreshness` is cheap and idempotent, so firing twice costs nothing.
+  window.addEventListener('focus', () => void checkGeoFreshness());
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) void checkGeoFreshness();
   });
-  els.geoBuildSetsButton.addEventListener('click', runGeoBuildSets);
-  els.geoReviewButton.addEventListener('click', runGeoReview);
   els.geoGazetteerButton.addEventListener('click', async () => {
     const root = state.library?.root || state.settings?.lastRoot;
     if (!root) return;

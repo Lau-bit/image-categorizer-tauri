@@ -3383,6 +3383,59 @@ fn get_kind_summary(root: String) -> Result<KindSummary, String> {
     })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepropagateResult {
+    /// Frames that inherited a kind from their video's described frames.
+    propagated: usize,
+    /// Frames whose video's described frames disagreed, so nothing was vouched for.
+    mixed: usize,
+    /// How many of those changed away from a real kind — the mislabels this run removed.
+    corrected: usize,
+}
+
+/// Re-runs ONLY the inheritance step: which unlooked-at frames may take their video's scene kind.
+///
+/// Pure and instant — it recomputes a derived field from the labels already on disk and calls no
+/// model. That is the whole point: when the propagation RULE changes, a library does not have to
+/// re-classify ten thousand descriptions to get the benefit, and the frames a stricter rule now
+/// declines to vouch for stop being set material as soon as the sets are rebuilt.
+#[tauri::command]
+fn repropagate_kinds(root: String) -> Result<RepropagateResult, String> {
+    let root_buf = root_path(&root)?;
+    let mut kinds_file = kinds::load_kinds(&root_buf);
+    if kinds_file.kinds.is_empty() {
+        return Err(
+            "Nothing has been scene-classified yet, so there is nothing to inherit from. Run \
+             Classify Scenes first."
+                .to_string(),
+        );
+    }
+    let before = kinds_file.propagated.clone();
+    let model = kinds_file.model.clone();
+    propagate_and_save_kinds(&root_buf, &mut kinds_file, &model)?;
+
+    let mixed = kinds_file
+        .propagated
+        .values()
+        .filter(|kind| kind.as_str() == kinds::KIND_MIXED)
+        .count();
+    // A frame that used to carry a real kind and is now held out is precisely a mislabel removed.
+    let corrected = kinds_file
+        .propagated
+        .iter()
+        .filter(|(hash, kind)| {
+            kind.as_str() == kinds::KIND_MIXED
+                && before.get(*hash).is_some_and(|old| old != kinds::KIND_MIXED)
+        })
+        .count();
+    Ok(RepropagateResult {
+        propagated: kinds_file.propagated.len() - mixed,
+        mixed,
+        corrected,
+    })
+}
+
 #[tauri::command]
 fn get_geo_summary(root: String) -> Result<GeoSummary, String> {
     let root_buf = root_path(&root)?;
@@ -3423,6 +3476,79 @@ fn build_geo_sets(root: String, target_size: Option<usize>) -> Result<geo::GeoSe
 fn get_geo_sets(root: String) -> Result<Option<geo::GeoSetsFile>, String> {
     let root_buf = root_path(&root)?;
     Ok(geo::load_sets(&root_buf))
+}
+
+/// Write time in epoch seconds, or `None` when the file has never been written.
+fn modified_secs(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Write time + size, which together move whenever a sidecar is rewritten — by this app or by
+/// super-image-viewer, which owns the exclusion list.
+fn file_stamp(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(meta) => format!("{}:{}", modified_secs(path).unwrap_or(0), meta.len()),
+        Err(_) => "-".to_string(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoStatusView {
+    /// Changes whenever any geo sidecar is rewritten. The panel keeps the value it loaded with and
+    /// re-checks it when the window comes back — the only way it can notice a write made by another
+    /// app while it was in the background.
+    fingerprint: String,
+    /// When this answer was produced, so the panel can say out loud that it did look again.
+    checked_at: String,
+    #[serde(flatten)]
+    status: geo::GeoStatus,
+}
+
+/// Whether what the Geo panel is showing has been overtaken by something written since.
+///
+/// Cheap on purpose: it stats five sidecars and parses the four SMALL ones, never the multi-megabyte
+/// records file. That is what lets the panel re-check freshness on every focus rather than only when
+/// the user happens to navigate away and back.
+#[tauri::command]
+fn get_geo_status(root: String) -> Result<GeoStatusView, String> {
+    let root_buf = root_path(&root)?;
+    let sets = geo::load_sets(&root_buf);
+    let excluded = geo::load_excluded(&root_buf);
+    let kind_file = kinds::load_kinds(&root_buf);
+    let allowed = kinds::allowed_kinds(&kind_file);
+    let kinds_map = kind_file.effective();
+
+    let geo_file = geo::geo_path(&root_buf);
+    let gazetteer_file = geo::gazetteer_path(&root_buf);
+    let sets_file = geo::sets_path(&root_buf);
+    let status = geo::status(&geo::StatusInput {
+        sets: sets.as_ref(),
+        excluded: &excluded.excluded,
+        kinds: &kinds_map,
+        allowed_kinds: &allowed,
+        derived_at: modified_secs(&geo_file),
+        gazetteer_at: modified_secs(&gazetteer_file),
+        sets_at: modified_secs(&sets_file),
+    });
+
+    let fingerprint = [
+        geo_file,
+        gazetteer_file,
+        sets_file,
+        geo::excluded_path(&root_buf),
+        kinds::kinds_path(&root_buf),
+    ]
+    .iter()
+    .map(|path| file_stamp(path))
+    .collect::<Vec<String>>()
+    .join("|");
+
+    Ok(GeoStatusView { fingerprint, checked_at: now_iso(), status })
 }
 
 /// Resolves a set's member hashes to real file paths so the set can be opened or handed to a viewer.
@@ -3943,6 +4069,7 @@ pub fn run() {
             get_geo_overrides,
             get_geo_set_images,
             get_geo_sets,
+            get_geo_status,
             get_geo_summary,
             get_kind_summary,
             get_nsfw_model_info,
@@ -3957,6 +4084,7 @@ pub fn run() {
             regenerate_chunk_plan,
             remove_manual_source_folder,
             rename_category,
+            repropagate_kinds,
             review_geo_sets,
             reveal_image,
             scan_library,

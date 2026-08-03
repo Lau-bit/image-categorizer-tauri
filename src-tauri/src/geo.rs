@@ -2001,6 +2001,151 @@ pub fn build_sets(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Freshness
+//
+// The Geo panel shows three vintages side by side — records, sets, and the exclusion list — written
+// at three different moments by three different actions, one of them (`.image-categorizer-geo-
+// excluded.json`) by ANOTHER APP entirely. A panel that simply paints what it last read is therefore
+// showing a mixture with nothing on screen saying so, and it fails silently in both directions:
+// coverage newer than the sets beside it, and sets still holding images excluded an hour ago.
+//
+// Exactness where it is available, ordering where it is not. "An excluded image is still a set
+// member" is an intersection and cannot be wrong; "the gazetteer was edited after the last derive"
+// is a question about write ORDER, and the files' own timestamps are the honest answer to it. No
+// fourth store is introduced for any of this — everything compared here is already on disk.
+// ---------------------------------------------------------------------------------------------
+
+/// Everything the freshness check compares, gathered by the caller so this stays a pure function.
+pub struct StatusInput<'a> {
+    /// `None` when no sets have been built yet.
+    pub sets: Option<&'a GeoSetsFile>,
+    pub excluded: &'a BTreeMap<String, GeoExclusion>,
+    /// hash -> effective scene kind: exactly the map `build_sets` filtered against.
+    pub kinds: &'a BTreeMap<String, String>,
+    pub allowed_kinds: &'a [String],
+    /// Sidecar write times in epoch seconds, `None` when the file does not exist. Only their
+    /// relative order is ever read.
+    pub derived_at: Option<u64>,
+    pub gazetteer_at: Option<u64>,
+    pub sets_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoStatus {
+    pub has_records: bool,
+    pub has_sets: bool,
+    pub sets_count: usize,
+    pub set_members: usize,
+    pub target_size: usize,
+    /// Straight out of the sets file, so the panel can date the sets independently of the records.
+    pub sets_built_at: Option<String>,
+    pub excluded_total: usize,
+    /// Hand-excluded images STILL inside a built set — proof the sets predate the exclusion.
+    pub excluded_in_sets: usize,
+    /// Members since classified as a kind sets are not allowed to draw from.
+    pub disallowed_in_sets: usize,
+    pub records_newer_than_sets: bool,
+    pub gazetteer_newer_than_records: bool,
+    /// The gazetteer holds decisions the records have never been through.
+    pub records_stale: bool,
+    /// The sets no longer match the records, exclusions or kinds they were built from.
+    pub sets_stale: bool,
+    /// One sentence per problem, each naming the button that fixes it. Empty = the files agree.
+    pub reasons: Vec<String>,
+}
+
+pub fn status(input: &StatusInput<'_>) -> GeoStatus {
+    let mut excluded_in_sets: BTreeSet<&str> = BTreeSet::new();
+    let mut disallowed_in_sets: BTreeSet<&str> = BTreeSet::new();
+    let mut set_members = 0usize;
+
+    for set in input.sets.iter().flat_map(|file| file.sets.iter()) {
+        set_members += set.members.len();
+        for hash in &set.members {
+            if input.excluded.contains_key(hash) {
+                excluded_in_sets.insert(hash.as_str());
+            }
+            // An unclassified member passes through `build_sets`, so only a member that HAS a kind
+            // and is not an allowed one counts as drift. Anything stricter would report every set
+            // as broken on a library that has never run the scene pass.
+            if let Some(kind) = input.kinds.get(hash) {
+                if !input.allowed_kinds.iter().any(|allowed| allowed == kind) {
+                    disallowed_in_sets.insert(hash.as_str());
+                }
+            }
+        }
+    }
+
+    let has_records = input.derived_at.is_some();
+    let has_sets = input.sets.is_some_and(|file| !file.sets.is_empty());
+    // Strictly greater, and `derive` writes the gazetteer just before the records: a derive can
+    // never accuse itself of leaving the gazetteer unapplied.
+    let gazetteer_newer_than_records = has_records && input.gazetteer_at > input.derived_at;
+    let records_newer_than_sets = has_sets && input.derived_at > input.sets_at;
+
+    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut reasons: Vec<String> = Vec::new();
+    if gazetteer_newer_than_records {
+        reasons.push(
+            "The gazetteer has been edited since the last derive, so the coverage below does not \
+             include those decisions yet — press Derive Geo."
+                .to_string(),
+        );
+    }
+    if records_newer_than_sets {
+        reasons.push(
+            "These sets were built from an earlier derive than the coverage beside them — press \
+             Build Country Sets to rebuild them from the current records."
+                .to_string(),
+        );
+    }
+    if !excluded_in_sets.is_empty() {
+        reasons.push(format!(
+            "{} still {} of a built set — press Build Country Sets to drop {}.",
+            count(excluded_in_sets.len(), "hand-excluded image is", "hand-excluded images are"),
+            if excluded_in_sets.len() == 1 { "a member" } else { "members" },
+            if excluded_in_sets.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    if !disallowed_in_sets.is_empty() {
+        reasons.push(format!(
+            "{} since been classified as a scene kind sets may not use (allowed: {}) — press \
+             Build Country Sets to drop {}.",
+            count(disallowed_in_sets.len(), "set member has", "set members have"),
+            if input.allowed_kinds.is_empty() {
+                "none".to_string()
+            } else {
+                input.allowed_kinds.join(", ")
+            },
+            if disallowed_in_sets.len() == 1 { "it" } else { "them" },
+        ));
+    }
+
+    GeoStatus {
+        has_records,
+        has_sets,
+        sets_count: input.sets.map(|file| file.sets.len()).unwrap_or(0),
+        set_members,
+        target_size: input.sets.map(|file| file.target_size).unwrap_or(0),
+        sets_built_at: input
+            .sets
+            .map(|file| file.generated_at.clone())
+            .filter(|value| !value.is_empty()),
+        excluded_total: input.excluded.len(),
+        excluded_in_sets: excluded_in_sets.len(),
+        disallowed_in_sets: disallowed_in_sets.len(),
+        records_newer_than_sets,
+        gazetteer_newer_than_records,
+        records_stale: gazetteer_newer_than_records,
+        sets_stale: records_newer_than_sets
+            || !excluded_in_sets.is_empty()
+            || !disallowed_in_sets.is_empty(),
+        reasons,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,5 +2526,133 @@ mod tests {
         let japan = filtered.sets.iter().find(|s| s.country == "Japan").unwrap();
         assert_eq!(japan.size, 10, "only the ten outdoor images remain");
         assert!(japan.members.iter().all(|hash| kinds[hash] == "outdoor"));
+    }
+
+    fn sets_of(members: &[&str]) -> GeoSetsFile {
+        GeoSetsFile {
+            version: GEO_SCHEMA_VERSION,
+            generated_at: "2026-08-03T12:00:00.000Z".into(),
+            target_size: 16,
+            sets: vec![GeoSet {
+                id: "country:japan:1".into(),
+                kind: "country".into(),
+                country: "Japan".into(),
+                title: "Japan".into(),
+                size: members.len(),
+                sources: members.len(),
+                max_per_source: 1,
+                quality: "diverse".into(),
+                members: members.iter().map(|hash| hash.to_string()).collect(),
+                gazetteer_fingerprint: "0".into(),
+                generated_at: "2026-08-03T12:00:00.000Z".into(),
+            }],
+        }
+    }
+
+    static EMPTY_KINDS: BTreeMap<String, String> = BTreeMap::new();
+
+    /// The everything-agrees baseline: derived at 100, gazetteer written just before it, sets built
+    /// after. Each test then overrides the one field it is about.
+    fn status_input<'a>(
+        sets: &'a GeoSetsFile,
+        excluded: &'a BTreeMap<String, GeoExclusion>,
+    ) -> StatusInput<'a> {
+        StatusInput {
+            sets: Some(sets),
+            excluded,
+            kinds: &EMPTY_KINDS,
+            allowed_kinds: &[],
+            derived_at: Some(100),
+            gazetteer_at: Some(90),
+            sets_at: Some(110),
+        }
+    }
+
+    #[test]
+    fn status_is_quiet_when_every_sidecar_agrees() {
+        let sets = sets_of(&["a", "b"]);
+        let excluded = BTreeMap::new();
+        let status = status(&status_input(&sets, &excluded));
+        assert!(!status.records_stale && !status.sets_stale);
+        assert!(status.reasons.is_empty(), "{:?}", status.reasons);
+        assert_eq!(status.set_members, 2);
+        assert_eq!(status.sets_built_at.as_deref(), Some("2026-08-03T12:00:00.000Z"));
+    }
+
+    #[test]
+    fn status_reports_an_exclusion_the_sets_predate() {
+        // The super-image-viewer case: another app wrote the exclusion while this window sat on a
+        // set list built before it. Nothing about the timestamps says so — only the intersection.
+        let sets = sets_of(&["a", "b"]);
+        let mut excluded = BTreeMap::new();
+        excluded.insert("b".to_string(), GeoExclusion::default());
+        let status = status(&status_input(&sets, &excluded));
+        assert_eq!(status.excluded_in_sets, 1);
+        assert!(status.sets_stale);
+        assert_eq!(status.reasons.len(), 1);
+        assert!(status.reasons[0].contains("1 hand-excluded image is"), "{:?}", status.reasons);
+    }
+
+    #[test]
+    fn status_reports_a_member_since_classified_out_of_bounds() {
+        let sets = sets_of(&["a", "b"]);
+        let excluded = BTreeMap::new();
+        let kinds: BTreeMap<String, String> =
+            [("b".to_string(), "person".to_string())].into_iter().collect();
+        let allowed = vec!["outdoor".to_string()];
+        let status = status(&StatusInput {
+            kinds: &kinds,
+            allowed_kinds: &allowed,
+            ..status_input(&sets, &excluded)
+        });
+        assert_eq!(status.disallowed_in_sets, 1);
+        assert!(status.sets_stale);
+        // An unclassified member is not drift: `build_sets` lets it through, so the report must too.
+        assert_eq!(status.excluded_in_sets, 0);
+    }
+
+    #[test]
+    fn status_reads_write_order_for_the_two_it_cannot_intersect() {
+        let sets = sets_of(&["a"]);
+        let excluded = BTreeMap::new();
+
+        // Gazetteer edited after the derive: the records have not been through those decisions.
+        let edited = status(&StatusInput {
+            gazetteer_at: Some(120),
+            ..status_input(&sets, &excluded)
+        });
+        assert!(edited.gazetteer_newer_than_records && edited.records_stale);
+
+        // Re-derived after the sets were built: the sets are the older half of the screen.
+        let rederived = status(&StatusInput {
+            derived_at: Some(200),
+            ..status_input(&sets, &excluded)
+        });
+        assert!(rederived.records_newer_than_sets && rederived.sets_stale);
+
+        // A derive writes the gazetteer immediately before the records, so equal stamps — the
+        // common case on a fast machine — must not accuse the derive of leaving work undone.
+        let same_second = status(&StatusInput {
+            gazetteer_at: Some(100),
+            ..status_input(&sets, &excluded)
+        });
+        assert!(!same_second.gazetteer_newer_than_records);
+    }
+
+    #[test]
+    fn status_says_nothing_before_the_first_derive() {
+        let excluded = BTreeMap::new();
+        let kinds = BTreeMap::new();
+        let status = status(&StatusInput {
+            sets: None,
+            excluded: &excluded,
+            kinds: &kinds,
+            allowed_kinds: &[],
+            derived_at: None,
+            gazetteer_at: Some(90),
+            sets_at: None,
+        });
+        assert!(!status.has_records && !status.has_sets);
+        assert!(status.reasons.is_empty(), "an empty library is not out of date");
     }
 }
