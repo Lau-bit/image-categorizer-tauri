@@ -1646,7 +1646,9 @@ const GEO_PIPELINE_STEPS = [
         // A stop is a decision, not a failure — but the parts after this would run on a
         // half-classified library, so the chain ends here rather than baking that in.
         step.state = 'stopped';
-        step.detail = state.kindProgress ? 'stopped part-way' : 'stopped';
+        // The progress handler has been writing "n / total" into this all along, and how far it got
+        // is the one thing worth keeping — `state.kindProgress` is already cleared by now.
+        step.detail = step.detail ? `stopped at ${step.detail}` : 'stopped';
         state.geoPipeline.cancelled = true;
         return;
       }
