@@ -122,11 +122,14 @@
                 <input type="checkbox" id="analyze-vision-check">
                 <span>Describe</span>
               </label>
+              <!-- Standing answer to "how much is left", updated by every scan and by ticking a
+                   box — so the size of a run is known before deciding to start one, not after. -->
+              <span id="analysis-pending" class="analysis-pending" hidden></span>
               <button
                 id="analyze-button"
                 class="button secondary"
                 type="button"
-                title="Analyze images not yet analyzed (for selected types, included folders, and included categories)"
+                title="Analyze images not yet analyzed (for selected types, included folders, and included categories). Counts how many are new and reports it before starting."
               >Analyze New</button>
               <button
                 id="reanalyze-button"

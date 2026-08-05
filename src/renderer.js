@@ -137,6 +137,7 @@ const els = {
   analyzeChunkCheck: document.getElementById('analyze-chunk-check'),
   analyzeVisionCheck: document.getElementById('analyze-vision-check'),
   analyzeNsfwCheckLabel: document.getElementById('analyze-nsfw-check-label'),
+  analysisPending: document.getElementById('analysis-pending'),
   openFolderButton: document.getElementById('open-folder-button'),
   settingsButton: document.getElementById('settings-button'),
   categoryDialog: document.getElementById('category-dialog'),
@@ -1115,6 +1116,7 @@ function render() {
   renderSidebar();
   renderHeader();
   renderNavButtons();
+  renderAnalysisPending();
   // The coverage scoreboard swaps places with the image grid rather than rendering inside it, so
   // the grid's virtual scrolling and drop handling never see any of this.
   const geoActive = state.currentView === 'geo';
@@ -3025,29 +3027,151 @@ async function runNextInQueue() {
   }
 }
 
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+// Queue order, which is also the order the breakdown reads in. The bits match `PASS_BIT_*` in
+// lib.rs — the index into the mask table the scan hands over.
+const ANALYSIS_TYPE_ORDER = ['nsfw', 'chunk', 'text', 'ocr', 'vision'];
+const ANALYSIS_PASS_BIT = { nsfw: 1, chunk: 2, text: 4, ocr: 8, vision: 16 };
+
+function selectedAnalysisTypes() {
+  const checks = {
+    nsfw: els.analyzeNsfwCheck,
+    chunk: els.analyzeChunkCheck,
+    text: els.analyzeTextCheck,
+    ocr: els.extractTextCheck,
+    vision: els.analyzeVisionCheck,
+  };
+  return ANALYSIS_TYPE_ORDER.filter(type => checks[type].checked);
+}
+
+// A UNION over the ticked passes, never a sum: an image that is new to both Explicit and Text is
+// one image to analyze. That is why the backend ships a table of per-combination counts — summing
+// per-pass totals would double-count every image more than one pass is waiting on.
+function newImageCount(types) {
+  const masks = state.library?.pending?.byPassMask;
+  if (!masks) return 0;
+  const selection = types.reduce((bits, type) => bits | ANALYSIS_PASS_BIT[type], 0);
+  return masks.reduce((sum, count, mask) => (mask & selection ? sum + count : sum), 0);
+}
+
+// Describe's number is measured against the library as it stands right now, and the passes queued
+// ahead of it change what it will see by the time it runs: Explicit scores the images Describe
+// refuses to look at unscored, and Video Dedup rebuilds the plan deciding which frames are sampled.
+// Saying so is the difference between a number that looks wrong later and one that was honest.
+function pendingCountCaveat(types) {
+  const pending = state.library?.pending;
+  if (!pending || !types.includes('vision')) return '';
+  const notes = [];
+  const unscored = pending.visionSkippedUnscored || 0;
+  if (unscored > 0) {
+    notes.push(types.includes('nsfw')
+      ? `${formatCount(unscored)} more unlock once Explicit has scored them`
+      : `${formatCount(unscored)} stay out until Explicit is run`);
+  }
+  if (types.includes('chunk')) notes.push('Video Dedup rebuilds the sample plan first');
+  if (!notes.length) return '';
+  return ` Describe's ${formatCount(newImageCount(['vision']))} is a snapshot — ${notes.join('; ')}.`;
+}
+
+function pendingBreakdown(types) {
+  return types.map(type => `${analysisTypeLabel(type)} ${formatCount(newImageCount([type]))}`).join(' · ');
+}
+
+// The standing readout in the analysis row. It answers "how many are new" for whatever is ticked
+// right now, off the last scan — no round trip, so ticking a box re-answers it instantly.
+function renderAnalysisPending() {
+  const element = els.analysisPending;
+  const pending = state.library?.pending;
+  if (!pending) {
+    element.hidden = true;
+    return;
+  }
+  element.hidden = false;
+
+  const types = selectedAnalysisTypes();
+  if (!types.length) {
+    element.textContent = 'no type ticked';
+    element.title = 'Tick an analysis type to see how many images are new to it.';
+    element.classList.add('is-clear');
+    return;
+  }
+
+  if (!pending.anyFolderIncluded) {
+    element.textContent = 'no folders included';
+    element.title = 'Every source folder is switched off for analysis, so no pass has anything to work on.';
+    element.classList.add('is-clear');
+    return;
+  }
+
+  const total = newImageCount(types);
+  element.textContent = total ? `${formatCount(total)} new` : 'nothing new';
+  element.classList.toggle('is-clear', total === 0);
+
+  // The tooltip carries what won't fit on the chip: the per-pass split, and where Describe's
+  // missing images went — "Describe 0" out of thousands usually means unscored, not done.
+  const lines = [
+    `${pendingBreakdown(types)}`,
+    `${formatCount(pending.eligibleImages)} images eligible for analysis`,
+  ];
+  if (types.includes('vision')) {
+    lines.push(
+      `Describe skips: ${formatCount(pending.visionSkippedUnscored)} not yet Explicit-analyzed, `
+      + `${formatCount(pending.visionSkippedExplicit)} explicit, `
+      + `${formatCount(pending.visionSkippedVideo)} deduped video frames, `
+      + `${formatCount(pending.visionSkippedCategory)} in omitted categories`,
+    );
+  }
+  lines.push('Counted at the last scan — press Rescan to take in files added since.');
+  element.title = lines.join('\n');
+}
+
 async function startAnalysis(force) {
   if (!state.library) {
     showToast('Choose a root folder first.');
     return;
   }
-  const wantText = els.analyzeTextCheck.checked;
-  const wantNsfw = els.analyzeNsfwCheck.checked;
-  const wantOcr = els.extractTextCheck.checked;
-  const wantChunk = els.analyzeChunkCheck.checked;
-  const wantVision = els.analyzeVisionCheck.checked;
-  if (!wantText && !wantNsfw && !wantOcr && !wantChunk && !wantVision) {
+  if (state.analyzing) return;
+
+  const types = selectedAnalysisTypes();
+  if (!types.length) {
     showToast('Select at least one analysis type.');
     return;
   }
 
+  // Only "Analyze New" has anything to say up front. "Re-analyze All" is by definition every
+  // eligible image, which is what the button already says. `byPassMask` missing means the counts
+  // never arrived, and an absent count must not be read as "nothing to do" — run and stay quiet.
+  if (!force && state.library.pending?.byPassMask) {
+    const total = newImageCount(types);
+    const breakdown = pendingBreakdown(types);
+    if (!state.library.pending?.anyFolderIncluded) {
+      const message = 'No source folders are included in analysis.';
+      setStatus(message);
+      showToast(message, { sticky: true });
+      return;
+    }
+    if (!total) {
+      // Video Dedup regroups the frames and re-samples every video even when there is no title
+      // strip left to OCR, so with it ticked the run still has real work to do.
+      if (!types.includes('chunk')) {
+        setStatus(`Nothing new to analyze — ${breakdown}.`);
+        showToast(`Nothing new to analyze: ${breakdown}.${pendingCountCaveat(types)}`, { sticky: true });
+        return;
+      }
+      setStatus('No new images — running Video Dedup to rebuild the video plan.');
+    } else {
+      const headline = `${formatCount(total)} new ${total === 1 ? 'image' : 'images'} to analyze — ${breakdown}`;
+      showToast(`${headline}.${pendingCountCaveat(types)}`, { sticky: true });
+    }
+  }
+
   // Order matters: Explicit first (Describe skips explicit images), then Video Dedup (builds the
   // sample plan Describe reads), then the text passes, and Describe last so it sees the results.
-  state.analysisQueue = [];
-  if (wantNsfw) state.analysisQueue.push({ type: 'nsfw', force });
-  if (wantChunk) state.analysisQueue.push({ type: 'chunk', force });
-  if (wantText) state.analysisQueue.push({ type: 'text', force });
-  if (wantOcr) state.analysisQueue.push({ type: 'ocr', force });
-  if (wantVision) state.analysisQueue.push({ type: 'vision', force });
+  // `types` is already in that order.
+  state.analysisQueue = types.map(type => ({ type, force }));
 
   setInteractionsLocked(true);
   await runNextInQueue();
@@ -3435,6 +3559,12 @@ function installEvents() {
   });
   els.analyzeButton.addEventListener('click', () => startAnalysis(false));
   els.reanalyzeButton.addEventListener('click', () => startAnalysis(true));
+  // Ticking a pass re-answers "how many are new" from the table the last scan already handed over,
+  // so the chip tracks the selection without a round trip.
+  for (const check of [els.analyzeNsfwCheck, els.analyzeChunkCheck, els.analyzeTextCheck,
+                       els.extractTextCheck, els.analyzeVisionCheck]) {
+    check.addEventListener('change', renderAnalysisPending);
+  }
   els.cancelAnalysisButton.addEventListener('click', cancelCurrentAnalysis);
   els.openFolderButton.addEventListener('click', openCurrentRootFolder);
   els.searchInput.addEventListener('input', () => {

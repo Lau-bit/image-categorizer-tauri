@@ -304,6 +304,55 @@ struct LibraryView {
     categories: Vec<CategoryView>,
     unclassified_count: usize,
     images: Vec<ImageView>,
+    /// How much analysis is outstanding, measured off this very scan. It rides along with the view
+    /// because the toolbar has to show it *before* anything is started, and re-deriving it on the
+    /// frontend would mean a second copy of every "already done" rule in another language.
+    pending: PendingAnalysis,
+}
+
+/// Bit per pass in `PendingAnalysis::by_pass_mask`, in queue order.
+const PASS_BIT_NSFW: usize = 1;
+const PASS_BIT_CHUNK: usize = 2;
+const PASS_BIT_TEXT: usize = 4;
+const PASS_BIT_OCR: usize = 8;
+const PASS_BIT_VISION: usize = 16;
+const PASS_MASK_COUNT: usize = 32;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingAnalysis {
+    /// How many images each COMBINATION of passes still has work on, indexed by a bitmask of
+    /// nsfw=1, chunk=2, text=4, ocr=8, vision=16; index 0 is everything nothing is waiting on.
+    ///
+    /// A 32-entry table rather than five totals because the question the toolbar answers — "how
+    /// many images would the ticked passes touch" — is a *union*, and a union cannot be recovered
+    /// from per-pass totals: an image that is new to both Explicit and Text is one image to
+    /// analyze, not two. Summing the table over the masks that intersect the selection gives the
+    /// exact answer for any of the 31 tick combinations, with no second trip to the backend.
+    by_pass_mask: Vec<usize>,
+    /// Images inside an included folder AND an included category: the pool the passes draw from.
+    eligible_images: usize,
+    /// False when the library has source folders and every one of them is switched off — which is
+    /// otherwise indistinguishable from a fully analyzed library, since both report zero pending.
+    any_folder_included: bool,
+    vision_skipped_unscored: usize,
+    vision_skipped_explicit: usize,
+    vision_skipped_video: usize,
+    vision_skipped_category: usize,
+}
+
+impl Default for PendingAnalysis {
+    fn default() -> Self {
+        Self {
+            by_pass_mask: vec![0; PASS_MASK_COUNT],
+            eligible_images: 0,
+            any_folder_included: true,
+            vision_skipped_unscored: 0,
+            vision_skipped_explicit: 0,
+            vision_skipped_video: 0,
+            vision_skipped_category: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1023,7 +1072,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     let (ocr_word_threshold, ocr_area_threshold) = ocr_thresholds(&config);
     let nsfw_score_threshold = nsfw_threshold(&config);
 
-    Ok(LibraryView {
+    let mut view = LibraryView {
         root: root.to_string_lossy().to_string(),
         source_pattern_preset: config.source_pattern_preset.clone(),
         source_pattern_regex: config.source_pattern_regex.clone(),
@@ -1034,7 +1083,14 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
         categories,
         unclassified_count,
         images: image_views,
-    })
+        pending: PendingAnalysis::default(),
+    };
+    // Measured off the scan that just happened rather than by a check of its own: every path that
+    // refreshes the library — first load, Rescan, a threshold or exclusion change, the end of a run
+    // — therefore refreshes the outstanding counts too, and they can never be from a different
+    // moment than the grid beside them.
+    view.pending = pending_analysis(&view, &config, load_chunk_plan(root).as_ref());
+    Ok(view)
 }
 
 fn launch_path(path: &Path) -> Result<(), String> {
@@ -1134,6 +1190,267 @@ fn set_source_pattern(
     scan_and_reconcile(&root)
 }
 
+// ==============================
+// Analysis selection — what "new" means
+// ==============================
+//
+// `Analyze New` counts the images it is about to work through before it starts one, so the count
+// and the pass that follows it MUST select the same images: a rule tightened in one place and not
+// the other turns the number on screen into a lie about a run that can take hours. Every pass and
+// the pre-count go through the `pending_*` functions below, and nothing else decides eligibility.
+
+/// The folder and category switches, which apply to every pass identically. Built once per call so
+/// a pass doesn't rebuild the excluded-name sets per image.
+struct AnalysisScope {
+    excluded_folders: std::collections::HashSet<String>,
+    excluded_categories: std::collections::HashSet<String>,
+}
+
+impl AnalysisScope {
+    fn new(config: &LibraryConfig) -> Self {
+        Self {
+            excluded_folders: config.excluded_analysis_folders.iter().cloned().collect(),
+            excluded_categories: excluded_analysis_categories(config),
+        }
+    }
+
+    fn folder_included(&self, image: &ImageView) -> bool {
+        !self.excluded_folders.contains(&image.source_folder)
+    }
+
+    fn category_included(&self, config: &LibraryConfig, image: &ImageView) -> bool {
+        !category_is_excluded(config, &image.hash, &self.excluded_categories)
+    }
+
+    fn includes(&self, config: &LibraryConfig, image: &ImageView) -> bool {
+        self.folder_included(image) && self.category_included(config, image)
+    }
+}
+
+/// False only when the library has source folders and every one of them is switched off. Worth
+/// saying out loud, because otherwise a fully excluded library is indistinguishable from a fully
+/// analyzed one: both report zero pending.
+fn analysis_has_included_folder(view: &LibraryView, config: &LibraryConfig) -> bool {
+    let excluded: std::collections::HashSet<&str> = config
+        .excluded_analysis_folders
+        .iter()
+        .map(String::as_str)
+        .collect();
+    view.source_folders.is_empty()
+        || view
+            .source_folders
+            .iter()
+            .any(|folder| !excluded.contains(folder.name.as_str()))
+}
+
+/// Images the OCR word-count pass still has to read. Explicit images are left alone: their score is
+/// already the classification, and running OCR over them buys nothing.
+fn pending_text<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool) -> Vec<&'a ImageView> {
+    let scope = AnalysisScope::new(config);
+    let threshold = nsfw_threshold(config);
+    view.images
+        .iter()
+        .filter(|image| scope.includes(config, image))
+        .filter(|image| {
+            config
+                .images
+                .get(&image.hash)
+                .and_then(|record| record.nsfw_score)
+                .map(|score| score < threshold)
+                .unwrap_or(true)
+        })
+        .filter(|image| {
+            force
+                || config
+                    .images
+                    .get(&image.hash)
+                    .map(|record| record.ocr_word_count.is_none())
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Images whose recognized text has not been written to the OCR text folder yet.
+fn pending_text_extraction<'a>(
+    view: &'a LibraryView,
+    config: &LibraryConfig,
+    force: bool,
+) -> Vec<&'a ImageView> {
+    let scope = AnalysisScope::new(config);
+    view.images
+        .iter()
+        .filter(|image| scope.includes(config, image))
+        .filter(|image| {
+            force
+                || config
+                    .images
+                    .get(&image.hash)
+                    .map(|record| record.ocr_text_chars.is_none())
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Images with no explicit-content score yet.
+fn pending_nsfw<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool) -> Vec<&'a ImageView> {
+    let scope = AnalysisScope::new(config);
+    view.images
+        .iter()
+        .filter(|image| scope.includes(config, image))
+        .filter(|image| {
+            force
+                || config
+                    .images
+                    .get(&image.hash)
+                    .map(|record| record.nsfw_score.is_none())
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Images whose title strip has not been OCR'd yet. A frame that was scanned and turned out not to
+/// be a video carries `Some("")`, so it is not pending either — only a missing field is.
+fn pending_chunk<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool) -> Vec<&'a ImageView> {
+    let scope = AnalysisScope::new(config);
+    view.images
+        .iter()
+        .filter(|image| scope.includes(config, image))
+        .filter(|image| {
+            force
+                || config
+                    .images
+                    .get(&image.hash)
+                    .map(|record| record.video_title.is_none())
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Why Describe's queue is so much shorter than the others — reported rather than inferred, because
+/// "3 images to describe" out of 13,000 reads as a bug until you can see where the rest went.
+#[derive(Debug, Clone, Copy, Default)]
+struct VisionSkips {
+    /// Video frames the chunk plan did not sample.
+    video: usize,
+    explicit: usize,
+    /// Not yet Explicit-analyzed. Describe refuses to look at an unscored image, so these are work
+    /// the Explicit pass unlocks rather than work that is done.
+    unscored: usize,
+    category: usize,
+}
+
+/// Images the vision model still has to describe, plus the tally of what was skipped and why.
+fn pending_vision<'a>(
+    view: &'a LibraryView,
+    config: &LibraryConfig,
+    plan: Option<&ChunkPlan>,
+    force: bool,
+) -> (Vec<&'a ImageView>, VisionSkips) {
+    let scope = AnalysisScope::new(config);
+    let threshold = nsfw_threshold(config);
+
+    // The chunk plan decides which video frames are allowed (only the sampled ones) and which
+    // hashes are video members at all (the rest are non-video and always eligible).
+    let mut selected: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut video_members: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if let Some(plan) = plan {
+        for group in &plan.groups {
+            for hash in &group.member_hashes {
+                video_members.insert(hash.as_str());
+            }
+            for hash in &group.selected_hashes {
+                selected.insert(hash.as_str());
+            }
+        }
+    }
+
+    let mut skips = VisionSkips::default();
+    let pending = view
+        .images
+        .iter()
+        .filter(|image| scope.folder_included(image))
+        .filter(|image| {
+            // Omitted categories (e.g. "High Text", already covered by OCR) never reach the
+            // vision model — this is where the token savings the user asked for come from.
+            if !scope.category_included(config, image) {
+                skips.category += 1;
+                return false;
+            }
+            true
+        })
+        .filter(|image| {
+            if video_members.contains(image.hash.as_str()) && !selected.contains(image.hash.as_str()) {
+                skips.video += 1;
+                return false;
+            }
+            true
+        })
+        .filter(|image| match config.images.get(&image.hash).and_then(|r| r.nsfw_score) {
+            Some(score) if score >= threshold => {
+                skips.explicit += 1;
+                false
+            }
+            Some(_) => true,
+            None => {
+                skips.unscored += 1;
+                false
+            }
+        })
+        .filter(|image| {
+            force
+                || config
+                    .images
+                    .get(&image.hash)
+                    .map(|record| record.vision_desc_chars.is_none())
+                    .unwrap_or(true)
+        })
+        .collect();
+
+    (pending, skips)
+}
+
+/// Tallies every pass's outstanding work in one walk of the scan that just finished, through the
+/// very same selectors the passes themselves use.
+///
+/// Each image is reduced to the bitmask of passes still waiting on it, which is what makes the
+/// toolbar's readout free: the frontend re-answers "how many for THIS tick combination" by summing
+/// the table, never by asking again.
+fn pending_analysis(view: &LibraryView, config: &LibraryConfig, plan: Option<&ChunkPlan>) -> PendingAnalysis {
+    let scope = AnalysisScope::new(config);
+    let (vision, skips) = pending_vision(view, config, plan, false);
+
+    // Keyed by relative path, which is one file: duplicates share a hash and each copy is analyzed,
+    // so a hash here would quietly merge two images' worth of work into one.
+    let sets: [(usize, std::collections::HashSet<&str>); 5] = [
+        (PASS_BIT_NSFW, pending_nsfw(view, config, false).iter().map(|i| i.relative_path.as_str()).collect()),
+        (PASS_BIT_CHUNK, pending_chunk(view, config, false).iter().map(|i| i.relative_path.as_str()).collect()),
+        (PASS_BIT_TEXT, pending_text(view, config, false).iter().map(|i| i.relative_path.as_str()).collect()),
+        (PASS_BIT_OCR, pending_text_extraction(view, config, false).iter().map(|i| i.relative_path.as_str()).collect()),
+        (PASS_BIT_VISION, vision.iter().map(|i| i.relative_path.as_str()).collect()),
+    ];
+
+    let mut by_pass_mask = vec![0usize; PASS_MASK_COUNT];
+    for image in &view.images {
+        let mut mask = 0usize;
+        for (bit, set) in &sets {
+            if set.contains(image.relative_path.as_str()) {
+                mask |= bit;
+            }
+        }
+        by_pass_mask[mask] += 1;
+    }
+
+    PendingAnalysis {
+        by_pass_mask,
+        eligible_images: view.images.iter().filter(|image| scope.includes(config, image)).count(),
+        any_folder_included: analysis_has_included_folder(view, config),
+        vision_skipped_unscored: skips.unscored,
+        vision_skipped_explicit: skips.explicit,
+        vision_skipped_video: skips.video,
+        vision_skipped_category: skips.category,
+    }
+}
+
 #[tauri::command]
 fn analyze_text(app: AppHandle, control: tauri::State<'_, AnalysisControl>, root: String, force: bool) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
@@ -1175,40 +1492,13 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
-        let excluded_folders: std::collections::HashSet<String> =
-            config.excluded_analysis_folders.iter().cloned().collect();
 
-        let excluded_categories = excluded_analysis_categories(&config);
-
-        let included_folder_exists = view
-            .source_folders
-            .iter()
-            .any(|folder| !excluded_folders.contains(&folder.name));
-        if !view.source_folders.is_empty() && !included_folder_exists {
+        if !analysis_has_included_folder(&view, &config) {
             return Ok(("completed", Some("No source folders are included in analysis.".to_string())));
         }
 
-        let pending: Vec<(String, String, String)> = view
-            .images
-            .iter()
-            .filter(|image| !excluded_folders.contains(&image.source_folder))
-            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
-            .filter(|image| {
-                config
-                    .images
-                    .get(&image.hash)
-                    .and_then(|record| record.nsfw_score)
-                    .map(|score| score < nsfw_threshold(&config))
-                    .unwrap_or(true)
-            })
-            .filter(|image| {
-                force
-                    || config
-                        .images
-                        .get(&image.hash)
-                        .map(|record| record.ocr_word_count.is_none())
-                        .unwrap_or(true)
-            })
+        let pending: Vec<(String, String, String)> = pending_text(&view, &config, force)
+            .into_iter()
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -1317,36 +1607,17 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
-        let excluded_folders: std::collections::HashSet<String> =
-            config.excluded_analysis_folders.iter().cloned().collect();
 
         let text_dir = root_buf.join(OCR_TEXT_DIR_NAME);
         fs::create_dir_all(&text_dir)
             .map_err(|error| format!("Failed to create text folder: {error}"))?;
 
-        let excluded_categories = excluded_analysis_categories(&config);
-
-        let included_folder_exists = view
-            .source_folders
-            .iter()
-            .any(|folder| !excluded_folders.contains(&folder.name));
-        if !view.source_folders.is_empty() && !included_folder_exists {
+        if !analysis_has_included_folder(&view, &config) {
             return Ok(("completed", Some("No source folders are included in extraction.".to_string())));
         }
 
-        let pending: Vec<(String, String, String)> = view
-            .images
-            .iter()
-            .filter(|image| !excluded_folders.contains(&image.source_folder))
-            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
-            .filter(|image| {
-                force
-                    || config
-                        .images
-                        .get(&image.hash)
-                        .map(|record| record.ocr_text_chars.is_none())
-                        .unwrap_or(true)
-            })
+        let pending: Vec<(String, String, String)> = pending_text_extraction(&view, &config, force)
+            .into_iter()
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -2059,23 +2330,9 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut session = create_session(&model_path)?;
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
-        let excluded_folders: std::collections::HashSet<String> =
-            config.excluded_analysis_folders.iter().cloned().collect();
-        let excluded_categories = excluded_analysis_categories(&config);
 
-        let pending: Vec<(String, String, String)> = view
-            .images
-            .iter()
-            .filter(|img| !excluded_folders.contains(&img.source_folder))
-            .filter(|img| !category_is_excluded(&config, &img.hash, &excluded_categories))
-            .filter(|img| {
-                force
-                    || config
-                        .images
-                        .get(&img.hash)
-                        .map(|r| r.nsfw_score.is_none())
-                        .unwrap_or(true)
-            })
+        let pending: Vec<(String, String, String)> = pending_nsfw(&view, &config, force)
+            .into_iter()
             .map(|img| (img.hash.clone(), img.path.clone(), img.name.clone()))
             .collect();
         drop(config);
@@ -2559,23 +2816,9 @@ fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
-        let excluded_folders: std::collections::HashSet<String> =
-            config.excluded_analysis_folders.iter().cloned().collect();
-        let excluded_categories = excluded_analysis_categories(&config);
 
-        let pending: Vec<(String, String, String)> = view
-            .images
-            .iter()
-            .filter(|image| !excluded_folders.contains(&image.source_folder))
-            .filter(|image| !category_is_excluded(&config, &image.hash, &excluded_categories))
-            .filter(|image| {
-                force
-                    || config
-                        .images
-                        .get(&image.hash)
-                        .map(|record| record.video_title.is_none())
-                        .unwrap_or(true)
-            })
+        let pending: Vec<(String, String, String)> = pending_chunk(&view, &config, force)
+            .into_iter()
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -2837,74 +3080,21 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
         let view = scan_and_reconcile(root_buf)?;
         let config = load_library_config(root_buf);
-        let threshold = nsfw_threshold(&config);
-        let excluded_folders: std::collections::HashSet<String> =
-            config.excluded_analysis_folders.iter().cloned().collect();
-        let excluded_categories = excluded_analysis_categories(&config);
-
-        // The chunk plan decides which video frames are allowed (only the sampled ones) and which
-        // hashes are video members at all (the rest are non-video and always eligible).
         let plan = load_chunk_plan(root_buf);
-        let mut selected: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut video_members: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(plan) = &plan {
-            for group in &plan.groups {
-                for hash in &group.member_hashes {
-                    video_members.insert(hash.clone());
-                }
-                for hash in &group.selected_hashes {
-                    selected.insert(hash.clone());
-                }
-            }
-        }
 
         let desc_dir = root_buf.join(VISION_DESC_DIR_NAME);
         fs::create_dir_all(&desc_dir).map_err(|error| format!("Failed to create descriptions folder: {error}"))?;
 
-        let mut skipped_video = 0usize;
-        let mut skipped_explicit = 0usize;
-        let mut skipped_unscored = 0usize;
-        let mut skipped_category = 0usize;
+        let (eligible, skips) = pending_vision(&view, &config, plan.as_ref(), force);
+        let VisionSkips {
+            video: skipped_video,
+            explicit: skipped_explicit,
+            unscored: skipped_unscored,
+            category: skipped_category,
+        } = skips;
 
-        let pending: Vec<(String, String, String, String, Option<String>)> = view
-            .images
-            .iter()
-            .filter(|image| !excluded_folders.contains(&image.source_folder))
-            .filter(|image| {
-                // Omitted categories (e.g. "High Text", already covered by OCR) never reach the
-                // vision model — this is where the token savings the user asked for come from.
-                if category_is_excluded(&config, &image.hash, &excluded_categories) {
-                    skipped_category += 1;
-                    return false;
-                }
-                true
-            })
-            .filter(|image| {
-                if video_members.contains(&image.hash) && !selected.contains(&image.hash) {
-                    skipped_video += 1;
-                    return false;
-                }
-                true
-            })
-            .filter(|image| match config.images.get(&image.hash).and_then(|r| r.nsfw_score) {
-                Some(score) if score >= threshold => {
-                    skipped_explicit += 1;
-                    false
-                }
-                Some(_) => true,
-                None => {
-                    skipped_unscored += 1;
-                    false
-                }
-            })
-            .filter(|image| {
-                force
-                    || config
-                        .images
-                        .get(&image.hash)
-                        .map(|record| record.vision_desc_chars.is_none())
-                        .unwrap_or(true)
-            })
+        let pending: Vec<(String, String, String, String, Option<String>)> = eligible
+            .into_iter()
             .map(|image| {
                 let title = config
                     .images
@@ -3750,6 +3940,344 @@ fn open_geo_gazetteer(root: String) -> Result<(), String> {
         geo::save_gazetteer(&root_buf, &geo::Gazetteer::default())?;
     }
     open_image(path.to_string_lossy().to_string())
+}
+
+// The selectors behind both `Analyze New`'s pre-count and the passes themselves. What is pinned
+// here is mostly *what does NOT count as new*: every one of these is a way the number on screen
+// could quietly disagree with the run that follows it.
+#[cfg(test)]
+mod pending_selection_tests {
+    use super::*;
+
+    fn image(hash: &str, relative_path: &str, folder: &str) -> ImageView {
+        ImageView {
+            hash: hash.to_string(),
+            path: format!("D:/library/{relative_path}"),
+            thumbnail_path: None,
+            relative_path: relative_path.to_string(),
+            name: relative_path.rsplit('/').next().unwrap_or(relative_path).to_string(),
+            source_folder: folder.to_string(),
+            size: 1,
+            modified_ms: 1,
+            category: None,
+            classified_by: None,
+            classified_at: None,
+            ocr_word_count: None,
+            ocr_text_area_ratio: None,
+            ocr_text_chars: None,
+            nsfw_score: None,
+            nsfw_labels: None,
+            video_title: None,
+            vision_desc_chars: None,
+        }
+    }
+
+    fn library_view(images: Vec<ImageView>, folders: &[&str]) -> LibraryView {
+        LibraryView {
+            root: "D:/library".to_string(),
+            source_pattern_preset: None,
+            source_pattern_regex: None,
+            ocr_word_threshold: 20,
+            ocr_area_threshold: 0.1,
+            nsfw_score_threshold: DEFAULT_NSFW_THRESHOLD,
+            source_folders: folders
+                .iter()
+                .map(|name| SourceFolderView {
+                    name: name.to_string(),
+                    relative_path: name.to_string(),
+                    is_manual: false,
+                    image_count: 0,
+                    included_in_analysis: true,
+                })
+                .collect(),
+            categories: vec![],
+            unclassified_count: 0,
+            images,
+            pending: PendingAnalysis::default(),
+        }
+    }
+
+    /// The frontend's side of the mask table: sum the buckets that intersect the ticked passes.
+    fn new_images_for(pending: &PendingAnalysis, selection: usize) -> usize {
+        pending
+            .by_pass_mask
+            .iter()
+            .enumerate()
+            .filter(|(mask, _)| mask & selection != 0)
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    fn hashes(images: &[&ImageView]) -> Vec<String> {
+        images.iter().map(|image| image.hash.clone()).collect()
+    }
+
+    #[test]
+    fn a_scanned_but_untitled_frame_is_not_pending_for_video_dedup() {
+        // `Some("")` means "we looked and there was no video marker". Treating it as pending would
+        // re-OCR the title strip of every standalone screenshot on every single run.
+        let mut config = LibraryConfig::default();
+        config.images.insert("scanned".to_string(), ImageRecord {
+            video_title: Some(String::new()),
+            ..Default::default()
+        });
+        config.images.insert("titled".to_string(), ImageRecord {
+            video_title: Some("Some Video".to_string()),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![
+                image("scanned", "2026-01/a.png", "2026-01"),
+                image("titled", "2026-01/b.png", "2026-01"),
+                image("fresh", "2026-01/c.png", "2026-01"),
+            ],
+            &["2026-01"],
+        );
+
+        assert_eq!(hashes(&pending_chunk(&view, &config, false)), vec!["fresh"]);
+        assert_eq!(pending_chunk(&view, &config, true).len(), 3, "force takes everything");
+    }
+
+    #[test]
+    fn excluded_folders_and_categories_drop_out_of_every_pass() {
+        let mut config = LibraryConfig::default();
+        config.excluded_analysis_folders = vec!["skipme".to_string()];
+        config.excluded_analysis_categories = vec!["High Text".to_string()];
+        config.images.insert("categorized".to_string(), ImageRecord {
+            category: Some("High Text".to_string()),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![
+                image("kept", "2026-01/a.png", "2026-01"),
+                image("infolder", "skipme/b.png", "skipme"),
+                image("categorized", "2026-01/c.png", "2026-01"),
+            ],
+            &["2026-01", "skipme"],
+        );
+
+        assert_eq!(hashes(&pending_text(&view, &config, false)), vec!["kept"]);
+        assert_eq!(hashes(&pending_nsfw(&view, &config, false)), vec!["kept"]);
+        assert_eq!(hashes(&pending_text_extraction(&view, &config, false)), vec!["kept"]);
+        assert_eq!(hashes(&pending_chunk(&view, &config, false)), vec!["kept"]);
+        assert!(analysis_has_included_folder(&view, &config));
+    }
+
+    #[test]
+    fn a_library_with_every_folder_excluded_is_not_the_same_as_a_finished_one() {
+        let mut config = LibraryConfig::default();
+        config.excluded_analysis_folders = vec!["2026-01".to_string()];
+        let view = library_view(vec![image("a", "2026-01/a.png", "2026-01")], &["2026-01"]);
+        assert!(!analysis_has_included_folder(&view, &config));
+
+        // A library with no source folders at all is analyzed out of the root, not excluded.
+        let rootonly = library_view(vec![image("a", "a.png", ROOT_SOURCE_FOLDER)], &[]);
+        assert!(analysis_has_included_folder(&rootonly, &LibraryConfig::default()));
+    }
+
+    #[test]
+    fn describe_reports_where_its_missing_images_went() {
+        // The four reasons Describe's queue is shorter than the library, each of which has to be
+        // countable — "3 to describe" out of thousands reads as a bug until the skips explain it.
+        let mut config = LibraryConfig::default();
+        config.excluded_analysis_categories = vec!["High Text".to_string()];
+        config.images.insert("explicit".to_string(), ImageRecord {
+            nsfw_score: Some(0.99),
+            ..Default::default()
+        });
+        config.images.insert("unsampled".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            ..Default::default()
+        });
+        config.images.insert("sampled".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            ..Default::default()
+        });
+        config.images.insert("hightext".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            category: Some("High Text".to_string()),
+            ..Default::default()
+        });
+        config.images.insert("described".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            vision_desc_chars: Some(400),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![
+                image("explicit", "2026-01/a.png", "2026-01"),
+                image("unsampled", "2026-01/b.png", "2026-01"),
+                image("sampled", "2026-01/c.png", "2026-01"),
+                image("hightext", "2026-01/d.png", "2026-01"),
+                image("described", "2026-01/e.png", "2026-01"),
+                image("unscored", "2026-01/f.png", "2026-01"),
+            ],
+            &["2026-01"],
+        );
+        let plan = ChunkPlan {
+            version: 1,
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            samples_per_group: 1,
+            groups: vec![chunker::ChunkGroup {
+                title: "Some Video".to_string(),
+                member_hashes: vec!["sampled".to_string(), "unsampled".to_string()],
+                selected_hashes: vec!["sampled".to_string()],
+            }],
+        };
+
+        let (pending, skips) = pending_vision(&view, &config, Some(&plan), false);
+        assert_eq!(hashes(&pending), vec!["sampled"]);
+        assert_eq!(skips.explicit, 1);
+        assert_eq!(skips.video, 1);
+        assert_eq!(skips.category, 1);
+        // An image nobody has scored yet is work the Explicit pass unlocks, not work that is done.
+        assert_eq!(skips.unscored, 1);
+    }
+
+    #[test]
+    fn the_mask_table_answers_a_tick_combination_as_a_union_not_a_sum() {
+        // "a" is new to Explicit and Text both; "b" only to Text. Ticking both must read as two
+        // images to analyze, not three — the whole reason the counts ship as a table of masks.
+        let mut config = LibraryConfig::default();
+        config.images.insert("a".to_string(), ImageRecord {
+            video_title: Some(String::new()),
+            ocr_text_chars: Some(0),
+            ..Default::default()
+        });
+        config.images.insert("b".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            video_title: Some(String::new()),
+            ocr_text_chars: Some(0),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![
+                image("a", "2026-01/a.png", "2026-01"),
+                image("b", "2026-01/b.png", "2026-01"),
+            ],
+            &["2026-01"],
+        );
+
+        let pending = pending_analysis(&view, &config, None);
+        assert_eq!(new_images_for(&pending, PASS_BIT_NSFW), 1);
+        assert_eq!(new_images_for(&pending, PASS_BIT_TEXT), 2);
+        assert_eq!(new_images_for(&pending, PASS_BIT_NSFW | PASS_BIT_TEXT), 2, "union, not 3");
+        assert_eq!(new_images_for(&pending, PASS_BIT_CHUNK), 0);
+        assert_eq!(pending.by_pass_mask.iter().sum::<usize>(), view.images.len(), "every image lands in exactly one bucket");
+        assert_eq!(pending.eligible_images, 2);
+    }
+
+    #[test]
+    fn the_mask_table_leaves_out_what_no_pass_would_touch() {
+        // An image in an excluded folder is in bucket 0 with the finished ones: counted as a real
+        // image, never as work. Nothing the readout adds up can include it.
+        let mut config = LibraryConfig::default();
+        config.excluded_analysis_folders = vec!["skipme".to_string()];
+        let view = library_view(
+            vec![
+                image("kept", "2026-01/a.png", "2026-01"),
+                image("dropped", "skipme/b.png", "skipme"),
+            ],
+            &["2026-01", "skipme"],
+        );
+
+        let pending = pending_analysis(&view, &config, None);
+        assert_eq!(pending.eligible_images, 1);
+        assert_eq!(new_images_for(&pending, PASS_MASK_COUNT - 1), 1, "every pass ticked still finds one");
+        assert_eq!(pending.by_pass_mask[0], 1, "the excluded image sits in the no-work bucket");
+    }
+
+    #[test]
+    fn duplicates_are_two_images_to_analyze_even_though_they_share_a_hash() {
+        // The pre-count's "new images" number is a union over passes, and it counts files: both
+        // copies of a duplicate are read, so counting by hash would under-report the run.
+        let config = LibraryConfig::default();
+        let view = library_view(
+            vec![
+                image("same", "2026-01/a.png", "2026-01"),
+                image("same", "2026-02/a.png", "2026-02"),
+            ],
+            &["2026-01", "2026-02"],
+        );
+
+        let pending = pending_nsfw(&view, &config, false);
+        assert_eq!(pending.len(), 2);
+        let files: std::collections::HashSet<&str> =
+            pending.iter().map(|image| image.relative_path.as_str()).collect();
+        assert_eq!(files.len(), 2);
+    }
+
+    /// The same selectors over a real library, printed rather than asserted. Read-only on purpose:
+    /// it reconstructs the view from the records already in the sidecar instead of scanning, so it
+    /// can be run while a pass is mid-flight — a scan would save the sidecar back and the running
+    /// pass would erase it. The cost of not scanning is that images added since the last scan are
+    /// missing and records for deleted files linger, so treat the numbers as close, not exact.
+    ///
+    /// `ICAT_LIBRARY=<root> cargo test pending_counts_against_real_library -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pending_counts_against_real_library() {
+        let Ok(root) = std::env::var("ICAT_LIBRARY") else {
+            eprintln!("set ICAT_LIBRARY to a library root");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let config = load_library_config(&root);
+        assert!(!config.images.is_empty(), "no records in {}", sidecar_path(&root).display());
+
+        let images: Vec<ImageView> = config
+            .images
+            .iter()
+            .map(|(hash, record)| {
+                let relative = record.last_known_path.clone();
+                let folder = record_source_folder(&relative).to_string();
+                let mut view = image(hash, &relative, &folder);
+                view.category = record.category.clone();
+                view.ocr_word_count = record.ocr_word_count;
+                view.ocr_text_chars = record.ocr_text_chars;
+                view.nsfw_score = record.nsfw_score;
+                view.video_title = record.video_title.clone();
+                view.vision_desc_chars = record.vision_desc_chars;
+                view
+            })
+            .collect();
+        let folders: Vec<String> = images
+            .iter()
+            .map(|image| image.source_folder.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let view = library_view(images, &folders.iter().map(String::as_str).collect::<Vec<_>>());
+        let plan = load_chunk_plan(&root);
+
+        let (vision, skips) = pending_vision(&view, &config, plan.as_ref(), false);
+        println!("{} records, folders included: {}", view.images.len(), analysis_has_included_folder(&view, &config));
+        println!("  Explicit     {}", pending_nsfw(&view, &config, false).len());
+        println!("  Video Dedup  {}", pending_chunk(&view, &config, false).len());
+        println!("  Text         {}", pending_text(&view, &config, false).len());
+        println!("  Extract Text {}", pending_text_extraction(&view, &config, false).len());
+        println!("  Describe     {}  (skipped: {} unscored, {} explicit, {} deduped frames, {} omitted categories)",
+            vision.len(), skips.unscored, skips.explicit, skips.video, skips.category);
+    }
+
+    #[test]
+    fn ocr_word_count_leaves_explicit_images_alone_but_extraction_does_not() {
+        let mut config = LibraryConfig::default();
+        config.images.insert("explicit".to_string(), ImageRecord {
+            nsfw_score: Some(0.99),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![
+                image("explicit", "2026-01/a.png", "2026-01"),
+                image("safe", "2026-01/b.png", "2026-01"),
+            ],
+            &["2026-01"],
+        );
+
+        assert_eq!(hashes(&pending_text(&view, &config, false)), vec!["safe"]);
+        assert_eq!(pending_text_extraction(&view, &config, false).len(), 2);
+    }
 }
 
 // Env-gated harness that runs the real geo derive against a real library and prints the resulting

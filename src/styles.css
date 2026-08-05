@@ -504,6 +504,35 @@ h1 {
   white-space: nowrap;
 }
 
+/* Sits between the tick boxes and the Analyze buttons because it is the thing that decides whether
+   to press one. `[hidden]` needs the explicit rule: `display: flex` here would otherwise beat the
+   user-agent `[hidden] { display: none }` and the chip would never go away. */
+.analysis-pending {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.analysis-pending[hidden] {
+  display: none;
+}
+
+/* Nothing outstanding is a resting state, not a result — it recedes instead of announcing itself. */
+.analysis-pending.is-clear {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
 .analysis-type-check {
   display: flex;
   align-items: center;
