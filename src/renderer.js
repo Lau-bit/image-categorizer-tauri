@@ -973,7 +973,6 @@ function buildImageCard(image) {
       <div class="analysis-summary"></div>
       <div class="card-controls">
         <select class="category-select"></select>
-        <button class="button compact secondary move-button" type="button">Move</button>
       </div>
       <div class="card-actions">
         <button class="button compact ghost open-button" type="button">Open</button>
@@ -1004,9 +1003,6 @@ function buildImageCard(image) {
   select.disabled = state.analyzing;
   select.addEventListener('change', () => assignCategory(image.hash, select.value || null));
 
-  const moveButton = card.querySelector('.move-button');
-  moveButton.disabled = state.analyzing;
-  moveButton.addEventListener('click', () => openMoveDialog(image));
   card.querySelector('.open-button').addEventListener('click', () => openImage(image.path));
   card.querySelector('.reveal-button').addEventListener('click', () => revealImage(image.path));
   card.addEventListener('pointerdown', event => startPointerDrag(event, card));
