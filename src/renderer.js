@@ -198,6 +198,9 @@ const els = {
   refreshVisionModelsButton: document.getElementById('refresh-vision-models-button'),
   loadVisionModelButton: document.getElementById('load-vision-model-button'),
   visionApiKeyInput: document.getElementById('vision-api-key-input'),
+  visionIdleUnloadInput: document.getElementById('vision-idle-unload-input'),
+  visionIdleMinutesInput: document.getElementById('vision-idle-minutes-input'),
+  visionIdleStatus: document.getElementById('vision-idle-status'),
   chunkPlanStatus: document.getElementById('chunk-plan-status'),
   regenerateChunkPlanButton: document.getElementById('regenerate-chunk-plan-button'),
   openChunkPlanButton: document.getElementById('open-chunk-plan-button'),
@@ -412,11 +415,14 @@ async function loadVisionAndChunkSettings() {
     els.visionEndpointInput.value = vision.endpoint || '';
     els.visionModelInput.value = vision.model || '';
     els.visionApiKeyInput.value = vision.apiKey || '';
+    els.visionIdleUnloadInput.checked = vision.idleUnload !== false;
+    els.visionIdleMinutesInput.value = vision.idleMinutes ?? 5;
   } catch {
     // non-fatal
   }
   // Fetch the model list in the background so an unreachable endpoint never delays the dialog.
   refreshVisionModels();
+  refreshVisionIdleStatus();
   try {
     state.chunkPlan = state.library?.root
       ? await window.categorizerAPI.getChunkPlan(state.library.root)
@@ -433,10 +439,63 @@ async function saveVisionSettings() {
       els.visionEndpointInput.value.trim(),
       els.visionModelInput.value.trim(),
       els.visionApiKeyInput.value.trim(),
+      els.visionIdleUnloadInput.checked,
+      Number(els.visionIdleMinutesInput.value) || 5,
     );
   } catch (error) {
     showToast(errorText(error));
   }
+  refreshVisionIdleStatus();
+}
+
+// Says whether the app is currently holding a model open, which is the one thing about the idle
+// lease a user can't infer from the settings — the rest happens inside LM Studio.
+async function refreshVisionIdleStatus() {
+  if (!els.visionIdleStatus) return;
+  try {
+    const status = await window.categorizerAPI.getVisionIdleStatus();
+    if (!status.enabled) {
+      els.visionIdleStatus.textContent = 'Off — a model this app loads stays until LM Studio’s own timeout.';
+    } else if (!status.ownedModel) {
+      els.visionIdleStatus.textContent =
+        `Idle release after ${status.idleMinutes} min. Nothing held right now — this app hasn’t loaded a model.`;
+    } else {
+      els.visionIdleStatus.textContent =
+        `Holding “${status.ownedModel}” — it will unload after ${status.idleMinutes} min with no requests from any app and no activity here.`;
+    }
+  } catch {
+    els.visionIdleStatus.textContent = '';
+  }
+}
+
+// The backend lets a model it loaded unload after a quiet spell, and "quiet" has to include the
+// user — someone sorting images between passes must not have the model pulled out from under them.
+// Only deliberate interaction counts: mousemove would make an abandoned window with the cursor
+// parked over it look busy forever. Throttled to one call a half-minute, because the backend only
+// needs this accurate to the minute.
+const APP_ACTIVITY_THROTTLE_MS = 30000;
+let lastActivityReportAt = 0;
+
+function reportAppActivity() {
+  const now = Date.now();
+  if (now - lastActivityReportAt < APP_ACTIVITY_THROTTLE_MS) return;
+  lastActivityReportAt = now;
+  window.categorizerAPI.noteAppActivity().catch(() => {});
+}
+
+function installAppActivityHeartbeat() {
+  // Capture phase, so a handler that stops propagation deeper in the app can't hide activity.
+  for (const type of ['pointerdown', 'keydown', 'wheel']) {
+    window.addEventListener(type, reportAppActivity, { passive: true, capture: true });
+  }
+  // Coming back to the window is activity too. Both are wired because neither fires reliably alone
+  // in WebView2 — the same pairing the geo panel's self-reload needs.
+  window.addEventListener('focus', reportAppActivity);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) reportAppActivity();
+  });
+  // Keep the Settings line honest when the model goes while the dialog is open.
+  window.categorizerAPI.onModelLeaseReleased(() => refreshVisionIdleStatus()).catch(() => {});
 }
 
 // Populates the model dropdown from the endpoint's /v1/models. Uses new Option(text, value) so ids
@@ -3640,6 +3699,9 @@ function installEvents() {
   });
   els.refreshVisionModelsButton.addEventListener('click', refreshVisionModels);
   els.loadVisionModelButton.addEventListener('click', loadSelectedVisionModel);
+  els.visionIdleUnloadInput.addEventListener('change', saveVisionSettings);
+  els.visionIdleMinutesInput.addEventListener('change', saveVisionSettings);
+  installAppActivityHeartbeat();
   els.toastDismiss.addEventListener('click', dismissToast);
   els.statusDismiss.addEventListener('click', clearStatus);
   els.regenerateChunkPlanButton.addEventListener('click', regenerateChunkPlan);

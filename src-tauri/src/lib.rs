@@ -38,6 +38,9 @@ use chunker::{build_plan, clean_title, ChunkPlan};
 mod vision;
 use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROMPT};
 
+mod model_lease;
+use model_lease::{IdleLeaseStatus, ModelLease};
+
 mod geo;
 
 mod kinds;
@@ -137,6 +140,11 @@ struct AppSettings {
     vision_endpoint: Option<String>,
     vision_model: Option<String>,
     vision_api_key: Option<String>,
+    // Idle lease over the model (see `model_lease`): when this app is the one that loaded the
+    // model, let it unload after `vision_idle_minutes` with no LM Studio traffic from anyone and no
+    // activity in this window. `None` on both = the defaults (on, 5 minutes).
+    vision_idle_unload: Option<bool>,
+    vision_idle_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2901,6 +2909,47 @@ fn vision_api_key(settings: &AppSettings) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Whether the idle lease is armed. On by default: an 18 GB model left resident after a run is a
+/// cost every other app on the box pays, and the lease only ever expires a load this app caused.
+fn vision_idle_unload(settings: &AppSettings) -> bool {
+    settings.vision_idle_unload.unwrap_or(true)
+}
+
+fn vision_idle_minutes(settings: &AppSettings) -> u32 {
+    settings
+        .vision_idle_minutes
+        .unwrap_or(model_lease::DEFAULT_IDLE_MINUTES)
+        .clamp(model_lease::MIN_IDLE_MINUTES, model_lease::MAX_IDLE_MINUTES)
+}
+
+/// The configured idle window, or `None` when the lease is switched off.
+fn vision_idle_window(settings: &AppSettings) -> Option<Duration> {
+    vision_idle_unload(settings).then(|| Duration::from_secs(u64::from(vision_idle_minutes(settings)) * 60))
+}
+
+/// Pushes the current setting into `vision`, which stamps it onto every outgoing request. Call
+/// after anything that can change the window — startup and each settings save.
+fn apply_idle_ttl(settings: &AppSettings) {
+    let seconds = vision_idle_window(settings).map_or(0, |window| window.as_secs() as u32);
+    vision::set_idle_ttl_secs(seconds);
+}
+
+/// The scheme+authority of the configured endpoint (`http://localhost:1234`), or `None` if it isn't
+/// shaped like a URL.
+fn endpoint_origin(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.trim().split_once("://")?;
+    let authority = rest.split('/').next().filter(|value| !value.is_empty())?;
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// LM Studio's **native** `…/api/v0/models`, which is the only endpoint that reports whether a model
+/// is actually resident (`/v1/models` lists every downloaded one). Derived from the configured chat
+/// endpoint's origin rather than a second setting, and `None` when that isn't a URL — a server that
+/// doesn't answer it simply leaves the lease unclaimed.
+fn vision_rest_models_url(settings: &AppSettings) -> Option<String> {
+    endpoint_origin(&vision_endpoint(settings)).map(|origin| format!("{origin}/api/v0/models"))
+}
+
 /// Derives the `…/v1/models` URL from the configured chat-completions endpoint, so the model picker
 /// hits the same server without needing a second setting. Strips a trailing `/chat/completions`
 /// (the usual shape) — else falls back to appending `/models` beside whatever path is configured.
@@ -2920,16 +2969,23 @@ struct VisionSettingsView {
     endpoint: String,
     model: String,
     api_key: String,
+    idle_unload: bool,
+    idle_minutes: u32,
+}
+
+fn vision_settings_view(settings: &AppSettings) -> VisionSettingsView {
+    VisionSettingsView {
+        endpoint: vision_endpoint(settings),
+        model: vision_model(settings),
+        api_key: vision_api_key(settings).unwrap_or_default(),
+        idle_unload: vision_idle_unload(settings),
+        idle_minutes: vision_idle_minutes(settings),
+    }
 }
 
 #[tauri::command]
 fn get_vision_settings(app: AppHandle) -> VisionSettingsView {
-    let settings = load_app_settings(&app);
-    VisionSettingsView {
-        endpoint: vision_endpoint(&settings),
-        model: vision_model(&settings),
-        api_key: vision_api_key(&settings).unwrap_or_default(),
-    }
+    vision_settings_view(&load_app_settings(&app))
 }
 
 #[tauri::command]
@@ -2938,17 +2994,35 @@ fn set_vision_settings(
     endpoint: String,
     model: String,
     api_key: String,
+    idle_unload: bool,
+    idle_minutes: u32,
 ) -> Result<VisionSettingsView, String> {
     let mut settings = load_app_settings(&app);
     settings.vision_endpoint = Some(endpoint.trim().to_string()).filter(|value| !value.is_empty());
     settings.vision_model = Some(model.trim().to_string()).filter(|value| !value.is_empty());
     settings.vision_api_key = Some(api_key.trim().to_string()).filter(|value| !value.is_empty());
+    settings.vision_idle_unload = Some(idle_unload);
+    settings.vision_idle_minutes = Some(idle_minutes.clamp(model_lease::MIN_IDLE_MINUTES, model_lease::MAX_IDLE_MINUTES));
     save_app_settings(&app, &settings)?;
-    Ok(VisionSettingsView {
-        endpoint: vision_endpoint(&settings),
-        model: vision_model(&settings),
-        api_key: vision_api_key(&settings).unwrap_or_default(),
-    })
+    apply_idle_ttl(&settings);
+    Ok(vision_settings_view(&settings))
+}
+
+/// Reports the idle lease for the Settings panel: whether this app is holding a load, and how long
+/// the window and the endpoint have been quiet.
+#[tauri::command]
+fn get_vision_idle_status(app: AppHandle) -> IdleLeaseStatus {
+    let settings = load_app_settings(&app);
+    app.state::<ModelLease>()
+        .status(vision_idle_unload(&settings), vision_idle_minutes(&settings))
+}
+
+/// Frontend heartbeat: the user just did something in the window. Throttled hard on the JS side —
+/// this exists to hold the model open for someone who is working in the app between passes, so it
+/// only has to be accurate to the minute.
+#[tauri::command]
+fn note_app_activity(app: AppHandle) {
+    app.state::<ModelLease>().note_app_activity();
 }
 
 /// Lists the model ids the configured vision endpoint offers, for the Settings model picker.
@@ -2974,7 +3048,11 @@ fn load_vision_model(app: AppHandle, model: String) -> Result<String, String> {
     let endpoint = vision_endpoint(&settings);
     let api_key = vision_api_key(&settings);
     let agent = build_agent();
-    warm_model(&agent, &endpoint, &model, api_key.as_deref())?;
+    // Wrapped so that if this poke is what brings the model up, the app owns that load and may let
+    // it expire; if the model was already resident it belongs to whoever loaded it.
+    model_lease::with_claim(&app, &model, || {
+        warm_model(&agent, &endpoint, &model, api_key.as_deref())
+    })?;
     Ok(format!("Model \"{model}\" is loaded and ready."))
 }
 
@@ -3141,7 +3219,10 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         // Actively load the chosen model before the first image. LM Studio JIT-loads a cold model on
         // this poke; if it can't (model not downloaded, wrong token, server down) every image would
         // fail identically, so surface that now with the server's own message instead of grinding.
-        if let Err(error) = warm_model(&agent, &endpoint, &model, api_key.as_deref()) {
+        let warmed = model_lease::with_claim(app, &model, || {
+            warm_model(&agent, &endpoint, &model, api_key.as_deref())
+        });
+        if let Err(error) = warmed {
             return Err(format!(
                 "Describe couldn't load the model \"{model}\". Pick a model that is downloaded in \
                  LM Studio (Settings → Describe → Load model), and check the endpoint and API token. \
@@ -3181,6 +3262,9 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                     last_endpoint_error = Some(error);
                 }
             }
+            // Each request re-armed the endpoint's idle countdown, so the keep-alive has nothing to
+            // do while a pass is grinding.
+            app.state::<ModelLease>().note_request();
 
             // Commit each result promptly so a stop resumes with at most the in-flight image redone.
             commit_vision_results(root_buf, &mut results)?;
@@ -3447,7 +3531,12 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
                 continue;
             }
 
-            match kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), &scenes) {
+            // Classify never warms first, so its own first batch can be the request that JIT-loads
+            // the model — claim the lease here for the same reason Describe claims it at warm-up.
+            let batch = model_lease::with_claim(app, &model, || {
+                kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), &scenes)
+            });
+            match batch {
                 Ok(labels) => {
                     for (hash, label) in hashes.iter().zip(labels) {
                         match label {
@@ -4524,10 +4613,17 @@ pub fn run() {
         .manage(ChunkControl::default())
         .manage(VisionControl::default())
         .manage(KindControl::default())
+        .manage(ModelLease::default())
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 apply_window_icon(&window);
             }
+            // Arm the idle lease before anything can send a request: the `ttl` is bound by LM Studio
+            // at load time, so a request that goes out before this is set would pin the model for
+            // the server's default hour. Headless refresh gets the watchdog too — with no window to
+            // report activity, its model is released as soon as the run stops.
+            apply_idle_ttl(&load_app_settings(&app.handle().clone()));
+            model_lease::spawn_watchdog(app.handle().clone());
             if headless_refresh {
                 let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
                 let cancel_item_id = cancel_item.id().clone();
@@ -4601,11 +4697,13 @@ pub fn run() {
             get_geo_summary,
             get_kind_summary,
             get_nsfw_model_info,
+            get_vision_idle_status,
             get_vision_settings,
             import_images,
             list_vision_models,
             load_vision_model,
             move_image,
+            note_app_activity,
             open_geo_gazetteer,
             open_image,
             open_root_folder,

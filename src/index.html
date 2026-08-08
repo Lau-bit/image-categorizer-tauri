@@ -407,6 +407,24 @@
             <input id="vision-api-key-input" class="dialog-input" type="password" autocomplete="off" placeholder="leave blank if auth is off">
           </label>
 
+          <label class="check-row">
+            <input id="vision-idle-unload-input" type="checkbox">
+            <span>Release the model when idle</span>
+          </label>
+          <p class="dialog-hint">
+            LM Studio keeps only one model in memory for the whole machine, so a model left loaded
+            after a run costs every other app on the box. When <em>this</em> app is the one that
+            loaded it, it asks LM Studio to unload it after a quiet spell — quiet meaning no
+            requests from <em>any</em> app and no activity in this window. Another app using the
+            model keeps it loaded, and a model somebody else loaded is never touched. Applies from
+            the next load: LM Studio fixes the timeout when the model comes up.
+          </p>
+          <label class="settings-stack">
+            <span class="settings-label">Idle minutes before release</span>
+            <input id="vision-idle-minutes-input" class="dialog-input" type="number" min="2" max="240" step="1">
+          </label>
+          <p class="settings-value" id="vision-idle-status"></p>
+
           <span class="settings-label">Video Chunk Plan</span>
           <p class="dialog-hint">
             "Video Dedup" reads each screenshot's title bar, groups frames from the same video, and

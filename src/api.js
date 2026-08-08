@@ -71,11 +71,18 @@ window.categorizerAPI = {
   analyzeVision: (root, force) => invoke('analyze_vision', { root, force }),
   cancelVisionAnalysis: () => invoke('cancel_vision_analysis'),
   getVisionSettings: () => invoke('get_vision_settings'),
-  setVisionSettings: (endpoint, model, apiKey) => invoke('set_vision_settings', { endpoint, model, apiKey }),
+  setVisionSettings: (endpoint, model, apiKey, idleUnload, idleMinutes) =>
+    invoke('set_vision_settings', { endpoint, model, apiKey, idleUnload, idleMinutes }),
   listVisionModels: () => invoke('list_vision_models'),
   loadVisionModel: model => invoke('load_vision_model', { model }),
   onVisionAnalysisProgress: callback => event.listen('vision-analysis-progress', message => callback(message.payload)),
   onVisionAnalysisFinished: callback => event.listen('vision-analysis-finished', message => callback(message.payload)),
+
+  // Idle lease over the local model: the app lets a model IT loaded unload after a quiet spell.
+  // `noteAppActivity` is the "someone is still working in here" heartbeat that holds it open.
+  getVisionIdleStatus: () => invoke('get_vision_idle_status'),
+  noteAppActivity: () => invoke('note_app_activity'),
+  onModelLeaseReleased: callback => event.listen('model-lease-released', message => callback(message.payload)),
 
   // Geo layer: countries derived from the vision descriptions, plus country sets built from them.
   // Purely additive — these read/write their own sidecars and never touch image categories.

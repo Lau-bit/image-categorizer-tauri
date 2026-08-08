@@ -10,6 +10,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use image::ExtendedColorType;
@@ -27,6 +28,54 @@ const JPEG_QUALITY: u8 = 82;
 /// failed the image. A ceiling only caps runaway generations; well-behaved ones stop early on their
 /// own, so raising it costs nothing on the common path while letting reasoning models finish.
 const MAX_COMPLETION_TOKENS: u32 = 4096;
+
+/// Idle TTL, in seconds, attached to every chat request this process sends — `0` sends none.
+///
+/// Process-global on purpose: it is a policy about a process-wide resource (how long a model *this
+/// process loaded* may sit resident), not a per-call argument, and threading it through six call
+/// sites would only copy one value around. `lib.rs` sets it at startup and whenever the setting
+/// changes; `model_lease` is what reasons about it.
+///
+/// **LM Studio binds `ttl` at load time.** The field takes effect only on the request that
+/// JIT-loads the model, and is ignored — the countdown merely reset — when the model is already
+/// resident. That is exactly the semantics wanted here: this app can shorten the idle life of a
+/// model it loaded, and can never shorten one another app or the GUI loaded. Verified 2026-08-07
+/// against LM Studio 0.3.x: `ttl:300` sent at an already-loaded `gemma-4-26b-a4b` left `lms ps`
+/// reporting `60m / 1h`, while the same field on a cold model came up `5m / 5m`. Any request from
+/// any client resets the countdown, so another app's traffic keeps the model alive with no
+/// coordination on this side. Servers that are not LM Studio ignore the extra field.
+static IDLE_TTL_SECS: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the `ttl` sent with every subsequent request; `0` disables it.
+pub fn set_idle_ttl_secs(seconds: u32) {
+    IDLE_TTL_SECS.store(seconds, Ordering::Relaxed);
+}
+
+pub fn idle_ttl_secs() -> u32 {
+    IDLE_TTL_SECS.load(Ordering::Relaxed)
+}
+
+/// Folds the configured idle TTL into a request body. Separate from the body builders so the
+/// behaviour is testable without an endpoint.
+fn with_idle_ttl(mut body: serde_json::Value) -> serde_json::Value {
+    let seconds = idle_ttl_secs();
+    if seconds > 0 {
+        if let Some(map) = body.as_object_mut() {
+            map.insert("ttl".to_string(), serde_json::json!(seconds));
+        }
+    }
+    body
+}
+
+/// Whether the endpoint currently holds a given model in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelState {
+    Loaded,
+    NotLoaded,
+    /// The server didn't answer, or isn't LM Studio. Only LM Studio's `/api/v0/models` reports
+    /// residency — the OpenAI-compatible `/v1/models` lists every *downloaded* model regardless.
+    Unknown,
+}
 
 /// The instruction that shapes every description. Bump `PROMPT_VERSION` in lib.rs when this changes
 /// so re-runs can be reasoned about. It deliberately asks the model to (a) read any window/app title
@@ -93,6 +142,16 @@ pub fn build_agent() -> ureq::Agent {
         .build()
 }
 
+/// A short-tempered agent for the background lease work — the residency probe and the keep-alive
+/// poke. Both run on a timer against a local server and must never wedge the watchdog for the five
+/// minutes `build_agent` is willing to wait on a real inference.
+pub fn build_probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(30))
+        .build()
+}
+
 /// Describes one image via the endpoint, returning the model's trimmed prose.
 ///
 /// `api_key`, when `Some`, is sent as an `Authorization: Bearer <key>` header — LM Studio rejects
@@ -108,7 +167,7 @@ pub fn describe_image(
 ) -> Result<String, String> {
     let data_url = image_to_jpeg_data_url(path)?;
 
-    let body = serde_json::json!({
+    let body = with_idle_ttl(serde_json::json!({
         "model": model,
         "messages": [{
             "role": "user",
@@ -120,7 +179,7 @@ pub fn describe_image(
         "max_tokens": MAX_COMPLETION_TOKENS,
         "temperature": 0.2,
         "stream": false
-    });
+    }));
     let body_str = serde_json::to_string(&body).map_err(|e| format!("Failed to build request: {e}"))?;
 
     let mut request = agent.post(endpoint).set("Content-Type", "application/json");
@@ -189,13 +248,13 @@ pub fn chat_text(
     prompt: &str,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let body = serde_json::json!({
+    let body = with_idle_ttl(serde_json::json!({
         "model": model,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": false
-    });
+    }));
     let body_str = serde_json::to_string(&body).map_err(|e| format!("Failed to build request: {e}"))?;
 
     let mut request = agent.post(endpoint).set("Content-Type", "application/json");
@@ -259,18 +318,71 @@ pub fn list_models(agent: &ureq::Agent, models_url: &str, api_key: Option<&str>)
     Ok(ids)
 }
 
+/// Reports whether `model` is currently resident at the endpoint.
+///
+/// `rest_models_url` is LM Studio's **native** `…/api/v0/models` (not the OpenAI-compatible
+/// `/v1/models`, which lists every downloaded model with no residency field). This is what lets the
+/// app tell "my request is about to load this model" from "somebody else already had it loaded" —
+/// the difference between owning the load and borrowing it.
+///
+/// Never returns an error: a probe is advisory, and an unreachable or non-LM-Studio server just
+/// means the app claims nothing and leaves the model alone.
+pub fn model_state(
+    agent: &ureq::Agent,
+    rest_models_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> ModelState {
+    let mut request = agent.get(rest_models_url);
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        request = request.set("Authorization", &format!("Bearer {key}"));
+    }
+    let Ok(response) = request.call() else {
+        return ModelState::Unknown;
+    };
+    let Ok(text) = response.into_string() else {
+        return ModelState::Unknown;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return ModelState::Unknown;
+    };
+    let Some(entries) = json["data"].as_array() else {
+        return ModelState::Unknown;
+    };
+    parse_model_state(entries, model)
+}
+
+/// The residency decision, split out from the HTTP so the id-matching rules are testable.
+fn parse_model_state(entries: &[serde_json::Value], model: &str) -> ModelState {
+    for entry in entries {
+        if entry["id"].as_str() != Some(model) {
+            continue;
+        }
+        return match entry["state"].as_str() {
+            Some("loaded") => ModelState::Loaded,
+            Some("not-loaded") => ModelState::NotLoaded,
+            // Any transitional state ("loading", …) means somebody else's load may already be in
+            // flight. Unknown claims nothing — mistaking another app's load for ours is the one
+            // error worth being conservative about, and the cost is only a missed idle window.
+            _ => ModelState::Unknown,
+        };
+    }
+    // The server answered and doesn't list that id at all, so it cannot be resident.
+    ModelState::NotLoaded
+}
+
 /// Actively loads `model` by sending a tiny 1-token completion — LM Studio JIT-loads a cold model on
 /// the first request and answers instantly if it is already warm. This is how the app *loads* the
 /// picked model instead of failing the whole run against an empty server. Returns `Ok` once the
 /// model responds; the read timeout is generous because a cold load can take a while.
 pub fn warm_model(agent: &ureq::Agent, endpoint: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
-    let body = serde_json::json!({
+    let body = with_idle_ttl(serde_json::json!({
         "model": model,
         "messages": [{ "role": "user", "content": "ok" }],
         "max_tokens": 1,
         "temperature": 0.0,
         "stream": false
-    });
+    }));
     let body_str = serde_json::to_string(&body).map_err(|e| format!("Failed to build request: {e}"))?;
 
     let mut request = agent.post(endpoint).set("Content-Type", "application/json");
@@ -312,6 +424,51 @@ mod tests {
             }
             Err(error) => panic!("live describe failed: {error}"),
         }
+    }
+
+    // The idle-TTL knob is a process-wide static, so these two run under one lock and restore it —
+    // otherwise `cargo test`'s thread pool has them clobbering each other (and the body assertions
+    // in other tests) at random.
+    static TTL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn idle_ttl_is_folded_into_the_body_only_when_set() {
+        let _guard = TTL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = idle_ttl_secs();
+
+        set_idle_ttl_secs(0);
+        let plain = with_idle_ttl(serde_json::json!({ "model": "m", "max_tokens": 1 }));
+        assert!(plain.get("ttl").is_none(), "no ttl must be sent when the feature is off");
+
+        set_idle_ttl_secs(300);
+        let leased = with_idle_ttl(serde_json::json!({ "model": "m", "max_tokens": 1 }));
+        assert_eq!(leased["ttl"], serde_json::json!(300));
+        // The rest of the body must survive untouched — the ttl is an addition, not a rewrite.
+        assert_eq!(leased["model"], serde_json::json!("m"));
+        assert_eq!(leased["max_tokens"], serde_json::json!(1));
+
+        set_idle_ttl_secs(previous);
+    }
+
+    // Residency is what decides whether this app owns a load, so the id/state matching is pinned
+    // against LM Studio's real `/api/v0/models` shape (captured 2026-08-07).
+    #[test]
+    fn model_state_reads_lm_studio_residency() {
+        let entries = serde_json::json!([
+            { "id": "google/gemma-4-26b-a4b", "state": "loaded", "type": "vlm" },
+            { "id": "google/gemma-4-12b", "state": "not-loaded", "type": "vlm" },
+            { "id": "somebody/loading-right-now", "state": "loading", "type": "vlm" },
+            { "id": "no/state-field", "type": "vlm" }
+        ]);
+        let entries = entries.as_array().unwrap();
+
+        assert_eq!(parse_model_state(entries, "google/gemma-4-26b-a4b"), ModelState::Loaded);
+        assert_eq!(parse_model_state(entries, "google/gemma-4-12b"), ModelState::NotLoaded);
+        // Transitional and missing states claim nothing.
+        assert_eq!(parse_model_state(entries, "somebody/loading-right-now"), ModelState::Unknown);
+        assert_eq!(parse_model_state(entries, "no/state-field"), ModelState::Unknown);
+        // A model the server has never heard of cannot be resident.
+        assert_eq!(parse_model_state(entries, "who/knows"), ModelState::NotLoaded);
     }
 
     // The whole vision *request* is built without the LLM — if base64 is wrong the model just gets
