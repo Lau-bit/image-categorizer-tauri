@@ -14,8 +14,27 @@ if (!invoke || !dialog || !convertFileSrc || !event || !tauriWindow) {
 
 const IMPORT_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'heic', 'heif'];
 
+const currentWindow = () => tauriWindow?.getCurrentWindow?.();
+
 window.categorizerAPI = {
-  showWindow: () => tauriWindow?.getCurrentWindow?.()?.show?.(),
+  showWindow: () => currentWindow()?.show?.(),
+
+  // The window is undecorated, so the in-page title bar drives these itself. Dragging and
+  // double-click-to-maximize are handled by Tauri's own drag-region script, not from here.
+  minimizeWindow: () => currentWindow()?.minimize?.(),
+  toggleMaximizeWindow: () => currentWindow()?.toggleMaximize?.(),
+  closeWindow: () => currentWindow()?.close?.(),
+  isWindowMaximized: () => currentWindow()?.isMaximized?.() ?? Promise.resolve(false),
+  onWindowResized: callback => currentWindow()?.onResized?.(() => callback()),
+  // Hands the press to the OS, which then runs its own resize loop — no setSize-per-mousemove, so
+  // snapping and the window's minimum size keep working. Direction is a tao ResizeDirection name.
+  startResizeDragging: direction => currentWindow()?.startResizeDragging?.(direction),
+
+  // Where the window opens: a default the user stamps by hand from Settings, never tracked
+  // automatically (see `save_window_defaults` in lib.rs for why).
+  getWindowDefaults: () => invoke('get_window_defaults'),
+  saveWindowDefaults: () => invoke('save_window_defaults'),
+  clearWindowDefaults: () => invoke('clear_window_defaults'),
 
   getSettings: () => invoke('get_app_settings'),
   setTileSize: tileSize => invoke('set_tile_size', { tileSize }),
@@ -43,10 +62,33 @@ window.categorizerAPI = {
   onTextAnalysisFinished: callback => event.listen('text-analysis-finished', message => callback(message.payload)),
 
   // OCR text extraction (saves recognized text to a sidecar folder)
-  extractText: (root, force) => invoke('extract_text', { root, force }),
+  // `indexedOnly` narrows a run to the categories the text index covers. The Analyze row passes
+  // false (extract everything outstanding); the Extracted Text panel passes true, so the count it
+  // offered is exactly the work that runs.
+  extractText: (root, force, indexedOnly = false) =>
+    invoke('extract_text', { root, force, indexedOnly }),
   cancelTextExtraction: () => invoke('cancel_text_extraction'),
   onTextExtractionProgress: callback => event.listen('text-extraction-progress', message => callback(message.payload)),
   onTextExtractionFinished: callback => event.listen('text-extraction-finished', message => callback(message.payload)),
+
+  // Extracted-text search. The same index `icat` reads from a terminal — the panel is one of two
+  // front ends, not the source of truth. `getTextStatus` deliberately never builds: opening the
+  // panel must not start work.
+  getTextStatus: root => invoke('get_text_status', { root }),
+  buildTextIndex: root => invoke('build_text_index', { root }),
+  searchText: (root, args, snippetWidth = 300) => invoke('search_text', { root, args, snippetWidth }),
+  getTextTimeline: (root, args, bucketHours) => invoke('get_text_timeline', { root, args, bucketHours }),
+  getImageText: (root, hash) => invoke('get_image_text', { root, hash }),
+  categorizeImages: (root, hashes, category) => invoke('categorize_images', { root, hashes, category }),
+  setTextIndexFolderIncluded: (root, folderName, included) =>
+    invoke('set_text_index_folder_included', { root, folderName, included }),
+
+  // Topic layer: one local-LLM call per time bucket, never per image. Nothing here runs by itself.
+  getTopicStatus: (root, bucketHours) => invoke('get_topic_status', { root, bucketHours }),
+  generateTopics: (root, bucketHours, force) => invoke('generate_topics', { root, bucketHours, force }),
+  cancelTopics: () => invoke('cancel_topics'),
+  onTopicsProgress: callback => event.listen('topics-progress', message => callback(message.payload)),
+  onTopicsFinished: callback => event.listen('topics-finished', message => callback(message.payload)),
 
   // NSFW (explicit content) analysis
   analyzeNsfw: (root, force) => invoke('analyze_nsfw', { root, force }),

@@ -16,8 +16,8 @@
         "height": 696,
         "minWidth": 400,
         "minHeight": 440,
-        "decorations": true,
-        "backgroundColor": "#101114",
+        "decorations": false,
+        "backgroundColor": "#121212",
         "resizable": true,
         "visible": false
       }

@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, WebviewWindow,
 };
 use tauri_plugin_notification::NotificationExt;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS};
@@ -46,6 +46,13 @@ mod geo;
 mod kinds;
 
 mod review;
+
+// Public because `src/bin/icat.rs` — the agent-facing CLI — links this crate as a library and needs
+// to reach `text_cli::run`. The rest of the app treats them like any other module.
+pub mod redact;
+pub mod text_cli;
+pub mod text_index;
+pub mod topics;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "heic", "heif"];
 const SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
@@ -145,6 +152,25 @@ struct AppSettings {
     // activity in this window. `None` on both = the defaults (on, 5 minutes).
     vision_idle_unload: Option<bool>,
     vision_idle_minutes: Option<u32>,
+    // Where the window opens, saved by hand from Settings rather than tracked on every move: the
+    // point is a chosen default, so a stray resize before closing must not overwrite it. `None` =
+    // no preference, i.e. the size in tauri.conf.json wherever Windows decides to put it.
+    window_bounds: Option<WindowBounds>,
+    // Saved while the window was maximized. The bounds are kept alongside it (the size to come back
+    // to when it is restored down), which is why this is a flag and not a third variant.
+    #[serde(default)]
+    window_maximized: bool,
+}
+
+/// A saved window rect in LOGICAL pixels. Physical pixels are DPI-dependent, so a rect saved on a
+/// 150%-scaled monitor would reopen at the wrong visual size on a 100% one.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -205,6 +231,15 @@ struct LibraryConfig {
     excluded_analysis_folders: Vec<String>,
     #[serde(default)]
     excluded_analysis_categories: Vec<String>,
+    // Which categories the text index covers. `None` means the default (High Text alone) — the pool
+    // the extraction pass is actually aimed at. Stored rather than hardcoded so widening it is a
+    // config edit, but left unset by default so the honest default is visible in code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_index_categories: Option<Vec<String>>,
+    // Source folders kept OUT of the text index. A denylist rather than an allowlist: everything
+    // already in the library is indexed, and opting a folder out is the rare case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    text_index_excluded_folders: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +257,18 @@ struct AppSettingsView {
 struct KnownRootView {
     path: String,
     exists: bool,
+}
+
+/// Both halves of the Settings row: what is stored, and what the window is doing right now — so the
+/// panel can say "this is what you would be saving" without the frontend measuring the window
+/// itself (the webview knows its own viewport, not the window's outer rect on the desktop).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowDefaultsView {
+    saved: Option<WindowBounds>,
+    saved_maximized: bool,
+    current: Option<WindowBounds>,
+    current_maximized: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,6 +456,12 @@ struct VisionControl {
 }
 
 #[derive(Default)]
+struct TopicControl {
+    running: AtomicBool,
+    cancel: AtomicBool,
+}
+
+#[derive(Default)]
 struct KindControl {
     running: AtomicBool,
     cancel: AtomicBool,
@@ -471,6 +524,151 @@ fn app_settings_view(app: &AppHandle) -> AppSettingsView {
         dark_mode: settings.dark_mode.unwrap_or(true),
         known_roots,
     }
+}
+
+// ==============================
+// Saved window geometry
+//
+// Deliberate, not automatic: "Save Current Position & Size" in Settings stamps the window's current
+// rect as the one every launch opens at. Nothing writes it on close, so nudging the window around
+// during a session — or closing it maximized — can never quietly replace the default that was
+// chosen on purpose.
+// ==============================
+
+fn window_bounds_of(window: &WebviewWindow) -> Result<WindowBounds, String> {
+    let scale = window
+        .scale_factor()
+        .map_err(|error| format!("Failed to read the window scale factor: {error}"))?;
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("Failed to read the window position: {error}"))?;
+    let size = window
+        .inner_size()
+        .map_err(|error| format!("Failed to read the window size: {error}"))?;
+    Ok(WindowBounds {
+        x: (f64::from(position.x) / scale).round() as i32,
+        y: (f64::from(position.y) / scale).round() as i32,
+        width: (f64::from(size.width) / scale).round() as u32,
+        height: (f64::from(size.height) / scale).round() as u32,
+    })
+}
+
+/// Position → size → position. The first move lands the window on its target monitor so the size is
+/// resolved at *that* monitor's scale factor; applying the size can then nudge the window, so the
+/// position is re-applied afterwards.
+fn apply_window_bounds(window: &WebviewWindow, bounds: &WindowBounds) -> Result<(), String> {
+    if bounds.width == 0 || bounds.height == 0 {
+        return Ok(());
+    }
+    let position = Position::Logical(LogicalPosition {
+        x: f64::from(bounds.x),
+        y: f64::from(bounds.y),
+    });
+    window
+        .set_position(position.clone())
+        .map_err(|error| format!("Failed to move the window: {error}"))?;
+    window
+        .set_size(Size::Logical(LogicalSize {
+            width: f64::from(bounds.width),
+            height: f64::from(bounds.height),
+        }))
+        .map_err(|error| format!("Failed to size the window: {error}"))?;
+    window
+        .set_position(position)
+        .map_err(|error| format!("Failed to move the window: {error}"))
+}
+
+/// A saved rect can point at a monitor that is no longer attached — and this window is unhidden by
+/// the frontend, so an off-screen restore would look exactly like a hung app. Measured in PHYSICAL
+/// pixels because that is the one coordinate space every monitor shares; a "logical virtual desktop"
+/// does not exist on a mixed-DPI desk.
+fn window_is_reachable(window: &WebviewWindow) -> bool {
+    const MIN_VISIBLE_WIDTH: i32 = 120;
+    const MIN_VISIBLE_HEIGHT: i32 = 32;
+
+    let (Ok(position), Ok(size), Ok(monitors)) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.available_monitors(),
+    ) else {
+        return true; // Can't tell — leave the window where the user asked for it.
+    };
+    let (left, top) = (position.x, position.y);
+    let (right, bottom) = (left + size.width as i32, top + size.height as i32);
+    monitors.iter().any(|monitor| {
+        let origin = monitor.position();
+        let extent = monitor.size();
+        let overlap_x = right.min(origin.x + extent.width as i32) - left.max(origin.x);
+        let overlap_y = bottom.min(origin.y + extent.height as i32) - top.max(origin.y);
+        overlap_x >= MIN_VISIBLE_WIDTH && overlap_y >= MIN_VISIBLE_HEIGHT
+    })
+}
+
+fn restore_saved_window_bounds(window: &WebviewWindow, settings: &AppSettings) {
+    let Some(bounds) = settings.window_bounds else {
+        return;
+    };
+    if apply_window_bounds(window, &bounds).is_err() {
+        return;
+    }
+    if !window_is_reachable(window) {
+        let _ = window.center();
+    }
+    if settings.window_maximized {
+        let _ = window.maximize();
+    }
+}
+
+fn window_defaults_view(app: &AppHandle, window: Option<&WebviewWindow>) -> WindowDefaultsView {
+    let settings = load_app_settings(app);
+    let current = window.and_then(|window| window_bounds_of(window).ok());
+    WindowDefaultsView {
+        saved: settings.window_bounds,
+        saved_maximized: settings.window_maximized,
+        current,
+        current_maximized: window
+            .and_then(|window| window.is_maximized().ok())
+            .unwrap_or(false),
+    }
+}
+
+#[tauri::command]
+fn get_window_defaults(app: AppHandle, window: WebviewWindow) -> WindowDefaultsView {
+    window_defaults_view(&app, Some(&window))
+}
+
+#[tauri::command]
+fn save_window_defaults(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<WindowDefaultsView, String> {
+    let maximized = window.is_maximized().unwrap_or(false);
+    let mut settings = load_app_settings(&app);
+    // A minimized window reports a junk rect, and a maximized one reports the whole screen — neither
+    // is the size to come back to, so in both cases the previously saved rect is kept and only the
+    // maximized flag moves. With nothing saved yet, the current rect is still better than nothing.
+    let usable = !maximized && !window.is_minimized().unwrap_or(false);
+    if usable || settings.window_bounds.is_none() {
+        let bounds = window_bounds_of(&window)?;
+        if bounds.width > 0 && bounds.height > 0 {
+            settings.window_bounds = Some(bounds);
+        }
+    }
+    settings.window_maximized = maximized;
+    save_app_settings(&app, &settings)?;
+    Ok(window_defaults_view(&app, Some(&window)))
+}
+
+#[tauri::command]
+fn clear_window_defaults(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<WindowDefaultsView, String> {
+    let mut settings = load_app_settings(&app);
+    settings.window_bounds = None;
+    settings.window_maximized = false;
+    save_app_settings(&app, &settings)?;
+    Ok(window_defaults_view(&app, Some(&window)))
 }
 
 fn remember_known_root(settings: &mut AppSettings, root: &str) {
@@ -1574,7 +1772,13 @@ fn set_text_thresholds(root: String, word_threshold: u32, area_threshold: f32) -
 }
 
 #[tauri::command]
-fn extract_text(app: AppHandle, control: tauri::State<'_, OcrTextControl>, root: String, force: bool) -> Result<(), String> {
+fn extract_text(
+    app: AppHandle,
+    control: tauri::State<'_, OcrTextControl>,
+    root: String,
+    force: bool,
+    indexed_only: bool,
+) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("Text extraction is already running.".to_string());
     }
@@ -1590,7 +1794,7 @@ fn extract_text(app: AppHandle, control: tauri::State<'_, OcrTextControl>, root:
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
-        run_text_extraction(&app_handle, &root_buf, force);
+        run_text_extraction(&app_handle, &root_buf, force, indexed_only);
     });
 
     Ok(())
@@ -1609,7 +1813,12 @@ fn cancel_text_extraction(control: tauri::State<'_, OcrTextControl>) -> Result<(
 // touches the images present at scan time, skips already-extracted images unless `force`, honours
 // excluded folders, and reports progress through the `text-extraction-*` events. Each image's
 // recognized text is written to `<root>/.image-categorizer-ocr-text/<hash>.txt`.
-fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
+//
+// `indexed_only` narrows the run to the categories the text index covers. The Analyze row passes
+// false — it means "extract everything outstanding" and always has. The Extracted Text panel passes
+// true, because the number it offers to act on is a High Text number: running the other 783 images
+// as well would do work the panel never mentioned and finish reporting a count nobody asked about.
+fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_only: bool) {
     let control = app.state::<OcrTextControl>();
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
@@ -1624,8 +1833,17 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool) {
             return Ok(("completed", Some("No source folders are included in extraction.".to_string())));
         }
 
+        let categories = indexed_categories(&config);
         let pending: Vec<(String, String, String)> = pending_text_extraction(&view, &config, force)
             .into_iter()
+            .filter(|image| {
+                !indexed_only
+                    || image
+                        .category
+                        .as_ref()
+                        .map(|category| categories.contains(category))
+                        .unwrap_or(false)
+            })
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -1708,6 +1926,742 @@ fn add_manual_source_folder(root: String, folder_path: String) -> Result<Library
         save_library_config(&root, &config)?;
     }
     scan_and_reconcile(&root)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extracted text: index scope, freshness, and the panel's commands.
+//
+// The scope rules live here rather than in `text_cli` so the panel and the CLI cannot drift apart
+// about what "in the index" means — there is one answer to that question and both callers read it.
+// ---------------------------------------------------------------------------------------------
+
+fn text_dir_path(root: &Path) -> PathBuf {
+    root.join(OCR_TEXT_DIR_NAME)
+}
+
+fn indexed_categories(config: &LibraryConfig) -> Vec<String> {
+    config
+        .text_index_categories
+        .clone()
+        .filter(|list| !list.is_empty())
+        .unwrap_or_else(|| vec![text_index::DEFAULT_TEXT_CATEGORY.to_string()])
+}
+
+/// The index's source list, read straight off the stored records rather than a filesystem scan. A
+/// search must not pay for a rescan: the records already hold the path, category and mtime the
+/// index needs, and a file that moved since the last scan still has its text under the same hash.
+fn text_index_sources(config: &LibraryConfig) -> Vec<text_index::SourceDoc> {
+    let excluded: Vec<&str> = config
+        .text_index_excluded_folders
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    config
+        .images
+        .iter()
+        .filter_map(|(hash, record)| {
+            let relative = record.last_known_path.replace('\\', "/");
+            let (folder, name) = match relative.rsplit_once('/') {
+                Some((parent, name)) => (
+                    parent.split('/').next().unwrap_or(ROOT_SOURCE_FOLDER).to_string(),
+                    name.to_string(),
+                ),
+                None => (ROOT_SOURCE_FOLDER.to_string(), relative.clone()),
+            };
+            if excluded.contains(&folder.as_str()) {
+                return None;
+            }
+            Some(text_index::SourceDoc {
+                hash: hash.clone(),
+                relative_path: relative,
+                name,
+                folder,
+                category: record.category.clone().unwrap_or_default(),
+                modified_ms: record.modified_ms.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn file_modified_ms(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+/// Why the index is out of date, or `None` when it is current. Answered from write ORDER — file
+/// mtimes — rather than by re-reading the 2.2 MB records file, so it is cheap enough to run on
+/// every query and on window focus. Same technique as `geo::status`, and the same trap: the
+/// comparison must be strictly greater-than, because a build writes the index moments after
+/// reading the sidecar and `>=` would make every build immediately accuse itself of being stale.
+fn text_index_staleness(root: &Path, index: &text_index::TextIndex) -> Option<String> {
+    if file_modified_ms(&root.join(SIDECAR_FILE_NAME))
+        .map(|ms| ms > index.built_at_ms)
+        .unwrap_or(false)
+    {
+        return Some("the library sidecar changed since the index was built".to_string());
+    }
+    if file_modified_ms(&text_dir_path(root))
+        .map(|ms| ms > index.built_at_ms)
+        .unwrap_or(false)
+    {
+        return Some("new text was extracted since the index was built".to_string());
+    }
+    None
+}
+
+fn build_text_index_for(root: &Path, config: &LibraryConfig) -> text_index::TextIndex {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    text_index::build(
+        &text_index_sources(config),
+        &text_dir_path(root),
+        &indexed_categories(config),
+        now_ms,
+        &now_iso(),
+    )
+}
+
+/// The parsed index, kept in memory between commands. Reparsing a multi-megabyte postings table on
+/// every keystroke in the search box would make the panel feel broken; the cache is keyed by root
+/// so switching libraries cannot serve the wrong one.
+#[derive(Default)]
+struct TextIndexCache {
+    inner: std::sync::Mutex<Option<(PathBuf, text_index::TextIndex)>>,
+}
+
+/// Loads the index, building it when missing or stale. Building is allowed unprompted — it is
+/// derived wholly from files already on disk. Running OCR is NOT, and never happens here: an
+/// implicit extraction is thousands of model-free but minutes-long OCR calls nobody asked for.
+fn text_index_for(root: &Path, cache: &TextIndexCache) -> Result<text_index::TextIndex, String> {
+    if let Ok(guard) = cache.inner.lock() {
+        if let Some((cached_root, index)) = guard.as_ref() {
+            if cached_root == root && text_index_staleness(root, index).is_none() {
+                return Ok(index.clone());
+            }
+        }
+    }
+
+    let existing = text_index::load(root);
+    let fresh = match &existing {
+        Some(index) if text_index_staleness(root, index).is_none() => existing.clone(),
+        _ => None,
+    };
+
+    let index = match fresh {
+        Some(index) => index,
+        None => {
+            let config = load_library_config(root);
+            let built = build_text_index_for(root, &config);
+            text_index::save(root, &built)?;
+            built
+        }
+    };
+
+    if let Ok(mut guard) = cache.inner.lock() {
+        *guard = Some((root.to_path_buf(), index.clone()));
+    }
+    Ok(index)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextStatusView {
+    /// Images in an indexed category, and how many of those have had their text extracted. This is
+    /// shown quietly: a fragmented screenshot corpus is *meant* to have holes, so coverage is a
+    /// fact to have available, not a target to chase.
+    in_scope: usize,
+    extracted: usize,
+    pending: usize,
+    /// How many of `pending` an extraction run could actually reach. The analysis scope
+    /// (`excludedAnalysisCategories` / `excludedAnalysisFolders`) is a separate axis from what the
+    /// index covers, and on a real library they disagree: this one excludes **High Text** from
+    /// analysis, which is precisely the category the index is built from. Counting coverage one way
+    /// and acting another is how a button offers 5,265 images and then quietly does nothing — so
+    /// both numbers are reported and the panel says which is which.
+    reachable_pending: usize,
+    /// Indexed categories switched off for analysis, and excluded folders holding pending images.
+    /// Named rather than counted, because the fix is to name one and turn it back on.
+    blocked_categories: Vec<String>,
+    blocked_folders: Vec<String>,
+    categories: Vec<String>,
+    excluded_folders: Vec<String>,
+    docs: usize,
+    terms: usize,
+    groups: usize,
+    exact_dupes: usize,
+    near_dupes: usize,
+    total_chars: u64,
+    built_at: Option<String>,
+    stale_reason: Option<String>,
+    span_from: Option<String>,
+    span_to: Option<String>,
+}
+
+#[tauri::command]
+fn get_text_status(root: String, cache: tauri::State<'_, TextIndexCache>) -> Result<TextStatusView, String> {
+    let root = root_path(&root)?;
+    let config = load_library_config(&root);
+    let categories = indexed_categories(&config);
+
+    // Mirrors `AnalysisScope` deliberately, off the stored records rather than a scan — the panel
+    // must not pay for a rescan to answer "how much of this could I actually run".
+    let excluded_categories = excluded_analysis_categories(&config);
+    let excluded_folders: std::collections::HashSet<&str> = config
+        .excluded_analysis_folders
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut in_scope = 0usize;
+    let mut extracted = 0usize;
+    let mut reachable_pending = 0usize;
+    let mut blocked_folders: std::collections::BTreeSet<String> = Default::default();
+
+    for record in config.images.values() {
+        let category = record.category.clone().unwrap_or_default();
+        if !categories.contains(&category) {
+            continue;
+        }
+        in_scope += 1;
+        if record.ocr_text_chars.is_some() {
+            extracted += 1;
+            continue;
+        }
+
+        let relative = record.last_known_path.replace('\\', "/");
+        let folder = match relative.rsplit_once('/') {
+            Some((parent, _)) => parent.split('/').next().unwrap_or(ROOT_SOURCE_FOLDER).to_string(),
+            None => ROOT_SOURCE_FOLDER.to_string(),
+        };
+        if excluded_categories.contains(category.as_str()) {
+            continue;
+        }
+        if excluded_folders.contains(folder.as_str()) {
+            blocked_folders.insert(folder);
+            continue;
+        }
+        reachable_pending += 1;
+    }
+
+    let blocked_categories: Vec<String> = categories
+        .iter()
+        .filter(|category| excluded_categories.contains(category.as_str()))
+        .cloned()
+        .collect();
+
+    // Deliberately does NOT build: opening the panel should never kick off work. The panel shows
+    // what exists and offers the button.
+    let index = {
+        let cached = cache
+            .inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().filter(|(path, _)| path == &root).map(|(_, index)| index.clone()));
+        cached.or_else(|| text_index::load(&root))
+    };
+    let stale_reason = index.as_ref().and_then(|index| text_index_staleness(&root, index));
+    let span = index.as_ref().and_then(|index| index.span());
+
+    Ok(TextStatusView {
+        in_scope,
+        extracted,
+        pending: in_scope.saturating_sub(extracted),
+        reachable_pending,
+        blocked_categories,
+        blocked_folders: blocked_folders.into_iter().collect(),
+        categories,
+        excluded_folders: config.text_index_excluded_folders.clone(),
+        docs: index.as_ref().map(|index| index.report.docs).unwrap_or(0),
+        terms: index.as_ref().map(|index| index.report.terms).unwrap_or(0),
+        groups: index.as_ref().map(|index| index.report.groups).unwrap_or(0),
+        exact_dupes: index.as_ref().map(|index| index.report.exact_dupes).unwrap_or(0),
+        near_dupes: index.as_ref().map(|index| index.report.near_dupes).unwrap_or(0),
+        total_chars: index.as_ref().map(|index| index.total_chars).unwrap_or(0),
+        built_at: index.as_ref().map(|index| index.built_at.clone()),
+        stale_reason,
+        span_from: span.map(|(first, _)| text_index::format_date(first)),
+        span_to: span.map(|(_, last)| text_index::format_date(last)),
+    })
+}
+
+#[tauri::command]
+fn build_text_index(
+    root: String,
+    cache: tauri::State<'_, TextIndexCache>,
+) -> Result<text_index::BuildReport, String> {
+    let root = root_path(&root)?;
+    let config = load_library_config(&root);
+    let index = build_text_index_for(&root, &config);
+    text_index::save(&root, &index)?;
+    let report = index.report.clone();
+    if let Ok(mut guard) = cache.inner.lock() {
+        *guard = Some((root, index));
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextHitView {
+    hash: String,
+    path: String,
+    name: String,
+    at: String,
+    ts: i64,
+    score: f32,
+    chars: u32,
+    rank: u8,
+    terms: Vec<String>,
+    exact_dupes: usize,
+    near_dupes: usize,
+    snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextSearchView {
+    hits: Vec<TextHitView>,
+    matched: usize,
+    unknown_terms: Vec<String>,
+    phrase_capped: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextQueryArgs {
+    query: String,
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
+    #[serde(default)]
+    folders: Vec<String>,
+    #[serde(default)]
+    min_chars: u32,
+    #[serde(default)]
+    include_dupes: bool,
+    #[serde(default)]
+    require_all: bool,
+    #[serde(default)]
+    limit: usize,
+}
+
+impl TextQueryArgs {
+    fn into_options(self) -> text_index::QueryOptions {
+        text_index::QueryOptions {
+            query: self.query,
+            from: self.from,
+            to: self.to,
+            folders: self.folders,
+            categories: Vec::new(),
+            min_chars: self.min_chars,
+            include_dupes: self.include_dupes,
+            require_all: self.require_all,
+            limit: self.limit,
+        }
+    }
+}
+
+#[tauri::command]
+fn search_text(
+    root: String,
+    args: TextQueryArgs,
+    snippet_width: usize,
+    cache: tauri::State<'_, TextIndexCache>,
+) -> Result<TextSearchView, String> {
+    let root = root_path(&root)?;
+    let index = text_index_for(&root, &cache)?;
+    let texts = text_dir_path(&root);
+    let terms = text_index::split_query(&args.query).0;
+    let outcome = text_index::search(&index, &args.into_options(), Some(&texts));
+
+    let width = snippet_width.clamp(80, 4000);
+    let hits = outcome
+        .hits
+        .iter()
+        .map(|hit| {
+            let text = fs::read_to_string(text_index::text_file_path(&texts, &hit.hash)).unwrap_or_default();
+            TextHitView {
+                hash: hit.hash.clone(),
+                path: hit.path.clone(),
+                name: hit.name.clone(),
+                at: text_index::format_datetime(hit.ts),
+                ts: hit.ts,
+                score: hit.score,
+                chars: hit.chars,
+                rank: hit.rank,
+                terms: hit.terms.clone(),
+                exact_dupes: hit.exact_dupes,
+                near_dupes: hit.near_dupes,
+                // The panel is the user reading their own screenshots, which is not an egress
+                // event — so no redaction here. Every path that leaves the machine (the CLI, and
+                // anything an agent reads) goes through `redact` instead.
+                snippet: text_index::snippet(&text, &terms, width),
+            }
+        })
+        .collect();
+
+    Ok(TextSearchView {
+        hits,
+        matched: outcome.matched,
+        unknown_terms: outcome.unknown_terms,
+        phrase_capped: outcome.phrase_capped,
+    })
+}
+
+#[tauri::command]
+fn get_text_timeline(
+    root: String,
+    args: TextQueryArgs,
+    bucket_hours: u32,
+    cache: tauri::State<'_, TextIndexCache>,
+) -> Result<Vec<text_index::Bucket>, String> {
+    let root = root_path(&root)?;
+    let index = text_index_for(&root, &cache)?;
+    let width = bucket_hours.max(1);
+    let mut buckets =
+        topics::timeline_with_topics(&index, &args.into_options(), width, &topics::load(&root));
+    // The hashes were only needed to compare each bucket's membership against the fingerprint its
+    // topics were written under. Sending 8,000 of them to the panel afterwards is pure weight.
+    for bucket in buckets.iter_mut() {
+        bucket.hashes.clear();
+    }
+    Ok(buckets)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TopicRunProgress {
+    processed: usize,
+    total: usize,
+    current_bucket: String,
+    topics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TopicStatusView {
+    generated_at: Option<String>,
+    model: Option<String>,
+    buckets_with_topics: usize,
+    buckets_total: usize,
+    buckets_stale: usize,
+    top_topics: Vec<(String, usize)>,
+    top_notable: Vec<(String, usize)>,
+}
+
+#[tauri::command]
+fn get_topic_status(
+    root: String,
+    bucket_hours: u32,
+    cache: tauri::State<'_, TextIndexCache>,
+) -> Result<TopicStatusView, String> {
+    let root = root_path(&root)?;
+    let width = bucket_hours.max(1);
+    let file = topics::load(&root);
+    let (top_topics, top_notable) = topics::vocabulary(&file, width);
+
+    // Counted against the CURRENT buckets, not against what the file happens to hold: a stored
+    // bucket for a span that no longer has images is not coverage.
+    let index = text_index_for(&root, &cache)?;
+    let mut buckets = text_index::timeline(&index, &text_index::QueryOptions::default(), width, true);
+    topics::apply(&mut buckets, &file, width);
+
+    Ok(TopicStatusView {
+        generated_at: (!file.generated_at.is_empty()).then(|| file.generated_at.clone()),
+        model: (!file.model.is_empty()).then(|| file.model.clone()),
+        buckets_with_topics: buckets.iter().filter(|bucket| !bucket.topics.is_empty()).count(),
+        buckets_total: buckets.len(),
+        buckets_stale: buckets.iter().filter(|bucket| bucket.topics_stale).count(),
+        top_topics: top_topics.into_iter().take(24).collect(),
+        top_notable: top_notable.into_iter().take(24).collect(),
+    })
+}
+
+#[tauri::command]
+fn generate_topics(
+    app: AppHandle,
+    root: String,
+    bucket_hours: u32,
+    force: bool,
+    control: tauri::State<'_, TopicControl>,
+) -> Result<(), String> {
+    let root_buf = root_path(&root)?;
+    if control.running.swap(true, Ordering::SeqCst) {
+        return Err("Topics are already being generated.".to_string());
+    }
+    control.cancel.store(false, Ordering::SeqCst);
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        run_topic_generation(&app_handle, &root_buf, bucket_hours.max(1), force);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_topics(control: tauri::State<'_, TopicControl>) -> Result<(), String> {
+    if !control.running.load(Ordering::SeqCst) {
+        return Err("No topic run is in progress.".to_string());
+    }
+    control.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Names what each time bucket was about, one model call per bucket. Mirrors `run_kind_classification`:
+/// detached thread, progress events, cancellable, and it saves what it has on the way out so a
+/// stopped run keeps every bucket it already paid for.
+fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: bool) {
+    let control = app.state::<TopicControl>();
+
+    let result = (|| -> Result<(&'static str, Option<String>), String> {
+        let settings = load_app_settings(app);
+        let endpoint = vision_endpoint(&settings);
+        let model = vision_model(&settings);
+        let api_key = vision_api_key(&settings);
+
+        let cache = app.state::<TextIndexCache>();
+        let index = text_index_for(root, &cache)?;
+        if index.docs.is_empty() {
+            return Ok(("completed", Some("No extracted text is indexed yet.".to_string())));
+        }
+
+        let texts = text_dir_path(root);
+        let buckets = text_index::timeline(&index, &text_index::QueryOptions::default(), width_hours, true);
+        let mut file = topics::load(root);
+        let pending: Vec<text_index::Bucket> =
+            topics::pending(&buckets, &file, width_hours, force).into_iter().cloned().collect();
+
+        if pending.is_empty() {
+            return Ok((
+                "completed",
+                Some("Every bucket already has topics for this width.".to_string()),
+            ));
+        }
+
+        let agent = vision::build_agent();
+        let total = pending.len();
+        let mut processed = 0usize;
+        let mut failures = 0usize;
+
+        for bucket in &pending {
+            if control.cancel.load(Ordering::SeqCst) {
+                topics::save(root, &file)?;
+                return Ok(("cancelled", Some(format!("Stopped after {processed} of {total}."))));
+            }
+
+            let (prompt, sampled) = topics::prepare(
+                bucket,
+                |hash| fs::read_to_string(text_index::text_file_path(&texts, hash)).ok(),
+                |hash| index.doc_by_hash(hash).map(|(_, doc)| doc.terms.clone()).unwrap_or_default(),
+                |hash| {
+                    index
+                        .doc_by_hash(hash)
+                        .map(|(_, doc)| text_index::format_datetime(doc.ts))
+                        .unwrap_or_default()
+                },
+                topics::DEFAULT_PROMPT_BUDGET,
+            );
+
+            if sampled == 0 {
+                failures += 1;
+                processed += 1;
+                continue;
+            }
+
+            // Claims the model only when this app is the one loading it, exactly as Describe and
+            // Classify do — a run must never shorten the idle life of a load somebody else owns.
+            let reply = model_lease::with_claim(app, &model, || {
+                topics::ask(&agent, &endpoint, &model, api_key.as_deref(), &prompt)
+            });
+
+            match reply {
+                Ok((topic_list, notable)) => {
+                    let _ = app.emit(
+                        "topics-progress",
+                        TopicRunProgress {
+                            processed: processed + 1,
+                            total,
+                            current_bucket: bucket.id.clone(),
+                            topics: topic_list.clone(),
+                        },
+                    );
+                    topics::record(
+                        &mut file, width_hours, bucket, topic_list, notable, sampled, &model, &now_iso(),
+                    );
+                }
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("Topic generation failed for {}: {error}", bucket.id);
+                    let _ = app.emit(
+                        "topics-progress",
+                        TopicRunProgress {
+                            processed: processed + 1,
+                            total,
+                            current_bucket: bucket.id.clone(),
+                            topics: Vec::new(),
+                        },
+                    );
+                }
+            }
+
+            processed += 1;
+            // Checkpointed per bucket rather than at the end. A bucket costs a model call; losing
+            // forty of them to a crash on the forty-first is not a trade worth making for one write
+            // of a file this small.
+            topics::save(root, &file)?;
+        }
+
+        let message = if failures > 0 {
+            Some(format!("Named {} of {total} buckets; {failures} failed.", total - failures))
+        } else {
+            Some(format!("Named {total} buckets."))
+        };
+        Ok(("completed", message))
+    })();
+
+    control.running.store(false, Ordering::SeqCst);
+
+    let (status, message) = match result {
+        Ok((status, message)) => (status.to_string(), message),
+        Err(error) => ("error".to_string(), Some(error)),
+    };
+    let _ = app.emit("topics-finished", TextAnalysisFinished { status, message });
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextGroupMemberView {
+    hash: String,
+    path: String,
+    at: String,
+    rank: u8,
+    novel_lines: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextDocumentView {
+    hash: String,
+    path: String,
+    name: String,
+    at: String,
+    category: String,
+    folder: String,
+    chars: u32,
+    rank: u8,
+    terms: Vec<String>,
+    text: String,
+    members: Vec<TextGroupMemberView>,
+}
+
+#[tauri::command]
+fn get_image_text(
+    root: String,
+    hash: String,
+    cache: tauri::State<'_, TextIndexCache>,
+) -> Result<TextDocumentView, String> {
+    let root = root_path(&root)?;
+    let index = text_index_for(&root, &cache)?;
+    let texts = text_dir_path(&root);
+    let (doc_index, doc) = index
+        .doc_by_hash(&hash)
+        .ok_or_else(|| "That image is not in the text index.".to_string())?;
+
+    let text = fs::read_to_string(text_index::text_file_path(&texts, &doc.hash))
+        .map_err(|error| format!("No extracted text for this image: {error}"))?;
+
+    let member_indexes = index.group_members(doc_index);
+    let representative = fs::read_to_string(text_index::text_file_path(
+        &texts,
+        &index.docs[member_indexes[0]].hash,
+    ))
+    .unwrap_or_default();
+
+    // Only the differences are carried back. A near-duplicate is usually the same screen scrolled
+    // a little, and those added lines are the entire reason it was kept — showing the whole thing
+    // again would bury them.
+    let members = member_indexes
+        .iter()
+        .skip(1)
+        .map(|member| {
+            let member_doc = &index.docs[*member];
+            let member_text =
+                fs::read_to_string(text_index::text_file_path(&texts, &member_doc.hash)).unwrap_or_default();
+            TextGroupMemberView {
+                hash: member_doc.hash.clone(),
+                path: member_doc.path.clone(),
+                at: text_index::format_datetime(member_doc.ts),
+                rank: member_doc.rank,
+                novel_lines: text_index::novel_lines(&representative, &member_text),
+            }
+        })
+        .collect();
+
+    Ok(TextDocumentView {
+        hash: doc.hash.clone(),
+        path: doc.path.clone(),
+        name: doc.name.clone(),
+        at: text_index::format_datetime(doc.ts),
+        category: doc.category.clone(),
+        folder: doc.folder.clone(),
+        chars: doc.chars,
+        rank: doc.rank,
+        terms: doc.terms.clone(),
+        text,
+        members,
+    })
+}
+
+/// Assigns a category to every hash given. Separate from `assign_category` because the panel acts
+/// on a whole result set, and doing that one IPC call at a time would rewrite the sidecar per image.
+#[tauri::command]
+fn categorize_images(root: String, hashes: Vec<String>, category: String) -> Result<usize, String> {
+    let root = root_path(&root)?;
+    // Cross-process: image-viewer-tauri writes this same sidecar, and so does a second instance of
+    // this app. Held for the whole read-modify-write.
+    let _sidecar_lock = SidecarLock::acquire(&root);
+    let mut config = load_library_config(&root);
+    if !config.categories.iter().any(|item| item == &category) {
+        return Err("Category does not exist.".to_string());
+    }
+
+    let stamp = now_iso();
+    let mut changed = 0usize;
+    for hash in &hashes {
+        if let Some(record) = config.images.get_mut(hash) {
+            if record.category.as_deref() == Some(category.as_str()) {
+                continue;
+            }
+            record.category = Some(category.clone());
+            record.classified_by = Some("manual".to_string());
+            record.classified_at = Some(stamp.clone());
+            changed += 1;
+        }
+    }
+    save_library_config(&root, &config)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn set_text_index_folder_included(root: String, folder_name: String, included: bool) -> Result<(), String> {
+    let root = root_path(&root)?;
+    let _sidecar_lock = SidecarLock::acquire(&root);
+    let mut config = load_library_config(&root);
+    if included {
+        config.text_index_excluded_folders.retain(|item| item != &folder_name);
+    } else if !config.text_index_excluded_folders.iter().any(|item| item == &folder_name) {
+        config.text_index_excluded_folders.push(folder_name);
+    }
+    save_library_config(&root, &config)
 }
 
 #[tauri::command]
@@ -2449,6 +3403,8 @@ fn validate_time_of_day(value: &str) -> Result<String, String> {
 // exe with `--headless-refresh`. The task is authoritative only for *when* the job fires — the
 // job itself re-reads `auto_refresh_enabled` on every run and no-ops if it's off, so disabling the
 // feature in Settings is always the final word even if the scheduled task somehow survives.
+// The task is registered from XML so it can state outright that it must not wake a sleeping
+// machine — see `auto_refresh_task_xml` for why that cannot be expressed any other way.
 fn configure_scheduled_task(enabled: bool, time: &str) -> Result<(), String> {
     if !enabled {
         let _ = Command::new("schtasks")
@@ -2461,27 +3417,128 @@ fn configure_scheduled_task(enabled: bool, time: &str) -> Result<(), String> {
     }
 
     let exe = std::env::current_exe().map_err(|error| format!("Failed to resolve executable path: {error}"))?;
-    let tr_value = format!("\"{}\" {HEADLESS_REFRESH_ARG}", exe.to_string_lossy());
+    let xml_path = std::env::temp_dir().join(format!("{AUTO_REFRESH_TASK_NAME}-{}.xml", std::process::id()));
+    // schtasks /XML reads UTF-16LE with a BOM — the encoding `Export-ScheduledTask` emits. A
+    // UTF-8 file is rejected outright as malformed.
+    write_utf16le_bom(&xml_path, &auto_refresh_task_xml(&exe, time))
+        .map_err(|error| format!("Failed to stage the scheduled task definition: {error}"))?;
+
     let status = Command::new("schtasks")
         .arg("/Create")
         .arg("/F")
-        .arg("/SC")
-        .arg("DAILY")
-        .arg("/ST")
-        .arg(time)
         .arg("/TN")
         .arg(AUTO_REFRESH_TASK_NAME)
-        .arg("/TR")
-        .arg(&tr_value)
-        .arg("/RL")
-        .arg("LIMITED")
+        .arg("/XML")
+        .arg(&xml_path)
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|error| format!("Failed to run schtasks: {error}"))?;
+        .status();
+    let _ = fs::remove_file(&xml_path);
+
+    let status = status.map_err(|error| format!("Failed to run schtasks: {error}"))?;
     if !status.success() {
         return Err("schtasks failed to create the scheduled task.".to_string());
     }
     Ok(())
+}
+
+// Escapes the five XML metacharacters. The task definition embeds a filesystem path and a
+// `DOMAIN\user`, neither of which is guaranteed free of `&`.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+// Writes UTF-16LE with a byte-order mark, the only encoding `schtasks /XML` accepts.
+fn write_utf16le_bom(path: &Path, contents: &str) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(contents.len() * 2 + 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in contents.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(path, bytes)
+}
+
+// The full task definition, registered through `/XML` rather than schtasks' flag form for one
+// reason: the flag form has no way to express `<WakeToRun>`, so it can only ever *inherit* the
+// default. That default is False (measured), but nothing in the code said so and nothing stopped
+// it drifting. A nightly job is precisely the shape that tempts someone into arming a wake timer,
+// so both power-relevant settings are asserted explicitly here instead of left implicit:
+//
+//   WakeToRun=false          — never bring the machine out of sleep to run this. The refresh is
+//                              a convenience pass over a local image library; it is never worth
+//                              spinning a sleeping desktop up at 04:00 for.
+//   StartWhenAvailable=true  — the necessary other half. Because the task will not wake the
+//                              machine, a desktop asleep at the scheduled time would otherwise
+//                              skip the pass entirely and silently, every single night. This
+//                              runs the missed pass once the user wakes the machine themselves.
+//
+// The trigger's StartBoundary is a fixed past date because a daily trigger only reads the
+// time-of-day from it and rolls forward; registering it does not fire an immediate catch-up run.
+fn auto_refresh_task_xml(exe: &Path, time: &str) -> String {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+        (Err(_), Ok(name)) => name,
+        _ => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Image Categorizer nightly refresh. Never wakes the machine.</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2020-01-01T{time}:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        user = xml_escape(&user),
+        time = time,
+        command = xml_escape(&exe.to_string_lossy()),
+        arguments = xml_escape(HEADLESS_REFRESH_ARG),
+    )
 }
 
 fn scheduled_task_installed() -> bool {
@@ -2639,7 +3696,9 @@ fn run_headless_refresh(app: &AppHandle) {
             let control = app.state::<OcrTextControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
-            run_text_extraction(app, &root_buf, false);
+            // Unscoped, as the nightly job always has been: it is the "keep everything current"
+            // pass, not the search index's own top-up.
+            run_text_extraction(app, &root_buf, false, false);
             if app.state::<OcrTextControl>().cancel.load(Ordering::SeqCst) {
                 cancelled = true;
             }
@@ -4614,15 +5673,21 @@ pub fn run() {
         .manage(VisionControl::default())
         .manage(KindControl::default())
         .manage(ModelLease::default())
+        .manage(TextIndexCache::default())
+        .manage(TopicControl::default())
         .setup(move |app| {
+            let startup_settings = load_app_settings(&app.handle().clone());
             if let Some(window) = app.get_webview_window("main") {
                 apply_window_icon(&window);
+                // Before the frontend unhides it, so the window never appears at one place and then
+                // jumps to another. The config's size is the fallback when nothing was saved.
+                restore_saved_window_bounds(&window, &startup_settings);
             }
             // Arm the idle lease before anything can send a request: the `ttl` is bound by LM Studio
             // at load time, so a request that goes out before this is set would pin the model for
             // the server's default hour. Headless refresh gets the watchdog too — with no window to
             // report activity, its model is released as soon as the run stops.
-            apply_idle_ttl(&load_app_settings(&app.handle().clone()));
+            apply_idle_ttl(&startup_settings);
             model_lease::spawn_watchdog(app.handle().clone());
             if headless_refresh {
                 let cancel_item = MenuItemBuilder::with_id("cancel-refresh", "Cancel refresh").build(app)?;
@@ -4671,14 +5736,18 @@ pub fn run() {
             assign_category,
             build_chunk_plan,
             build_geo_sets,
+            build_text_index,
             cancel_chunk_scan,
             cancel_kind_classification,
             cancel_nsfw_analysis,
             cancel_text_analysis,
             cancel_text_extraction,
+            cancel_topics,
             cancel_vision_analysis,
             choose_root_folder,
+            clear_window_defaults,
             classify_kinds,
+            categorize_images,
             create_category,
             delete_category,
             derive_geo,
@@ -4695,10 +5764,16 @@ pub fn run() {
             get_geo_sets,
             get_geo_status,
             get_geo_summary,
+            get_image_text,
             get_kind_summary,
             get_nsfw_model_info,
+            generate_topics,
+            get_text_status,
+            get_text_timeline,
+            get_topic_status,
             get_vision_idle_status,
             get_vision_settings,
+            get_window_defaults,
             import_images,
             list_vision_models,
             load_vision_model,
@@ -4713,7 +5788,9 @@ pub fn run() {
             repropagate_kinds,
             review_geo_sets,
             reveal_image,
+            save_window_defaults,
             scan_library,
+            search_text,
             select_root_folder,
             set_auto_refresh_settings,
             set_dark_mode,
@@ -4722,6 +5799,7 @@ pub fn run() {
             set_geo_override,
             set_nsfw_threshold,
             set_source_pattern,
+            set_text_index_folder_included,
             set_text_thresholds,
             set_tile_size,
             set_vision_settings

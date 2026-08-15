@@ -9,6 +9,39 @@
     <script src="renderer.js" defer></script>
   </head>
   <body>
+    <!-- The window is undecorated (tauri.conf.json), so this strip IS the title bar: it supplies the
+         drag region, the app identity and the three window buttons Windows would otherwise draw.
+         `data-tauri-drag-region="deep"` hands a press anywhere in the strip to the OS (move, and
+         double-click to maximize) — Tauri's own script excludes clickable elements, so the three
+         buttons stay buttons without needing to opt out. -->
+    <div class="titlebar" id="titlebar" data-tauri-drag-region="deep">
+      <div class="titlebar-identity">
+        <svg class="titlebar-mark" viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="1.6" y="3.4" width="16.8" height="13.2" rx="3" />
+          <path class="titlebar-mark-scene" d="M1.6 13.1l4.3-4.2 3.4 3.3 3.2-3.6 4.9 5" />
+          <circle class="titlebar-mark-dot" cx="13.4" cy="7.6" r="1.5" />
+        </svg>
+        <span class="titlebar-title">Image Categorizer</span>
+      </div>
+      <div class="titlebar-controls">
+        <button class="titlebar-button" id="titlebar-minimize" type="button" title="Minimize" aria-label="Minimize">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8" /></svg>
+        </button>
+        <button class="titlebar-button" id="titlebar-maximize" type="button" title="Maximize" aria-label="Maximize">
+          <svg class="titlebar-glyph-maximize" viewBox="0 0 12 12" aria-hidden="true">
+            <rect x="2.2" y="2.2" width="7.6" height="7.6" rx="1.1" />
+          </svg>
+          <svg class="titlebar-glyph-restore" viewBox="0 0 12 12" aria-hidden="true">
+            <rect x="1.6" y="3.6" width="6.8" height="6.8" rx="1.1" />
+            <path d="M3.9 3.4V2.7a1.1 1.1 0 0 1 1.1-1.1h4.3a1.1 1.1 0 0 1 1.1 1.1V7a1.1 1.1 0 0 1-1.1 1.1h-.7" />
+          </svg>
+        </button>
+        <button class="titlebar-button danger" id="titlebar-close" type="button" title="Close" aria-label="Close">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.6 2.6l6.8 6.8M9.4 2.6l-6.8 6.8" /></svg>
+        </button>
+      </div>
+    </div>
+
     <div class="app-shell">
       <aside class="sidebar">
         <!-- No app name or logo here: the OS title bar already carries both, right above this row.
@@ -49,6 +82,10 @@
           <span>Geo Coverage</span>
           <span class="count-pill" id="geo-count">0</span>
         </button>
+        <button class="nav-item" id="text-tab" type="button">
+          <span>Extracted Text</span>
+          <span class="count-pill" id="text-count">0</span>
+        </button>
 
         <div class="section-title">
           <span>Categories</span>
@@ -87,14 +124,18 @@
               <h1 id="view-title">All Images</h1>
               <div class="path-line" id="view-subtitle"></div>
             </div>
-          </div>
-          <div class="top-actions">
-            <input id="search-input" class="search-input" type="search" placeholder="Search images">
+            <!-- Rides on the title's row rather than in the action bar below. It is the one thing up
+                 here that is neither a control nor a label — it reports what the app is doing — and
+                 the title row is the only row with width to spare, so parking it there buys the
+                 action bar a whole row back. -->
             <span class="status-area">
               <span id="status-spinner" class="status-spinner" aria-hidden="true"></span>
               <span id="status-message" class="status-message"></span>
               <button id="status-dismiss" class="status-dismiss" type="button" title="Dismiss this message" aria-label="Dismiss status message" hidden>&#10005;</button>
             </span>
+          </div>
+          <div class="top-actions">
+            <input id="search-input" class="search-input" type="search" placeholder="Search images">
             <select id="sort-select" class="sort-select" title="Sort images">
               <option value="newest">Newest</option>
               <option value="name">Name</option>
@@ -253,6 +294,97 @@
                outside those 109 is a legitimate answer, and coverage already reports them. -->
           <datalist id="geo-country-options"></datalist>
         </section>
+
+        <!-- Extracted text. Same shape as the geo panel and for the same reason: this is a reader,
+             not a list of image tiles, so it swaps places with the grid instead of rendering inside
+             it. Everything here is also reachable from `icat` with the app closed — the panel is the
+             human half, the CLI is the agent half, and they share one index. -->
+        <section class="text-view hidden" id="text-view">
+          <div class="text-toolbar">
+            <input id="text-query" class="text-query" type="search"
+                   placeholder="Search extracted text — quote a &quot;phrase&quot; for an exact match">
+            <label class="text-inline-field">
+              <span>From</span>
+              <input id="text-from" class="text-date-input" type="date">
+            </label>
+            <label class="text-inline-field">
+              <span>To</span>
+              <input id="text-to" class="text-date-input" type="date">
+            </label>
+            <select id="text-range-preset" class="text-select" title="Jump the date range">
+              <option value="">Any time</option>
+              <option value="1">Today</option>
+              <option value="2">Last 2 days</option>
+              <option value="7">Last week</option>
+              <option value="30">Last month</option>
+            </select>
+            <button id="text-search-button" class="button" type="button">Search</button>
+            <span class="text-toolbar-spacer"></span>
+            <button id="text-rebuild-button" class="button secondary" type="button"
+                    title="Re-read every extracted text file and rebuild the search index. Fast — it does not run OCR.">Rebuild Index</button>
+            <button id="text-refresh-button" class="button secondary" type="button"
+                    title="Re-read the index status from disk.">Refresh</button>
+          </div>
+
+          <!-- Mode row. Images and time buckets are two views of one index, not two features: a
+               bucket is computed from the same documents at whatever width is asked for. -->
+          <div class="text-modes">
+            <div class="text-mode-group" id="text-mode-group">
+              <button class="text-mode active" id="text-mode-images" type="button">Images</button>
+              <button class="text-mode" id="text-mode-buckets" type="button">Timeline</button>
+            </div>
+            <label class="text-inline-field text-bucket-field">
+              <span>Bucket</span>
+              <select id="text-bucket-hours" class="text-select">
+                <option value="6">6 hours</option>
+                <option value="24">1 day</option>
+                <option value="48" selected>2 days</option>
+                <option value="168">1 week</option>
+                <option value="720">1 month</option>
+              </select>
+            </label>
+            <label class="text-check" title="Show identical re-captures instead of collapsing them under the first one.">
+              <input type="checkbox" id="text-include-dupes">
+              <span>Show identical copies</span>
+            </label>
+            <label class="text-check" title="Require every word rather than ranking on any of them.">
+              <input type="checkbox" id="text-require-all">
+              <span>All words</span>
+            </label>
+            <!-- Only in timeline mode: naming a bucket is a question about a span of time, and
+                 there is no such thing as the topics of a result list. -->
+            <button id="text-topics-button" class="button secondary text-topics-button" type="button"
+                    title="Ask the local model what each bucket was about. One call per bucket, never per image.">Name buckets…</button>
+            <button id="text-topics-stop" class="button secondary text-topics-button hidden" type="button">Stop</button>
+            <span class="text-toolbar-spacer"></span>
+            <span class="text-status-line" id="text-status-line"></span>
+          </div>
+
+          <!-- Survives the run so the last result stays readable, same as the geo pipeline strip. -->
+          <div class="text-topics-progress hidden" id="text-topics-progress"></div>
+
+          <!-- Coverage is stated once, quietly, and never nags: a screenshot corpus is meant to be
+               fragmented, so a gap is not a defect to chase. -->
+          <div class="text-coverage" id="text-coverage"></div>
+
+          <div class="text-columns">
+            <div class="text-results-column">
+              <div class="text-results" id="text-results"></div>
+            </div>
+            <div class="text-detail-column">
+              <div class="text-detail" id="text-detail"></div>
+            </div>
+          </div>
+
+          <!-- Acts on the whole result set. Categorizing from a search is the bridge back to what
+               this app is: a search you can repeat is also a category you can keep. -->
+          <div class="text-actions hidden" id="text-actions">
+            <span class="text-actions-label" id="text-actions-label"></span>
+            <select id="text-action-category" class="text-select"></select>
+            <button id="text-categorize-button" class="button secondary" type="button">Categorize these</button>
+            <button id="text-copy-button" class="button secondary" type="button">Copy text</button>
+          </div>
+        </section>
         <div class="drop-overlay hidden" id="drop-overlay">
           <div class="drop-overlay-inner">
             <div class="drop-overlay-icon">↓</div>
@@ -311,6 +443,13 @@
         </div>
       </form>
     </dialog>
+
+    <!-- What dims the app behind a dialog, in place of the browser's own ::backdrop. It exists
+         because every dialog here is opened NON-modally: `showModal()` marks the whole document
+         outside the dialog inert, which now includes the custom title bar, so the window's close
+         button went dead whenever Settings was open. This starts below the title bar instead, which
+         is exactly where the modality should stop — and clicking it dismisses the dialog. -->
+    <div class="dialog-scrim" id="dialog-scrim"></div>
 
     <dialog class="dialog settings-dialog" id="settings-dialog">
       <form method="dialog" id="settings-form">
@@ -453,6 +592,20 @@
         </label>
 
         <div class="settings-stack">
+          <span class="settings-label">Window Position &amp; Size</span>
+          <p class="dialog-hint">
+            Move and resize the window the way you want it, then save it as the default — every
+            launch reopens exactly there. Nothing is saved automatically, so shoving the window
+            around later never overwrites what you chose. Saving while maximized reopens maximized.
+          </p>
+          <p class="settings-value wrap" id="window-defaults-status"></p>
+          <div class="settings-actions">
+            <button class="button compact" id="save-window-defaults-button" type="button" title="Stamp the window's current position and size as the one every launch opens at">Save Current Position &amp; Size</button>
+            <button class="button compact secondary" id="clear-window-defaults-button" type="button" title="Forget the saved default; the window reopens at its built-in size wherever Windows places it">Clear</button>
+          </div>
+        </div>
+
+        <div class="settings-stack">
           <span class="settings-label">Automatic Daily Refresh</span>
           <p class="dialog-hint">
             Runs a rescan (and, if selected, analysis) once a day via Windows Task Scheduler, even
@@ -516,6 +669,21 @@
     <div class="toast" id="toast" role="status" aria-live="polite">
       <span class="toast-text" id="toast-text"></span>
       <button class="toast-dismiss" id="toast-dismiss" type="button" title="Dismiss" aria-label="Dismiss">&#10005;</button>
+    </div>
+
+    <!-- An undecorated window cannot be resized by its edges: the webview's child HWND covers every
+         pixel of the client area, so the frame's hit test never runs. These strips are the handles —
+         a press on one calls startResizeDragging, which hands the OS the same resize loop the native
+         border would have started (snapping and min-size tracking included). -->
+    <div class="resize-grips" id="resize-grips" aria-hidden="true">
+      <div class="resize-grip edge-n" data-resize-dir="North"></div>
+      <div class="resize-grip edge-s" data-resize-dir="South"></div>
+      <div class="resize-grip edge-w" data-resize-dir="West"></div>
+      <div class="resize-grip edge-e" data-resize-dir="East"></div>
+      <div class="resize-grip corner-nw" data-resize-dir="NorthWest"></div>
+      <div class="resize-grip corner-ne" data-resize-dir="NorthEast"></div>
+      <div class="resize-grip corner-sw" data-resize-dir="SouthWest"></div>
+      <div class="resize-grip corner-se" data-resize-dir="SouthEast"></div>
     </div>
   </body>
 </html>

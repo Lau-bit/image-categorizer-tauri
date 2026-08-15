@@ -1,19 +1,39 @@
+/* Dark theme — NEUTRAL surfaces, colour only where it means something.
+   Every grey here is achromatic (r == g == b) on purpose: the previous set carried a blue cast
+   (#101114 is two points bluer than it is red, and so was every panel, border and label above it),
+   which reads as a tint over the whole app rather than as a decision. Colour is spent on the parts
+   that are supposed to catch the eye — selection, focus, running state, the geo tiers, danger — and
+   those stand out further now that nothing behind them is competing.
+   Surfaces climb bg → panel → panel-soft → panel-raised; the sidebar is the lighter plane and the
+   content area the darker one, which is the arrangement this app already had. */
 :root {
-  --bg: #101114;
-  --panel: #17191d;
-  --panel-soft: #1d2025;
-  --panel-raised: #22262c;
-  --border: #30343b;
-  --border-strong: #3d434c;
-  --text: #f0f2f4;
-  --muted: #a2a9b2;
-  --muted-strong: #c6ccd2;
+  --bg: #121212;
+  --panel: #191919;
+  --panel-soft: #1e1e1e;
+  --panel-raised: #272727;
+  --border: #333333;
+  --border-strong: #454545;
+  --text: #f4f4f4;
+  --muted: #a3a3a3;
+  --muted-strong: #cccccc;
   --accent: #3b82c4;
   --accent-strong: #316ea6;
-  --accent-soft: rgba(59, 130, 196, 0.16);
+  /* A touch stronger than it was: the old bluish panels met this tint halfway, a neutral grey
+     doesn't, so the same alpha would have read as "slightly lighter row" rather than "selected". */
+  --accent-soft: rgba(59, 130, 196, 0.2);
   --danger: #e66c6c;
-  --shadow: rgba(0, 0, 0, 0.34);
+  --shadow: rgba(0, 0, 0, 0.4);
   --tile-size: 168px;
+  /* Custom title bar (the window is undecorated). Its own tokens rather than the panel ones: it sits
+     above everything else in the window, so it wants to read as the darkest surface, not as another
+     panel — and light mode has to be able to flip it independently. */
+  --titlebar-height: 38px;
+  --titlebar-bg: linear-gradient(180deg, #1f1f1f 0%, #151515 100%);
+  --titlebar-border: #2e2e2e;
+  --titlebar-text: #d4d4d4;
+  --titlebar-hover: rgba(255, 255, 255, 0.08);
+  --titlebar-active: rgba(255, 255, 255, 0.14);
+  --titlebar-close: #e5484d;
   font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -35,6 +55,11 @@ body.light-mode {
   --accent-strong: #185a8f;
   --accent-soft: #dceaf6;
   --shadow: rgba(0, 0, 0, 0.18);
+  --titlebar-bg: linear-gradient(180deg, #ffffff 0%, #f3f3f3 100%);
+  --titlebar-border: #dedede;
+  --titlebar-text: #383838;
+  --titlebar-hover: rgba(0, 0, 0, 0.07);
+  --titlebar-active: rgba(0, 0, 0, 0.12);
 }
 
 * {
@@ -48,6 +73,13 @@ body {
      780px floor was doing nothing but forcing a horizontal scrollbar on any smaller window. */
   min-width: 360px;
   min-height: 420px;
+  /* A column of exactly two rows: the title bar, then the shell taking whatever is left. The shell
+     used to own `height: 100vh` on its own; it now measures `100vh - titlebar` through this flex
+     line, which is what keeps the grid's definite height (the virtual scroller reads it). Dialogs,
+     the toast and the resize grips are all out of flow, so they add no rows here. */
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -67,10 +99,168 @@ button {
   display: none !important;
 }
 
+/* ==============================
+   Title bar
+   The window is undecorated, so everything Windows would have drawn lives here: the drag strip, the
+   app identity, and the three controls. Kept flat and dark on purpose — it reads as the top edge of
+   the app rather than as a second panel above the sidebar.
+   ============================== */
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 var(--titlebar-height);
+  height: var(--titlebar-height);
+  /* Above the dialog scrim. Nothing overlaps it — the scrim starts where the bar ends — but the
+     frame outranking everything drawn inside the window is the rule, not a coincidence. */
+  position: relative;
+  z-index: 70;
+  padding-left: 12px;
+  border-bottom: 1px solid var(--titlebar-border);
+  background: var(--titlebar-bg);
+  color: var(--titlebar-text);
+  /* A drag strip that selects text under the cursor feels broken; the OS takes the press anyway. */
+  user-select: none;
+  cursor: default;
+}
+
+.titlebar-identity {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  /* Presses land on the strip itself rather than on the mark or the words, so Tauri's drag handler
+     sees one target regardless of where in the identity block the cursor was. */
+  pointer-events: none;
+}
+
+.titlebar-mark {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.titlebar-mark-dot {
+  fill: var(--accent);
+  stroke: none;
+}
+
+.titlebar-title {
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-self: stretch;
+  flex: 0 0 auto;
+}
+
+/* Windows' own proportions: square-ish, full-height, no radius — a rounded button here would read as
+   app UI floating in the strip rather than as part of the frame. */
+.titlebar-button {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  align-self: stretch;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  cursor: default;
+  transition: background-color 90ms ease, color 90ms ease;
+}
+
+.titlebar-button svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.titlebar-button:hover {
+  background: var(--titlebar-hover);
+}
+
+.titlebar-button:active {
+  background: var(--titlebar-active);
+}
+
+.titlebar-button.danger:hover,
+.titlebar-button.danger:active {
+  background: var(--titlebar-close);
+  color: #ffffff;
+}
+
+/* One button, two glyphs: a square to maximize, the offset pair to restore down. */
+.titlebar-glyph-restore,
+body.window-maximized .titlebar-glyph-maximize {
+  display: none;
+}
+
+body.window-maximized .titlebar-glyph-restore {
+  display: block;
+}
+
+/* ==============================
+   Resize grips
+   Undecorated windows get no resize border of their own — WebView2's child window covers the frame's
+   edge pixels, so tao's hit test never runs. `position: fixed` (not absolute) so the outermost
+   column of pixels, the one the cursor actually lands on, belongs to the strip.
+   ============================== */
+
+.resize-grips {
+  position: fixed;
+  inset: 0;
+  /* Above the dialog scrim, like the title bar: an open dialog is no reason to lose the window's
+     own edges. The strips are 4px at the very rim, and every dialog is inset well clear of them. */
+  z-index: 71;
+  pointer-events: none;
+}
+
+.resize-grip {
+  position: fixed;
+  pointer-events: auto;
+}
+
+/* While an in-page drag is in flight the gesture resolves its target with elementFromPoint, and a
+   grip lying over the drop target would answer in its place. */
+body.pointer-dragging .resize-grip {
+  pointer-events: none;
+}
+
+.resize-grip.edge-n { top: 0; left: 0; right: 0; height: 4px; cursor: ns-resize; }
+.resize-grip.edge-s { bottom: 0; left: 0; right: 0; height: 4px; cursor: ns-resize; }
+.resize-grip.edge-w { top: 0; bottom: 0; left: 0; width: 4px; cursor: ew-resize; }
+.resize-grip.edge-e { top: 0; bottom: 0; right: 0; width: 4px; cursor: ew-resize; }
+.resize-grip.corner-nw { top: 0; left: 0; width: 10px; height: 10px; cursor: nwse-resize; }
+.resize-grip.corner-ne { top: 0; right: 0; width: 10px; height: 10px; cursor: nesw-resize; }
+.resize-grip.corner-sw { bottom: 0; left: 0; width: 10px; height: 10px; cursor: nesw-resize; }
+.resize-grip.corner-se { bottom: 0; right: 0; width: 10px; height: 10px; cursor: nwse-resize; }
+
+/* A maximized window has no edges to grab, and a grip there would resize it out of its maximized
+   state on a stray click at the screen edge. */
+body.window-maximized .resize-grips {
+  display: none;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  height: 100vh;
+  flex: 1 1 auto;
+  min-height: 0;
   background: var(--bg);
 }
 
@@ -353,7 +543,7 @@ body.light-mode .count-pill {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(16, 17, 20, 0.82);
+  background: rgba(14, 14, 14, 0.84);
   backdrop-filter: blur(2px);
   pointer-events: none;
 }
@@ -394,8 +584,11 @@ body.light-mode .drop-overlay {
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 18px;
-  padding: 16px 18px 12px;
+  /* Deliberately tight. Everything in here is a header above the thing the window is actually for —
+     a grid of images or the coverage scoreboard — and at the window sizes this app is used at, the
+     header was taking a third of the height before either had a pixel. */
+  gap: 6px 12px;
+  padding: 10px 18px 8px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
   /* Without this the topbar is the one thing that can still force a horizontal scrollbar. A grid
@@ -412,6 +605,10 @@ body.light-mode .drop-overlay {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* Takes the whole line when it has one to itself, so the path gets every pixel the status line
+     isn't using and the status ends up flush against the right edge instead of trailing the path
+     with a gap after it. */
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -456,42 +653,58 @@ body.light-mode .drop-overlay {
   background: var(--panel-soft);
 }
 
+/* Title and path on ONE baseline rather than stacked: the path is context, not a heading, and a
+   line of its own cost the content area ~20px in every view. */
 .title-block {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
   min-width: 0;
 }
 
 h1 {
   margin: 0;
   color: var(--text);
-  font-size: 22px;
+  font-size: 19px;
   font-weight: 760;
+  white-space: nowrap;
 }
 
 .path-line {
-  margin-top: 4px;
   color: var(--muted);
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Packed left, not right. Right-aligning rows that wrap is what left a hole between the first
+   control of each row and the window edge — the empty band beside Rescan. */
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
+}
+
+.top-actions .button {
+  min-height: 30px;
+  padding: 0 10px;
 }
 
 .analysis-controls {
   display: flex;
   align-items: center;
+  /* Last in the bar whatever its DOM position: it is the widest item and needs a row of its own at
+     these window widths, so leading with it would strand the narrow controls below it. */
+  order: 2;
   /* Its eight controls are the single widest thing in the action bar. Wrapping them inside their
      own bordered group keeps the group's min-content down to one checkbox, so a narrow window
      reflows the analysis controls instead of pushing the whole topbar past the window edge. */
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 4px 8px;
+  gap: 5px;
+  padding: 3px 7px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--panel-soft);
@@ -637,14 +850,19 @@ h1 {
 /* Fixed-width slot for the spinner + status text. Because its footprint never changes, the toolbar
    controls around it don't shift as the status message grows/shrinks between analysis steps, and the
    spinner (which reserves its space) doesn't get pushed around either. */
+/* Lives on the title's row (see index.html), pushed to its far end. `flex-shrink` rather than the
+   old fixed 284px slot: it now shares that row with a full library path, and both of them
+   ellipsize, so the width goes to whichever has less to say instead of being reserved. */
 .status-area {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  /* 260px of text + the 16px ✕ and its gap, so adding the button didn't cost the message any
-     width — messages that fit before still fit. */
-  flex: 0 0 284px;
-  width: 284px;
+  /* Sized by what it is saying, capped, never reserved: an idle app has no message, and a slot
+     held open for one would be taking those pixels off the path beside it for nothing. */
+  flex: 0 1 auto;
+  max-width: 340px;
+  margin-left: auto;
   min-width: 0;
 }
 
@@ -760,7 +978,8 @@ body.pointer-dragging {
   width: 100%;
   aspect-ratio: 1 / 1;
   overflow: hidden;
-  background: #0a0b0d;
+  /* Darker than the card so a letterboxed thumbnail reads as frame, not as a gap. */
+  background: #0c0c0c;
   pointer-events: none;
 }
 
@@ -921,8 +1140,38 @@ body.pointer-dragging {
   }
 }
 
+/* Dialogs are opened with `show()`, not `showModal()`, so they are ordinary positioned elements
+   rather than top-layer ones: placement, stacking and the dim behind them are all ours. Both the
+   scrim and the dialog start BELOW the title bar — a modal that covers the frame takes the window's
+   own close button with it, which is the bug this arrangement exists to avoid. */
+.dialog-scrim {
+  position: fixed;
+  inset: var(--titlebar-height) 0 0 0;
+  z-index: 60;
+  display: none;
+  background: rgba(0, 0, 0, 0.58);
+}
+
+body.light-mode .dialog-scrim {
+  background: rgba(20, 20, 20, 0.32);
+}
+
+body.dialog-open .dialog-scrim {
+  display: block;
+}
+
 .dialog {
+  /* Centred in the area BELOW the title bar, hence the half-bar offset. Done with a transform
+     rather than the `inset: 0; margin: auto` the UA uses for modal dialogs — that centring needs a
+     definite height, and an auto-height box with both insets set is top-aligned instead. */
+  position: fixed;
+  top: calc(50vh + var(--titlebar-height) / 2);
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 61;
   width: min(440px, calc(100vw - 32px));
+  max-height: calc(100vh - var(--titlebar-height) - 32px);
+  margin: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0;
@@ -933,7 +1182,7 @@ body.pointer-dragging {
 
 .settings-dialog {
   width: min(620px, calc(100vw - 32px));
-  max-height: min(760px, calc(100vh - 48px));
+  max-height: min(760px, calc(100vh - var(--titlebar-height) - 32px));
   overflow-y: auto;
 }
 
@@ -1037,6 +1286,21 @@ body.pointer-dragging {
   color: var(--text);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The single-line ellipsis above is for paths and model ids. A sentence needs the opposite. */
+.settings-value.wrap {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+/* Buttons that belong to a settings block, sized by their labels rather than stretched across the
+   dialog the way `.model-row`'s grid stretches its first child. */
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .model-row {
@@ -1182,23 +1446,53 @@ input[type="range"] {
 .geo-view {
   height: 100%;
   min-height: 0;
-  padding: 14px 18px 18px;
+  /* No top padding, because the sticky toolbar below is the first thing in here and a scroll
+     container's padding is part of its sticky constraint: with 14px of it, the bar parked 14px down
+     and content scrolled visibly through the strip above it. The bar carries that space as its own
+     padding instead. */
+  padding: 0 18px 18px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
+/* Sticky, because the runs are what this panel is FOR and the panel is several windows tall:
+   reading a cluster or a set meant scrolling back to the top to start the next pass. The negative
+   margins let the bar bleed into `.geo-view`'s 18px gutters, so content slides under an opaque bar
+   instead of past its edges — a sticky element only covers its own box. */
 .geo-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  padding-bottom: 12px;
+  gap: 7px;
+  margin: 0 -18px;
+  padding: 12px 18px 10px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* The bar is two rows at the usual window width and it is now permanently on screen, so every row
+   it costs is a row the scoreboard doesn't get. */
+.geo-toolbar .button {
+  min-height: 30px;
+  padding: 0 10px;
 }
 
 .geo-toolbar-spacer {
   flex: 1 1 auto;
+}
+
+/* The header's compaction is global (see `.topbar` and friends) — this is the one part that can
+   only be true here: the search box filters image CARDS and the sort order sorts them, and the grid
+   is not on screen in this view, so both are inert. They cost a row of a panel that is several
+   windows tall, so they go. `geoSet` (a country set's images ARE a grid) is deliberately excluded —
+   search works there. */
+body.view-geo .search-input,
+body.view-geo .sort-select {
+  display: none;
 }
 
 .geo-generated {
@@ -1933,9 +2227,531 @@ body.light-mode .geo-legend-item.tier-thin { color: #7a5f16; }
 body.light-mode .geo-legend-item.tier-ready { color: #1d5878; }
 body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
 
+/* ==============================
+   Extracted text
+   A reading surface, not a scoreboard: two columns, results on the left and one document's whole
+   text on the right, because the point of a hit is the text around it. Follows the geo panel's
+   structure (own scroll container, sticky toolbar bleeding into the gutters) so the two panels
+   behave identically when they swap places with the grid.
+   ============================== */
+
+.text-view {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* Same no-top-padding rule as `.geo-view`: a scroll container's padding is part of its sticky
+     constraint, so the toolbar would park below it and let content scroll through the gap. */
+  padding: 0 18px 18px;
+  overflow: hidden;
+}
+
+.text-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin: 0 -18px;
+  padding: 12px 18px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.text-toolbar .button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.text-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+/* The query box is the widest thing in the bar and the first thing reached for, so it takes the
+   slack rather than the buttons. */
+.text-query {
+  flex: 1 1 260px;
+  min-width: 180px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.text-query:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.text-inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.text-date-input,
+.text-select {
+  min-height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.text-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.text-mode-group {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.text-mode {
+  min-height: 28px;
+  padding: 0 12px;
+  border: none;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.text-mode:hover {
+  background: var(--panel-raised);
+}
+
+.text-mode.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.text-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.text-status-line {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-coverage {
+  padding: 7px 0;
+}
+
+.text-coverage-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Deliberately not a warning colour. A gap in a screenshot corpus is normal — these are snippets
+   captured in the moment, not a document set with a completeness target — so this stays quiet even
+   though it is now a button. Anything louder would train the eye to ignore it. Underlined on hover
+   rather than boxed: it should read as the number it replaced until you reach for it. */
+.text-coverage-pending {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--muted-strong);
+  font: inherit;
+  cursor: pointer;
+}
+
+.text-coverage-pending:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.text-coverage-pending:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* Blocked reads as information, not alarm — the setting is legitimate and the click offers to lift
+   it. Same weight as the stale-index note beside it. */
+.text-coverage-pending.blocked {
+  color: var(--accent);
+}
+
+.text-coverage-note {
+  color: var(--muted);
+}
+
+.text-coverage-stale {
+  color: var(--accent);
+}
+
+.text-columns {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  padding-top: 10px;
+}
+
+/* Timeline mode has no document to read, so the reading pane stands down and the buckets take the
+   whole width. Declared here rather than toggled inline so the narrow-window override below can
+   still win — that one has to reset `grid-template-rows` too, or the single column keeps the two
+   fixed rows the stacked layout gives it. */
+.text-view.buckets-mode .text-detail-column {
+  display: none;
+}
+
+.text-view.buckets-mode .text-columns {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.text-results-column,
+.text-detail-column {
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Each column scrolls on its own: reading a long document must not move the result list out from
+   under the cursor, which is the whole reason this is two panes rather than one. */
+.text-results,
+.text-detail {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.text-results-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-unknown-terms {
+  color: var(--danger);
+}
+
+.text-hit {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.text-hit:hover {
+  background: var(--panel-soft);
+}
+
+.text-hit.selected {
+  background: var(--accent-soft);
+}
+
+/* Dimmed, not hidden. A near-duplicate already ranks below every first-hand hit; the fade says why
+   it is low without taking away the thing that makes it worth keeping — its added lines. */
+.text-hit.near-dupe {
+  opacity: 0.72;
+}
+
+.text-hit-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.text-hit-when {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.text-hit-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.text-hit-terms {
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.text-hit-snippet {
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.text-bucket {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.text-bucket:hover {
+  background: var(--panel-soft);
+}
+
+.text-bucket-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.text-bucket-id {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-bucket-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-bucket-bar {
+  height: 4px;
+  margin: 6px 0;
+  border-radius: 999px;
+  background: var(--panel-raised);
+  overflow: hidden;
+}
+
+.text-bucket-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+/* The three lines under a bucket are a deliberate ladder, brightest first: what it was ABOUT
+   (model-named), the specific things NAMED on screen, then the raw distinctive words. Reading down
+   goes from interpretation to evidence, and each line is dimmer than the one above it so the eye
+   stops at whichever level it needs. */
+.text-bucket-topics {
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.text-bucket-notable {
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Counts say how much was captured; these say what it was about, which is the question a screenshot
+   trail is kept to answer. Always present — they need no model. */
+.text-bucket-terms {
+  color: var(--muted-strong);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Dimmer than the terms: while a run is going this line changes every few seconds, and it must not
+   pull the eye off the buckets it is filling in. */
+.text-topics-progress {
+  padding: 4px 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-topics-button {
+  min-height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.text-detail-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.text-detail-title {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-detail-path {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-detail-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.text-detail-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.text-detail-actions .button {
+  min-height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.text-detail-terms {
+  padding: 7px 12px 0;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+/* Monospace and wrapped: OCR output is one recognized line per line, and its column alignment is
+   often the only clue to what part of the screen a fragment came from. */
+.text-detail-body,
+.text-detail-member-lines {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--muted-strong);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.text-detail-member {
+  margin: 0 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.text-detail-member-head {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.text-detail-member-lines {
+  padding: 8px 10px;
+  color: var(--text);
+}
+
+.text-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.text-actions .button {
+  min-height: 28px;
+  padding: 0 10px;
+}
+
+.text-actions-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-empty {
+  padding: 22px 14px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* Same reasoning as `body.view-geo`: the header's search box filters image CARDS and the sort order
+   sorts them, and the grid is not on screen here. Worse than inert, they are confusable — this
+   panel has its own query box two rows below. */
+body.view-text .search-input,
+body.view-text .sort-select {
+  display: none;
+}
+
 @media (max-width: 1180px) {
   .geo-columns {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Reading pane under the results rather than beside them. Two columns stop being readable well
+     before the sidebar stops fitting: at this width the document pane is narrower than the OCR
+     lines it has to render, and `overflow-wrap: anywhere` would shred every path in it. Both panes
+     keep their own scroll — `.text-columns` is what scrolls, so the pair still cannot push the
+     panel into horizontal overflow. */
+  .text-columns {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(160px, 1fr) minmax(160px, 1fr);
+    overflow-y: auto;
+  }
+
+  /* One pane, one row. Without this the stacked layout's second row survives with nothing in it
+     and the bucket list only gets half the panel. */
+  .text-view.buckets-mode .text-columns {
+    grid-template-rows: minmax(0, 1fr);
+    overflow-y: hidden;
   }
 
   .geo-sets {
@@ -1948,7 +2764,8 @@ body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
    The window gets dragged down to a third of the screen routinely, so nothing below may depend on
    horizontal overflow to stay reachable: the action bar wraps, its two fixed-width controls become
    shrinkable, and the sidebar stacks above the grid instead of competing with it for width.
-   The shell stays exactly 100vh at every width — see the note on `grid-template-rows`.
+   The shell keeps its exact height (the viewport minus the title bar) at every width — see the note
+   on `grid-template-rows`.
    ============================== */
 
 @media (max-width: 980px) {
@@ -2013,13 +2830,32 @@ body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
     min-width: 0;
   }
 
+  /* Shares the title's row here too, so it may take at most half of it — a full-width status line
+     would push the view title out of a window that is already short of room. */
   .status-area {
-    flex: 1 1 100%;
-    width: auto;
+    flex: 0 1 50%;
   }
 
-  .drop-target,
-  .geo-view {
+  .drop-target {
     padding: 12px 14px 14px;
+  }
+
+  /* Same no-top-padding rule as the wide layout, for the same reason: the sticky toolbar would
+     otherwise park below it and let content scroll through the gap. Its bleed has to match this
+     gutter, not the wide one. */
+  .geo-view {
+    padding: 0 14px 14px;
+  }
+
+  .geo-toolbar {
+    margin: 0 -14px;
+  }
+
+  .text-view {
+    padding: 0 14px 14px;
+  }
+
+  .text-toolbar {
+    margin: 0 -14px;
   }
 }

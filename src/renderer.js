@@ -31,6 +31,24 @@ const state = {
   geoSummary: null,
   geoCoverage: null,
   geoSets: null,
+  // Extracted-text search. `textStatus` is what the panel paints before anything is queried; it is
+  // read without ever building, so opening the tab never starts work. Everything here mirrors what
+  // `icat` does from a terminal — one index, two front ends.
+  textStatus: null,
+  textMode: 'images',
+  textHits: null,
+  textBuckets: null,
+  textMatched: 0,
+  textUnknownTerms: [],
+  textSelectedHash: null,
+  textDetail: null,
+  textBusy: false,
+  textQueryToken: 0,
+  // Topic layer. `topicRun` is non-null only while a run is in flight; the last line it wrote stays
+  // on screen afterwards, so a finished run is still readable.
+  topicStatus: null,
+  topicRun: null,
+  topicMessage: null,
   // The gazetteer's `overrides` table, so the worklist can show what each string was decided to
   // mean — including decisions made by hand-editing the file. `geoOverrideBusy` holds the one
   // location string currently being written, so only its own row goes inert.
@@ -86,6 +104,33 @@ const els = {
   unclassifiedCount: document.getElementById('unclassified-count'),
   geoTab: document.getElementById('geo-tab'),
   geoCount: document.getElementById('geo-count'),
+  textTab: document.getElementById('text-tab'),
+  textCount: document.getElementById('text-count'),
+  textView: document.getElementById('text-view'),
+  textQuery: document.getElementById('text-query'),
+  textFrom: document.getElementById('text-from'),
+  textTo: document.getElementById('text-to'),
+  textRangePreset: document.getElementById('text-range-preset'),
+  textSearchButton: document.getElementById('text-search-button'),
+  textRebuildButton: document.getElementById('text-rebuild-button'),
+  textRefreshButton: document.getElementById('text-refresh-button'),
+  textModeImages: document.getElementById('text-mode-images'),
+  textModeBuckets: document.getElementById('text-mode-buckets'),
+  textBucketHours: document.getElementById('text-bucket-hours'),
+  textIncludeDupes: document.getElementById('text-include-dupes'),
+  textRequireAll: document.getElementById('text-require-all'),
+  textStatusLine: document.getElementById('text-status-line'),
+  textTopicsButton: document.getElementById('text-topics-button'),
+  textTopicsStop: document.getElementById('text-topics-stop'),
+  textTopicsProgress: document.getElementById('text-topics-progress'),
+  textCoverage: document.getElementById('text-coverage'),
+  textResults: document.getElementById('text-results'),
+  textDetail: document.getElementById('text-detail'),
+  textActions: document.getElementById('text-actions'),
+  textActionsLabel: document.getElementById('text-actions-label'),
+  textActionCategory: document.getElementById('text-action-category'),
+  textCategorizeButton: document.getElementById('text-categorize-button'),
+  textCopyButton: document.getElementById('text-copy-button'),
   geoView: document.getElementById('geo-view'),
   geoStats: document.getElementById('geo-stats'),
   geoLegend: document.getElementById('geo-legend'),
@@ -162,6 +207,11 @@ const els = {
   moveFolderSelect: document.getElementById('move-folder-select'),
   moveNewFolderInput: document.getElementById('move-new-folder-input'),
   cancelMoveButton: document.getElementById('cancel-move-button'),
+  dialogScrim: document.getElementById('dialog-scrim'),
+  titlebarMinimize: document.getElementById('titlebar-minimize'),
+  titlebarMaximize: document.getElementById('titlebar-maximize'),
+  titlebarClose: document.getElementById('titlebar-close'),
+  resizeGrips: document.getElementById('resize-grips'),
   settingsDialog: document.getElementById('settings-dialog'),
   settingsForm: document.getElementById('settings-form'),
   settingsRootFolder: document.getElementById('settings-root-folder'),
@@ -172,6 +222,9 @@ const els = {
   tileSizeInput: document.getElementById('tile-size-input'),
   tileSizeValue: document.getElementById('tile-size-value'),
   darkModeInput: document.getElementById('dark-mode-input'),
+  windowDefaultsStatus: document.getElementById('window-defaults-status'),
+  saveWindowDefaultsButton: document.getElementById('save-window-defaults-button'),
+  clearWindowDefaultsButton: document.getElementById('clear-window-defaults-button'),
   ocrWordThresholdInput: document.getElementById('ocr-word-threshold-input'),
   ocrWordThresholdValue: document.getElementById('ocr-word-threshold-value'),
   ocrAreaThresholdInput: document.getElementById('ocr-area-threshold-input'),
@@ -824,6 +877,8 @@ function renderSidebar() {
   // An opened set still belongs to Geo, so the tab stays lit while browsing one.
   els.geoTab.classList.toggle('active', state.currentView === 'geo' || state.currentView === 'geoSet');
   setCountPill(els.geoCount, state.geoSummary?.stats?.taggedTotal || 0);
+  els.textTab.classList.toggle('active', state.currentView === 'text');
+  setCountPill(els.textCount, state.textStatus?.docs || 0);
 
   els.categoryList.innerHTML = '';
   const categories = library?.categories || [];
@@ -945,6 +1000,8 @@ function renderHeader() {
     els.viewTitle.textContent = 'Unclassified';
   } else if (state.currentView === 'geo') {
     els.viewTitle.textContent = 'Geo Coverage';
+  } else if (state.currentView === 'text') {
+    els.viewTitle.textContent = 'Extracted Text';
   } else if (state.currentView === 'geoSet') {
     els.viewTitle.textContent = state.geoSetTitle || 'Country Set';
   } else {
@@ -955,6 +1012,9 @@ function renderHeader() {
   els.viewSubtitle.textContent =
     library?.root ||
     (state.loading ? (state.settings?.lastRoot || 'Loading…') : 'No root folder chosen yet');
+  // It shares its row with the title and the status line now, so a long root path ellipsizes —
+  // the tooltip is where the whole thing stays readable.
+  els.viewSubtitle.title = els.viewSubtitle.textContent;
 }
 
 // Built through `new Option(text, value)` rather than an interpolated HTML string: a name is
@@ -1175,9 +1235,17 @@ function render() {
   // The coverage scoreboard swaps places with the image grid rather than rendering inside it, so
   // the grid's virtual scrolling and drop handling never see any of this.
   const geoActive = state.currentView === 'geo';
-  els.mainDropTarget.classList.toggle('hidden', geoActive);
+  const textActive = state.currentView === 'text';
+  els.mainDropTarget.classList.toggle('hidden', geoActive || textActive);
   els.geoView.classList.toggle('hidden', !geoActive);
+  els.textView.classList.toggle('hidden', !textActive);
+  // Lets the stylesheet compact the header for this view: the search box and the sort order act on
+  // the image grid, which is exactly what this view replaces, so they are inert here and the panel
+  // gets their rows back. The text panel has its own query box for the same reason.
+  document.body.classList.toggle('view-geo', geoActive);
+  document.body.classList.toggle('view-text', textActive);
   if (geoActive) renderGeo();
+  else if (textActive) renderText();
   else renderImages();
 }
 
@@ -1310,6 +1378,7 @@ function navEntryLabel(entry) {
   if (entry.view === 'all') return 'All Images';
   if (entry.view === 'unclassified') return 'Unclassified';
   if (entry.view === 'geo') return 'Geo Coverage';
+  if (entry.view === 'text') return 'Extracted Text';
   if (entry.view === 'geoSet') return entry.geoSetTitle || 'country set';
   return entry.category || 'category';
 }
@@ -1322,8 +1391,9 @@ function captureNavScroll() {
   // A hidden surface reports 0; only overwrite what is actually on screen, or opening a set from
   // Geo Coverage would record the grid's 0 over the set list's real offset.
   const geoActive = state.currentView === 'geo';
+  const textActive = state.currentView === 'text';
   entry.scroll = {
-    main: geoActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
+    main: geoActive || textActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
     geo: geoActive ? els.geoView.scrollTop : entry.scroll.geo,
     geoSets: geoActive ? els.geoSets.scrollTop : entry.scroll.geoSets,
   };
@@ -2718,9 +2788,61 @@ async function revealImage(filePath) {
   }
 }
 
+// ==============================
+// Dialogs
+//
+// Every dialog is opened NON-modally and dimmed by `#dialog-scrim` rather than the browser's own
+// ::backdrop. `showModal()` marks the whole document outside the dialog inert, and since the window
+// is undecorated that now includes the title bar — with Settings open, the window's close, minimize
+// and maximize buttons all stopped responding. The scrim reproduces the modality over the part of
+// the window where it belongs, stops where the frame begins, and dismisses on a click.
+//
+// Each dialog closes through its own `close…` function because most of them clear pending state
+// (the paths queued for import, the image a move is about to act on) that a bare `.close()` leaves
+// behind, so every dismissal path — Done, Cancel, Escape, clicking away — must go through them.
+// ==============================
+
+function dialogClosers() {
+  return [
+    [els.categoryDialog, closeCategoryDialog],
+    [els.categoryRenameDialog, closeCategoryRenameDialog],
+    [els.moveDialog, closeMoveDialog],
+    [els.importDialog, closeImportDialog],
+    [els.settingsDialog, closeSettingsDialog],
+  ];
+}
+
+function openDialog(dialog) {
+  dialog.show();
+  syncDialogScrim();
+}
+
+function syncDialogScrim() {
+  document.body.classList.toggle('dialog-open', dialogClosers().some(([dialog]) => dialog.open));
+}
+
+function dismissOpenDialogs() {
+  for (const [dialog, close] of dialogClosers()) {
+    if (dialog.open) close();
+  }
+}
+
+function installDialogDismissal() {
+  // A dialog also closes without passing through `dismissOpenDialogs` — `<form method="dialog">`
+  // does it natively — so the scrim follows the `close` event, which every path fires.
+  for (const [dialog] of dialogClosers()) {
+    dialog.addEventListener('close', syncDialogScrim);
+  }
+  // `click` rather than `mousedown`: a drag that starts on a slider inside the dialog and releases
+  // out here would otherwise dismiss it mid-gesture.
+  els.dialogScrim.addEventListener('click', event => {
+    if (event.target === els.dialogScrim) dismissOpenDialogs();
+  });
+}
+
 function openCategoryDialog() {
   els.categoryNameInput.value = '';
-  els.categoryDialog.showModal();
+  openDialog(els.categoryDialog);
   setTimeout(() => els.categoryNameInput.focus(), 0);
 }
 
@@ -2731,7 +2853,7 @@ function closeCategoryDialog() {
 function openCategoryRenameDialog(name) {
   state.pendingCategoryRenameName = name;
   els.categoryRenameInput.value = name;
-  els.categoryRenameDialog.showModal();
+  openDialog(els.categoryRenameDialog);
   setTimeout(() => {
     els.categoryRenameInput.focus();
     els.categoryRenameInput.select();
@@ -2752,7 +2874,7 @@ function openMoveDialog(image) {
     ...folders.map(folder => new Option(folder.name, folder.name, false, folder.name === image.sourceFolder))
   );
   els.moveNewFolderInput.value = '';
-  els.moveDialog.showModal();
+  openDialog(els.moveDialog);
 }
 
 function closeMoveDialog() {
@@ -2802,7 +2924,7 @@ function openImportDialog(paths) {
     paths.length === 1 ? '1 item selected' : `${paths.length} items selected`;
   els.importFolderSelect.replaceChildren(...folders.map(folder => new Option(folder.name, folder.name)));
   els.importNewFolderInput.value = folders.some(folder => folder.name === suggested) ? '' : suggested;
-  els.importDialog.showModal();
+  openDialog(els.importDialog);
   setTimeout(() => els.importNewFolderInput.focus(), 0);
 }
 
@@ -2853,10 +2975,15 @@ function openSettingsDialog() {
   syncNsfwModelHint();
   loadAutoRefreshSettings();
   loadVisionAndChunkSettings();
-  els.settingsDialog.showModal();
+  // Reads the live window rect, so it has to be re-fetched on every open rather than cached.
+  loadWindowDefaults();
+  openDialog(els.settingsDialog);
 }
 
 function closeSettingsDialog() {
+  // Tile size and dark mode are applied live but persisted on the way out, so the save belongs to
+  // every way of leaving — Done, Escape, and clicking away — not just to the submit button.
+  saveUiSettingsNow();
   els.settingsDialog.close();
 }
 
@@ -3037,6 +3164,8 @@ function analysisTypeLabel(type) {
 
 async function runNextInQueue() {
   if (!state.analysisQueue.length) {
+    const extractionRan = state.analysisRan?.has('ocr');
+    state.analysisRan = null;
     // All done — refresh and unlock
     state.analysisRunning = null;
     setInteractionsLocked(false);
@@ -3049,6 +3178,12 @@ async function runNextInQueue() {
         setLoading(false);
         render();
         setStatus('Analysis complete.');
+        // New extracted text makes the search index stale by construction. Rebuilding here keeps
+        // the cost inside the run that caused it, instead of charging it to the next search.
+        if (extractionRan) {
+          await rebuildTextIndex();
+          await loadTextStatus();
+        }
       } catch (error) {
         setLoading(false);
         setStatus('');
@@ -3058,7 +3193,9 @@ async function runNextInQueue() {
     return;
   }
 
-  const { type, force } = state.analysisQueue.shift();
+  const { type, force, indexedOnly } = state.analysisQueue.shift();
+  state.analysisRan = state.analysisRan || new Set();
+  state.analysisRan.add(type);
   state.analysisRunning = type;
   const verb = force ? 'Re-analyzing' : 'Analyzing';
   setStatus(`${verb} (${analysisTypeLabel(type)})…`);
@@ -3067,7 +3204,7 @@ async function runNextInQueue() {
     if (type === 'text') {
       await window.categorizerAPI.analyzeText(state.library.root, force);
     } else if (type === 'ocr') {
-      await window.categorizerAPI.extractText(state.library.root, force);
+      await window.categorizerAPI.extractText(state.library.root, force, !!indexedOnly);
     } else if (type === 'chunk') {
       await window.categorizerAPI.buildChunkPlan(state.library.root, force);
     } else if (type === 'vision') {
@@ -3475,6 +3612,106 @@ function installSidebarToggle() {
   });
 }
 
+// ==============================
+// Custom title bar
+// The window is undecorated, so the strip at the top of the page IS the frame: Tauri's own
+// drag-region script handles moving and double-click-to-maximize, and everything below supplies the
+// parts it doesn't — the three buttons, the maximized/restored glyph, and the edge resize handles a
+// borderless window has no OS border for.
+// ==============================
+
+async function syncMaximizedState() {
+  try {
+    const maximized = await window.categorizerAPI.isWindowMaximized();
+    document.body.classList.toggle('window-maximized', !!maximized);
+    els.titlebarMaximize.title = maximized ? 'Restore down' : 'Maximize';
+    els.titlebarMaximize.setAttribute('aria-label', maximized ? 'Restore down' : 'Maximize');
+  } catch {}
+}
+
+async function installTitlebar() {
+  els.titlebarMinimize.addEventListener('click', () => {
+    window.categorizerAPI.minimizeWindow?.();
+  });
+  els.titlebarMaximize.addEventListener('click', async () => {
+    await window.categorizerAPI.toggleMaximizeWindow?.();
+    syncMaximizedState();
+  });
+  els.titlebarClose.addEventListener('click', () => {
+    window.categorizerAPI.closeWindow?.();
+  });
+
+  for (const grip of els.resizeGrips.querySelectorAll('.resize-grip')) {
+    grip.addEventListener('mousedown', event => {
+      if (event.button !== 0) return;
+      // Without this, an ancestor turning the press into startDragging would move the window
+      // instead of resizing it.
+      event.preventDefault();
+      event.stopPropagation();
+      window.categorizerAPI.startResizeDragging?.(grip.dataset.resizeDir);
+    });
+  }
+
+  // Aero Snap and the drag-region's own double-click both maximize without going through the
+  // button, so the glyph has to follow the window rather than the click that was made here.
+  try {
+    await window.categorizerAPI.onWindowResized?.(syncMaximizedState);
+  } catch {}
+  syncMaximizedState();
+}
+
+// ==============================
+// Saved window position and size
+// ==============================
+
+function windowBoundsLabel(bounds) {
+  if (!bounds) return 'unknown';
+  return `${bounds.width} × ${bounds.height} at ${bounds.x}, ${bounds.y}`;
+}
+
+function renderWindowDefaults(defaults) {
+  if (!defaults) {
+    els.windowDefaultsStatus.textContent = '';
+    return;
+  }
+  // The saved rect is kept alongside the maximized flag — it's the size the window comes back to
+  // when it's restored down, which is worth saying out loud since nothing on screen shows it.
+  const saved = defaults.savedMaximized
+    ? `maximized${defaults.saved ? ` (restoring down to ${windowBoundsLabel(defaults.saved)})` : ''}`
+    : windowBoundsLabel(defaults.saved);
+  const current = `Now: ${defaults.currentMaximized ? 'maximized' : windowBoundsLabel(defaults.current)}.`;
+  els.windowDefaultsStatus.textContent = defaults.saved || defaults.savedMaximized
+    ? `Opens at ${saved}. ${current}`
+    : `No saved default — opens at its built-in size, placed by Windows. ${current}`;
+  els.clearWindowDefaultsButton.disabled = !defaults.saved && !defaults.savedMaximized;
+}
+
+async function loadWindowDefaults() {
+  try {
+    renderWindowDefaults(await window.categorizerAPI.getWindowDefaults());
+  } catch (error) {
+    els.windowDefaultsStatus.textContent = errorText(error);
+  }
+}
+
+async function saveWindowDefaults() {
+  try {
+    renderWindowDefaults(await window.categorizerAPI.saveWindowDefaults());
+    showToast('Saved this position and size as the default.');
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function clearWindowDefaults() {
+  try {
+    renderWindowDefaults(await window.categorizerAPI.clearWindowDefaults());
+    showToast('Cleared the saved window default.');
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
 function startPointerDrag(event, card) {
   if (state.analyzing || event.button !== 0 || event.target.closest('button, select, .analysis-summary')) return;
 
@@ -3568,6 +3805,8 @@ function installEvents() {
   els.allTab.addEventListener('click', selectAll);
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
   els.geoTab.addEventListener('click', selectGeo);
+  els.textTab.addEventListener('click', selectText);
+  wireTextPanel();
   els.geoRunButton.addEventListener('click', () => void runSelectedGeoPipeline());
   els.geoStopButton.addEventListener('click', () => void stopGeoPipeline());
   for (const step of GEO_PIPELINE_STEPS) {
@@ -3602,6 +3841,8 @@ function installEvents() {
     selectRootFolder(value);
   });
   els.settingsButton.addEventListener('click', openSettingsDialog);
+  els.saveWindowDefaultsButton.addEventListener('click', saveWindowDefaults);
+  els.clearWindowDefaultsButton.addEventListener('click', clearWindowDefaults);
   els.refreshButton.addEventListener('click', refreshAll);
   els.importButton.addEventListener('click', () =>
     importFromPicker(window.categorizerAPI.chooseImagesToImport));
@@ -3661,7 +3902,6 @@ function installEvents() {
 
   els.settingsForm.addEventListener('submit', event => {
     event.preventDefault();
-    saveUiSettingsNow();
     closeSettingsDialog();
   });
   els.settingsRootButton.addEventListener('click', changeRootFolder);
@@ -3716,13 +3956,9 @@ function installEvents() {
   els.autoRefreshToastInput.addEventListener('change', saveAutoRefreshSettings);
 
   document.addEventListener('keydown', event => {
-    if (event.key === 'Escape') {
-      if (els.categoryDialog.open) closeCategoryDialog();
-      if (els.categoryRenameDialog.open) closeCategoryRenameDialog();
-      if (els.moveDialog.open) closeMoveDialog();
-      if (els.importDialog.open) closeImportDialog();
-      if (els.settingsDialog.open) closeSettingsDialog();
-    }
+    // A non-modal dialog gets no free Escape handling from the browser, so this listener is now the
+    // only thing closing one on Escape rather than a duplicate of the native behaviour.
+    if (event.key === 'Escape') dismissOpenDialogs();
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
       event.preventDefault();
       refreshAll();
@@ -3806,6 +4042,8 @@ async function installAnalysisListeners() {
 async function init() {
   try {
     installEvents();
+    installTitlebar();
+    installDialogDismissal();
     // Mark loading before the first paint so the window unhides onto an intentional spinner
     // rather than the "No root folder chosen yet" empty state shown before settings load.
     setLoading(true);
@@ -3814,6 +4052,7 @@ async function init() {
 
     await installAnalysisListeners();
     await installKindListeners();
+    await installTopicListeners();
     await installFileDropListener();
     await refreshAll();
   } catch (error) {
@@ -3824,6 +4063,837 @@ async function init() {
     render();
     showWindowAfterPaint();
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extracted Text
+//
+// Reads the same index `icat` reads. Two rules shape everything here:
+//   * Opening the panel must never start work — `getTextStatus` reports what exists and offers a
+//     button; it does not build. Searching may build, because that is what the user just asked for.
+//   * The panel shows the RAW text. This is the user reading their own screenshots, which is not an
+//     egress event; redaction happens on the paths that leave the machine (the CLI, and anything an
+//     agent reads). Keeping the two apart is the whole point of redacting at read rather than at
+//     index time.
+// ---------------------------------------------------------------------------------------------
+
+const TEXT_SNIPPET_WIDTH = 320;
+
+function selectText() {
+  cancelPointerDrag();
+  pushNavEntry(navEntry('text'));
+  state.currentView = 'text';
+  state.currentCategory = null;
+  render();
+  loadTextStatus();
+}
+
+async function loadTextStatus() {
+  const root = state.library?.root;
+  if (!root) return;
+  try {
+    state.textStatus = await window.categorizerAPI.getTextStatus(root);
+  } catch (error) {
+    console.error('Text status failed:', error);
+  }
+  renderSidebar();
+  if (state.currentView === 'text') renderText();
+  loadTopicStatus();
+}
+
+function wireTextPanel() {
+  els.textSearchButton.addEventListener('click', () => runTextQuery());
+  els.textQuery.addEventListener('keydown', event => {
+    if (event.key === 'Enter') runTextQuery();
+  });
+  els.textFrom.addEventListener('change', () => runTextQuery());
+  els.textTo.addEventListener('change', () => runTextQuery());
+  els.textIncludeDupes.addEventListener('change', () => runTextQuery());
+  els.textRequireAll.addEventListener('change', () => runTextQuery());
+  els.textBucketHours.addEventListener('change', () => {
+    // Topics are stored per width, so changing it changes how much is named.
+    loadTopicStatus();
+    if (state.textMode === 'buckets') runTextQuery();
+  });
+  els.textTopicsButton.addEventListener('click', () => generateTopics());
+  els.textTopicsStop.addEventListener('click', () => stopTopics());
+
+  els.textRangePreset.addEventListener('change', () => {
+    const days = Number(els.textRangePreset.value || 0);
+    if (!days) {
+      els.textFrom.value = '';
+      els.textTo.value = '';
+    } else {
+      const now = new Date();
+      const start = new Date(now.getTime() - (days - 1) * 86400000);
+      els.textFrom.value = isoDateInput(start);
+      els.textTo.value = isoDateInput(now);
+    }
+    runTextQuery();
+  });
+
+  els.textModeImages.addEventListener('click', () => setTextMode('images'));
+  els.textModeBuckets.addEventListener('click', () => setTextMode('buckets'));
+
+  els.textRefreshButton.addEventListener('click', () => loadTextStatus());
+  els.textRebuildButton.addEventListener('click', () => rebuildTextIndex());
+  els.textActionCategory.addEventListener('change', () => {
+    els.textCategorizeButton.disabled = !els.textActionCategory.value;
+  });
+  els.textCategorizeButton.addEventListener('click', () => categorizeTextResults());
+  els.textCopyButton.addEventListener('click', () => copyTextResults());
+}
+
+function setTextMode(mode) {
+  if (state.textMode === mode) return;
+  state.textMode = mode;
+  els.textModeImages.classList.toggle('active', mode === 'images');
+  els.textModeBuckets.classList.toggle('active', mode === 'buckets');
+  runTextQuery();
+}
+
+function isoDateInput(date) {
+  const pad = value => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+// The index stores LOCAL civil seconds — the screenshot filename's own wall clock, with no timezone
+// applied. So a date from the picker converts by reading its fields, never via `getTime()`, which
+// would shift the whole range by the UTC offset and quietly drop a day at either end.
+function civilSecondsFromInput(value, endOfDay) {
+  if (!value) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  const days = Math.floor(Date.UTC(year, month - 1, day) / 86400000);
+  return days * 86400 + (endOfDay ? 86399 : 0);
+}
+
+function textQueryArgs() {
+  return {
+    query: els.textQuery.value || '',
+    from: civilSecondsFromInput(els.textFrom.value, false),
+    to: civilSecondsFromInput(els.textTo.value, true),
+    folders: [],
+    minChars: 0,
+    includeDupes: els.textIncludeDupes.checked,
+    requireAll: els.textRequireAll.checked,
+    limit: 200,
+  };
+}
+
+async function runTextQuery() {
+  const root = state.library?.root;
+  if (!root) return;
+  const args = textQueryArgs();
+  if (state.textMode === 'images' && !args.query.trim()) {
+    state.textHits = null;
+    state.textMatched = 0;
+    state.textUnknownTerms = [];
+    renderText();
+    return;
+  }
+
+  // Every query carries a token; a slower earlier one landing later must not overwrite a newer
+  // result. The search box fires on Enter rather than per keystroke, but the date pickers and the
+  // toggles all fire too, and those overlap easily.
+  const token = ++state.textQueryToken;
+  state.textBusy = true;
+  renderText();
+
+  try {
+    if (state.textMode === 'buckets') {
+      const hours = Number(els.textBucketHours.value || 48);
+      const buckets = await window.categorizerAPI.getTextTimeline(root, args, hours);
+      if (token !== state.textQueryToken) return;
+      state.textBuckets = buckets;
+    } else {
+      const result = await window.categorizerAPI.searchText(root, args, TEXT_SNIPPET_WIDTH);
+      if (token !== state.textQueryToken) return;
+      state.textHits = result.hits;
+      state.textMatched = result.matched;
+      state.textUnknownTerms = result.unknownTerms || [];
+      if (result.phraseCapped) {
+        showToast('Phrase checked against the top-ranked candidates only.');
+      }
+    }
+    // A query may have built the index, so the status line beside it is now out of date.
+    state.textStatus = await window.categorizerAPI.getTextStatus(root);
+  } catch (error) {
+    if (token === state.textQueryToken) showToast(errorText(error));
+  } finally {
+    if (token === state.textQueryToken) {
+      state.textBusy = false;
+      renderText();
+      renderSidebar();
+    }
+  }
+}
+
+/// Tops the index up from the panel: OCR the in-scope images that have none, then rebuild.
+///
+/// Goes through the ordinary analysis queue rather than calling the command directly, so it inherits
+/// everything that already works there — the interaction lock, the status line, the Stop button, and
+/// the rescan on the way out. A second, parallel path would be a second set of those bugs.
+async function extractPendingText() {
+  if (!state.library) return;
+  if (state.analyzing) {
+    showToast('Another analysis pass is running.');
+    return;
+  }
+  const status = state.textStatus;
+  const pending = status?.pending || 0;
+  if (!pending) return;
+
+  const blocked = status?.blockedCategories || [];
+  const reachable = status?.reachablePending ?? pending;
+  const scope = (status?.categories || []).join('/') || 'in-scope';
+
+  // Nothing is reachable because the category the index covers is switched off for analysis. Lifting
+  // that is a real settings change, so it is asked for explicitly rather than folded into "extract".
+  if (reachable === 0 && blocked.length) {
+    const names = blocked.join(', ');
+    const confirmed = window.confirm(
+      `${names} ${blocked.length > 1 ? 'are' : 'is'} excluded from analysis, so extraction skips ` +
+        `${blocked.length > 1 ? 'them' : 'it'} — that is why nothing runs.\n\n` +
+        `Include ${names} in analysis and extract ${formatCount(pending)} images?\n\n` +
+        'This also lets the other Analyze passes see these images again.'
+    );
+    if (!confirmed) return;
+    try {
+      for (const category of blocked) {
+        await window.categorizerAPI.setCategoryAnalysisIncluded(state.library.root, category, true);
+      }
+      state.library = await window.categorizerAPI.scanLibrary(state.library.root);
+      render();
+    } catch (error) {
+      showToast(errorText(error));
+      return;
+    }
+  } else {
+    const confirmed = window.confirm(
+      `Extract text from ${formatCount(reachable)} ${scope} images?\n\n` +
+        'This is OCR on this machine — no model, no network — but it takes a while at this count. ' +
+        'You can stop it part way; everything done by then is kept.'
+    );
+    if (!confirmed) return;
+  }
+
+  state.analysisQueue = [{ type: 'ocr', force: false, indexedOnly: true }];
+  setInteractionsLocked(true);
+  await runNextInQueue();
+}
+
+async function rebuildTextIndex() {
+  const root = state.library?.root;
+  if (!root) return;
+  els.textRebuildButton.disabled = true;
+  try {
+    const report = await window.categorizerAPI.buildTextIndex(root);
+    showToast(`Indexed ${formatCount(report.docs)} documents in ${formatCount(report.elapsedMs)} ms.`);
+    await loadTextStatus();
+    if (state.textHits || state.textBuckets) runTextQuery();
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    els.textRebuildButton.disabled = false;
+  }
+}
+
+async function selectTextDocument(hash) {
+  const root = state.library?.root;
+  if (!root) return;
+  state.textSelectedHash = hash;
+  state.textDetail = null;
+  renderText();
+  try {
+    state.textDetail = await window.categorizerAPI.getImageText(root, hash);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+  if (state.currentView === 'text') renderText();
+}
+
+function textResultHashes() {
+  return (state.textHits || []).map(hit => hit.hash);
+}
+
+async function categorizeTextResults() {
+  const root = state.library?.root;
+  const category = els.textActionCategory.value;
+  const hashes = textResultHashes();
+  if (!root || !category || !hashes.length) return;
+
+  // An image holds ONE category, so this overwrites whatever these were filed under — and since
+  // the index only covers High Text, filing them elsewhere also drops them out of search. Both are
+  // fine when meant and unpleasant when not, and there is no undo, so a whole result set is
+  // confirmed. Same bar as deleting a category, which already asks.
+  const confirmed = window.confirm(
+    `Move ${hashes.length} images to "${category}"?\n\n` +
+      'This replaces the category each one currently has. Anything moved out of the indexed ' +
+      'categories also leaves the text index.'
+  );
+  if (!confirmed) return;
+
+  els.textCategorizeButton.disabled = true;
+  try {
+    const changed = await window.categorizerAPI.categorizeImages(root, hashes, category);
+    showToast(`${formatCount(changed)} of ${formatCount(hashes.length)} images moved to ${category}.`);
+    await refreshLibrary();
+    // Categories decide what is indexed, so moving images out of scope leaves the index describing
+    // a library that no longer exists. Rebuilding here keeps the panel honest about its own results.
+    await rebuildTextIndex();
+  } catch (error) {
+    showToast(errorText(error));
+  } finally {
+    els.textCategorizeButton.disabled = false;
+  }
+}
+
+async function copyTextResults() {
+  const hits = state.textHits || [];
+  if (!hits.length) return;
+  const lines = hits.map(hit => `## ${hit.at}  ${hit.path}\n${hit.snippet}`);
+  try {
+    await navigator.clipboard.writeText(lines.join('\n\n'));
+    showToast(`Copied ${formatCount(hits.length)} results.`);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+function renderText() {
+  const status = state.textStatus;
+
+  els.textStatusLine.textContent = state.textBusy ? 'Searching…' : textStatusSummary(status);
+
+  // The reading pane has nothing to show in timeline mode — a bucket is a count and a keyword list,
+  // not a document — so it gives its half back rather than sitting there saying "pick a result".
+  els.textView.classList.toggle('buckets-mode', state.textMode === 'buckets');
+
+  renderTextCoverage(status);
+  renderTextTopicsBar();
+  renderTextActions();
+
+  if (state.textMode === 'buckets') renderTextBuckets();
+  else renderTextHits();
+
+  renderTextDetail();
+}
+
+function textStatusSummary(status) {
+  if (!status) return '';
+  if (!status.docs) return 'No index yet — search to build one.';
+  const parts = [`${formatCount(status.docs)} documents`];
+  if (status.exactDupes) parts.push(`${formatCount(status.exactDupes)} identical hidden`);
+  if (status.nearDupes) parts.push(`${formatCount(status.nearDupes)} near demoted`);
+  if (status.spanFrom) parts.push(`${status.spanFrom} → ${status.spanTo}`);
+  return parts.join(' · ');
+}
+
+function renderTextCoverage(status) {
+  els.textCoverage.innerHTML = '';
+  if (!status) return;
+
+  const line = document.createElement('div');
+  line.className = 'text-coverage-line';
+
+  const scope = document.createElement('span');
+  scope.textContent =
+    `${status.categories.join(', ')}: ${formatCount(status.extracted)} of ${formatCount(status.inScope)} extracted`;
+  line.append(scope);
+
+  if (status.pending) {
+    // Still stated without urgency — a screenshot corpus is meant to have holes — but it is the one
+    // number on this panel with an obvious next action, so it IS that action rather than a pointer
+    // to one somewhere else.
+    //
+    // The catch, and the reason this is not just a button: the analysis scope is a SEPARATE axis
+    // from what the index covers, and on a real library they disagree. Extraction honours
+    // `excludedAnalysisCategories`, and High Text — the category the whole index is built from — is
+    // routinely excluded there. Offering to extract 5,265 images and then silently doing nothing is
+    // the failure this avoids, so a blocked count says what is blocking it and clicking it offers
+    // to lift exactly that.
+    const blockedCategories = status.blockedCategories || [];
+    const blockedFolders = status.blockedFolders || [];
+    const reachable = status.reachablePending ?? status.pending;
+
+    const pending = document.createElement('button');
+    pending.type = 'button';
+    pending.className = 'text-coverage-pending';
+    pending.disabled = state.analyzing;
+    pending.addEventListener('click', () => extractPendingText());
+
+    if (reachable === 0 && blockedCategories.length) {
+      pending.classList.add('blocked');
+      pending.textContent =
+        `${formatCount(status.pending)} not extracted — ${blockedCategories.join(', ')} excluded from analysis`;
+      pending.title =
+        `Extraction skips ${blockedCategories.join(', ')} because ${blockedCategories.length > 1 ? 'they are' : 'it is'} ` +
+        'switched off in the Categories list. Click to include and extract.';
+    } else {
+      pending.textContent = `Extract ${formatCount(reachable)} more`;
+      pending.title =
+        `Run OCR over the ${formatCount(reachable)} ${status.categories.join('/')} images that have ` +
+        'no extracted text yet, then rebuild the index. Cancellable; also `icat extract`.';
+    }
+    line.append(pending);
+
+    // Excluded FOLDERS are left as a statement, not an offer. A folder switched off means "don't
+    // look in here at all", which is a broader intent than one category's text — turning it back on
+    // would change what every other pass sees too.
+    if (blockedFolders.length) {
+      const folders = document.createElement('span');
+      folders.className = 'text-coverage-note';
+      folders.textContent = `${blockedFolders.join(', ')} excluded from analysis`;
+      folders.title = 'Source folders switched off in the sidebar. Nothing here will extract them.';
+      line.append(folders);
+    }
+  }
+
+  if (status.staleReason) {
+    const stale = document.createElement('span');
+    stale.className = 'text-coverage-stale';
+    stale.textContent = status.staleReason;
+    line.append(stale);
+  }
+
+  els.textCoverage.append(line);
+}
+
+function renderTextActions() {
+  const hits = state.textHits || [];
+  const show = state.textMode === 'images' && hits.length > 0;
+  els.textActions.classList.toggle('hidden', !show);
+  if (!show) return;
+
+  els.textActionsLabel.textContent = `${formatCount(hits.length)} results`;
+
+  const categories = (state.library?.categories || []).map(category => category.name);
+  const previous = els.textActionCategory.value;
+  els.textActionCategory.innerHTML = '';
+
+  // A placeholder first, and the button stays dead until something is chosen. Without it the
+  // select defaults to whatever category happens to sort first — which here is `Explicit` — so a
+  // single click on a 200-result set would file two hundred screenshots under it.
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Choose a category…';
+  els.textActionCategory.append(placeholder);
+
+  for (const name of categories) {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    els.textActionCategory.append(option);
+  }
+  els.textActionCategory.value = categories.includes(previous) ? previous : '';
+  els.textCategorizeButton.disabled = !els.textActionCategory.value;
+}
+
+function renderTextHits() {
+  els.textResults.innerHTML = '';
+  const hits = state.textHits;
+
+  if (state.textBusy && !hits) {
+    els.textResults.append(textEmpty('Searching…'));
+    return;
+  }
+  if (!hits) {
+    els.textResults.append(
+      textEmpty('Type a query and press Enter. Quote a "phrase" to require it exactly.')
+    );
+    return;
+  }
+  if (!hits.length) {
+    const unknown = state.textUnknownTerms || [];
+    els.textResults.append(
+      textEmpty(
+        unknown.length
+          ? `Nothing found. These were never on screen: ${unknown.join(', ')}`
+          : 'Nothing matched in this range.'
+      )
+    );
+    return;
+  }
+
+  const header = document.createElement('div');
+  header.className = 'text-results-head';
+  header.textContent = `${formatCount(state.textMatched)} matched · showing ${formatCount(hits.length)}`;
+  if ((state.textUnknownTerms || []).length) {
+    const unknown = document.createElement('span');
+    unknown.className = 'text-unknown-terms';
+    unknown.textContent = `never on screen: ${state.textUnknownTerms.join(', ')}`;
+    header.append(unknown);
+  }
+  els.textResults.append(header);
+
+  for (const hit of hits) {
+    els.textResults.append(renderTextHit(hit));
+  }
+}
+
+function renderTextHit(hit) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'text-hit';
+  row.classList.toggle('selected', hit.hash === state.textSelectedHash);
+  // A near-duplicate is dimmed rather than hidden: it ranks below first-hand hits but stays
+  // readable, because the lines it added are often exactly what was being looked for.
+  row.classList.toggle('near-dupe', hit.rank === 2);
+
+  const head = document.createElement('div');
+  head.className = 'text-hit-head';
+
+  const when = document.createElement('span');
+  when.className = 'text-hit-when';
+  when.textContent = hit.at;
+  head.append(when);
+
+  const path = document.createElement('span');
+  path.className = 'text-hit-path';
+  path.textContent = hit.path;
+  path.title = hit.path;
+  head.append(path);
+
+  for (const badge of textHitBadges(hit)) {
+    const element = document.createElement('span');
+    element.className = 'text-badge';
+    element.textContent = badge;
+    head.append(element);
+  }
+
+  row.append(head);
+
+  if (hit.terms?.length) {
+    const terms = document.createElement('div');
+    terms.className = 'text-hit-terms';
+    terms.textContent = hit.terms.join(' · ');
+    row.append(terms);
+  }
+
+  const snippet = document.createElement('div');
+  snippet.className = 'text-hit-snippet';
+  snippet.textContent = hit.snippet;
+  row.append(snippet);
+
+  row.addEventListener('click', () => selectTextDocument(hit.hash));
+  return row;
+}
+
+function textHitBadges(hit) {
+  const badges = [];
+  if (hit.rank === 2) badges.push('near-dupe');
+  if (hit.exactDupes) badges.push(`+${hit.exactDupes} identical`);
+  if (hit.nearDupes) badges.push(`+${hit.nearDupes} near`);
+  return badges;
+}
+
+function renderTextBuckets() {
+  els.textResults.innerHTML = '';
+  const buckets = state.textBuckets;
+  if (state.textBusy && !buckets) {
+    els.textResults.append(textEmpty('Building the timeline…'));
+    return;
+  }
+  if (!buckets || !buckets.length) {
+    els.textResults.append(textEmpty('No extracted text in this range.'));
+    return;
+  }
+
+  const busiest = buckets.reduce((most, bucket) => Math.max(most, bucket.images), 1);
+
+  for (const bucket of buckets) {
+    const row = document.createElement('div');
+    row.className = 'text-bucket';
+
+    const head = document.createElement('div');
+    head.className = 'text-bucket-head';
+
+    const label = document.createElement('span');
+    label.className = 'text-bucket-id';
+    label.textContent = bucket.id;
+    head.append(label);
+
+    const count = document.createElement('span');
+    count.className = 'text-bucket-count';
+    count.textContent = `${formatCount(bucket.images)} images`;
+    head.append(count);
+
+    if (bucket.exactDupes || bucket.nearDupes) {
+      const dupes = document.createElement('span');
+      dupes.className = 'text-badge';
+      dupes.textContent = `${bucket.exactDupes} identical, ${bucket.nearDupes} near`;
+      head.append(dupes);
+    }
+    row.append(head);
+
+    const bar = document.createElement('div');
+    bar.className = 'text-bucket-bar';
+    const fill = document.createElement('div');
+    fill.className = 'text-bucket-fill';
+    fill.style.width = `${Math.max(2, Math.round((bucket.images / busiest) * 100))}%`;
+    bar.append(fill);
+    row.append(bar);
+
+    // Topics first when they exist — they answer "what was this about", which the statistical
+    // terms below only supply the raw material for. Both are shown: a topic phrase smooths away the
+    // exact spellings (identifiers, error strings) that make a term searchable.
+    if (bucket.topics?.length) {
+      const topics = document.createElement('div');
+      topics.className = 'text-bucket-topics';
+      topics.textContent = bucket.topics.join(' · ');
+      if (bucket.topicsStale) {
+        const stale = document.createElement('span');
+        stale.className = 'text-badge';
+        stale.textContent = 'stale';
+        stale.title = 'These names were written for a different set of images than this bucket now holds.';
+        topics.append(' ', stale);
+      }
+      row.append(topics);
+    }
+
+    if (bucket.notable?.length) {
+      const notable = document.createElement('div');
+      notable.className = 'text-bucket-notable';
+      notable.textContent = bucket.notable.join(' · ');
+      row.append(notable);
+    }
+
+    if (bucket.terms?.length) {
+      const terms = document.createElement('div');
+      terms.className = 'text-bucket-terms';
+      terms.textContent = bucket.terms.join(' · ');
+      row.append(terms);
+    }
+
+    // Clicking a bucket narrows the date range to it and drops back to the image list — the
+    // timeline's job is to be a way in, not a destination.
+    row.addEventListener('click', () => {
+      els.textFrom.value = isoDateInput(new Date(bucket.start * 1000));
+      els.textTo.value = isoDateInput(new Date(bucket.end * 1000));
+      els.textRangePreset.value = '';
+      setTextMode('images');
+    });
+    els.textResults.append(row);
+  }
+}
+
+function renderTextDetail() {
+  els.textDetail.innerHTML = '';
+  const detail = state.textDetail;
+
+  if (!state.textSelectedHash) {
+    els.textDetail.append(textEmpty('Pick a result to read its full text.'));
+    return;
+  }
+  if (!detail) {
+    els.textDetail.append(textEmpty('Loading…'));
+    return;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'text-detail-head';
+
+  const title = document.createElement('div');
+  title.className = 'text-detail-title';
+  title.textContent = detail.at;
+  head.append(title);
+
+  const path = document.createElement('div');
+  path.className = 'text-detail-path';
+  path.textContent = detail.path;
+  head.append(path);
+
+  const meta = document.createElement('div');
+  meta.className = 'text-detail-meta';
+  meta.textContent = `${detail.category} · ${formatCount(detail.chars)} chars`;
+  head.append(meta);
+
+  const actions = document.createElement('div');
+  actions.className = 'text-detail-actions';
+
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'button secondary';
+  copy.textContent = 'Copy text';
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(detail.text);
+      showToast('Text copied.');
+    } catch (error) {
+      showToast(errorText(error));
+    }
+  });
+  actions.append(copy);
+
+  const reveal = document.createElement('button');
+  reveal.type = 'button';
+  reveal.className = 'button secondary';
+  reveal.textContent = 'Show image';
+  reveal.addEventListener('click', async () => {
+    const image = (state.library?.images || []).find(item => item.hash === detail.hash);
+    if (!image) {
+      showToast('That image is not in the current scan.');
+      return;
+    }
+    try {
+      await window.categorizerAPI.openImage(image.path);
+    } catch (error) {
+      showToast(errorText(error));
+    }
+  });
+  actions.append(reveal);
+  head.append(actions);
+  els.textDetail.append(head);
+
+  if (detail.terms?.length) {
+    const terms = document.createElement('div');
+    terms.className = 'text-detail-terms';
+    terms.textContent = detail.terms.join(' · ');
+    els.textDetail.append(terms);
+  }
+
+  const body = document.createElement('pre');
+  body.className = 'text-detail-body';
+  body.textContent = detail.text;
+  els.textDetail.append(body);
+
+  // Group members contribute only their NEW lines. A near-duplicate is usually the same screen
+  // scrolled a little, and reprinting the whole thing would bury the two lines that differ.
+  for (const member of detail.members || []) {
+    const block = document.createElement('div');
+    block.className = 'text-detail-member';
+
+    const kind = member.rank === 1 ? 'identical copy' : 'near copy';
+    const memberHead = document.createElement('div');
+    memberHead.className = 'text-detail-member-head';
+    memberHead.textContent = member.novelLines.length
+      ? `${member.at} · ${kind} · added ${member.novelLines.length} lines`
+      : `${member.at} · ${kind} · nothing new`;
+    block.append(memberHead);
+
+    if (member.novelLines.length) {
+      const lines = document.createElement('pre');
+      lines.className = 'text-detail-member-lines';
+      lines.textContent = member.novelLines.join('\n');
+      block.append(lines);
+    }
+    els.textDetail.append(block);
+  }
+}
+
+function textEmpty(message) {
+  const element = document.createElement('div');
+  element.className = 'text-empty';
+  element.textContent = message;
+  return element;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Topic layer (phase 2)
+//
+// Statistical keywords already label every bucket for free. What they cannot do is see that
+// `webview2`, `cdp` and `9400` are one subject — that is a synthesis job, and it is why this makes
+// one local-model call per BUCKET rather than per image: 44 calls for this whole library instead of
+// ~8,800. It never starts on its own; the button is the only trigger in the UI, `icat topics` the
+// only one outside it.
+// ---------------------------------------------------------------------------------------------
+
+async function loadTopicStatus() {
+  const root = state.library?.root;
+  if (!root) return;
+  try {
+    state.topicStatus = await window.categorizerAPI.getTopicStatus(root, currentBucketHours());
+  } catch (error) {
+    // A library with no index yet is the normal case here, not something to surface.
+    state.topicStatus = null;
+  }
+  if (state.currentView === 'text') renderTextTopicsBar();
+}
+
+function currentBucketHours() {
+  return Number(els.textBucketHours.value || 48);
+}
+
+async function installTopicListeners() {
+  await window.categorizerAPI.onTopicsProgress(payload => {
+    state.topicRun = payload;
+    renderTextTopicsBar();
+  });
+  await window.categorizerAPI.onTopicsFinished(payload => {
+    state.topicRun = null;
+    state.topicMessage = payload.message || null;
+    if (payload.status === 'error') showToast(payload.message || 'Naming buckets failed.');
+    else if (payload.message) showToast(payload.message);
+    renderTextTopicsBar();
+    // The timeline is what the run was for, so it repaints with the names in place.
+    loadTopicStatus();
+    if (state.currentView === 'text' && state.textMode === 'buckets') runTextQuery();
+  });
+}
+
+async function generateTopics() {
+  const root = state.library?.root;
+  if (!root) return;
+  const hours = currentBucketHours();
+  const pending = state.topicStatus
+    ? state.topicStatus.bucketsTotal - state.topicStatus.bucketsWithTopics + state.topicStatus.bucketsStale
+    : null;
+
+  // One model call per bucket, and the user is the one paying the wall-clock. Say how many before
+  // starting rather than after — the count is the whole decision.
+  const confirmed = window.confirm(
+    pending
+      ? `Ask the local model to name ${pending} bucket${pending === 1 ? '' : 's'} at ${hours}h?\n\n` +
+        'One call each, text only. You can stop part way — finished buckets are kept.'
+      : `Re-name every bucket at ${hours}h?`
+  );
+  if (!confirmed) return;
+
+  state.topicMessage = null;
+  state.topicRun = { processed: 0, total: pending || 0, currentBucket: '', topics: [] };
+  renderTextTopicsBar();
+  try {
+    await window.categorizerAPI.generateTopics(root, hours, false);
+  } catch (error) {
+    state.topicRun = null;
+    showToast(errorText(error));
+    renderTextTopicsBar();
+  }
+}
+
+async function stopTopics() {
+  try {
+    await window.categorizerAPI.cancelTopics();
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+function renderTextTopicsBar() {
+  const running = !!state.topicRun;
+  // The button belongs to the timeline: naming a span of time is meaningless for a result list.
+  const show = state.textMode === 'buckets';
+  els.textTopicsButton.classList.toggle('hidden', !show || running);
+  els.textTopicsStop.classList.toggle('hidden', !show || !running);
+
+  const status = state.topicStatus;
+  if (show && status && status.bucketsTotal) {
+    const parts = [`${formatCount(status.bucketsWithTopics)}/${formatCount(status.bucketsTotal)} named`];
+    if (status.bucketsStale) parts.push(`${formatCount(status.bucketsStale)} stale`);
+    els.textTopicsButton.textContent =
+      status.bucketsWithTopics === 0 ? 'Name buckets…' : `Name buckets… (${parts.join(', ')})`;
+  } else {
+    els.textTopicsButton.textContent = 'Name buckets…';
+  }
+
+  const line = state.topicRun
+    ? `${formatCount(state.topicRun.processed)}/${formatCount(state.topicRun.total)} · ${state.topicRun.currentBucket}` +
+      (state.topicRun.topics?.length ? ` — ${state.topicRun.topics.join(' · ')}` : '')
+    : state.topicMessage;
+
+  els.textTopicsProgress.classList.toggle('hidden', !show || !line);
+  els.textTopicsProgress.textContent = line || '';
 }
 
 init();
