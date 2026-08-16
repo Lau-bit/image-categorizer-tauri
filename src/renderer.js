@@ -4616,7 +4616,15 @@ function renderTextBuckets() {
 
     const count = document.createElement('span');
     count.className = 'text-bucket-count';
-    count.textContent = `${formatCount(bucket.images)} images`;
+    // A date range can cut through the middle of a bucket. The count then describes the part in
+    // range while the topics under it describe the whole bucket, so the two are said apart rather
+    // than left to look like one number.
+    count.textContent = bucket.partial
+      ? `${formatCount(bucket.images)} of ${formatCount(bucket.members)} images`
+      : `${formatCount(bucket.images)} images`;
+    if (bucket.partial) {
+      count.title = 'Your date range covers part of this bucket. The topics below describe the whole bucket.';
+    }
     head.append(count);
 
     if (bucket.exactDupes || bucket.nearDupes) {

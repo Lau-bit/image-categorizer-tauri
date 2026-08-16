@@ -67,9 +67,19 @@ SEARCH / TIMELINE OPTIONS
 
 TOPICS OPTIONS
   --bucket <hours>    width to name buckets at (default 48; stored per width)
+  --from / --to       which buckets to name; a bucket only half in range is still
+                      named as the whole bucket it is
   --force             re-run buckets that already have topics
   --limit <n>         stop after n buckets
   --vocabulary        print the topic/name vocabulary instead of generating
+
+CATEGORIZE OPTIONS
+  --to <category>     required; must already exist, so a typo cannot fork the taxonomy
+  --hash <h>          repeatable, or comma-separated
+  --query <q>         categorize everything the query matches — ALL of it, not a page.
+                      Pass -k <n> to cap it deliberately.
+  --from / --until    bound the query by time. The upper bound is `--until` here,
+                      because `--to` already names the category.
 
 EXAMPLES
   icat search "webview2 cdp" --from 7d
@@ -122,6 +132,16 @@ pub fn run() -> i32 {
 // Argument parsing
 // ---------------------------------------------------------------------------------------------
 
+/// Flags that are switches, never value-takers. Listed explicitly because the alternative — "a flag
+/// swallows the next token unless that token starts with `--`" — cannot tell a switch from a value
+/// flag when a bare word follows, and silently eats it: `icat search --full tauri webview2` searched
+/// for `webview2` alone and dropped `tauri` without a word, returning a confident wrong answer.
+/// Anything not named here keeps the old heuristic, so an unknown flag still behaves sensibly.
+const SWITCHES: &[&str] = &[
+    "json", "raw", "no-build", "all", "dupes", "full", "force", "group", "hashes", "vocabulary",
+    "all-categories", "help",
+];
+
 struct Args {
     command: String,
     positional: Vec<String>,
@@ -144,10 +164,14 @@ impl Args {
                     None => (rest.to_string(), None),
                 };
                 let value = match inline {
+                    // `--json=false` is still honoured for anything that reads the value back.
                     Some(value) => value,
+                    // A known switch never consumes what follows it, so a query word after one
+                    // stays part of the query.
+                    None if SWITCHES.contains(&name.as_str()) => "true".to_string(),
                     None => {
-                        // A flag takes the next token as its value unless that token is itself a
-                        // flag — which is how boolean switches stay switches.
+                        // Anything else takes the next token as its value unless that token is
+                        // itself a flag.
                         match argv.get(index + 1) {
                             Some(next) if !next.starts_with("--") && !is_short_flag(next) => {
                                 index += 1;
@@ -367,13 +391,22 @@ fn parse_when(value: &str, end_of_day: bool) -> Result<i64, String> {
 }
 
 fn query_options(args: &Args, query: String) -> Result<QueryOptions, String> {
+    query_options_for(args, query, "to")
+}
+
+/// `upper_bound_flag` exists because **`--to` means two different things**. In `search` and
+/// `timeline` it is the end of the time range; in `categorize` it is the destination category. They
+/// collided: `categorize --query tauri --to Archive` fed `Archive` to the time parser and died with
+/// *"cannot read `Archive` as a time"*, so the `--query` form of categorize could never run at all.
+/// Categorize therefore bounds its upper end with `--until`, and `--to` stays the category there.
+fn query_options_for(args: &Args, query: String, upper_bound_flag: &str) -> Result<QueryOptions, String> {
     Ok(QueryOptions {
         query,
         from: match args.flag("from") {
             Some(value) => Some(parse_when(value, false)?),
             None => None,
         },
-        to: match args.flag("to") {
+        to: match args.flag(upper_bound_flag) {
             Some(value) => Some(parse_when(value, true)?),
             None => None,
         },
@@ -384,6 +417,17 @@ fn query_options(args: &Args, query: String) -> Result<QueryOptions, String> {
         require_all: args.is_set("all"),
         limit: args.number("limit", 20)?,
     })
+}
+
+/// How many hits a **write** may act on. Reads page — 20 is a sensible screenful of search results
+/// — but a write inheriting that default silently filed the top 20 of a 1,471-match query and then
+/// reported "20" as if that had been the whole match set. A bulk edit takes everything it matched
+/// unless the caller caps it on purpose.
+fn write_limit(args: &Args) -> Result<usize, String> {
+    match args.flag("limit") {
+        Some(_) => args.number("limit", 0),
+        None => Ok(0),
+    }
 }
 
 fn maybe_redact(text: &str, raw: bool) -> String {
@@ -518,6 +562,14 @@ fn cmd_index(args: &Args) -> Result<(), String> {
                 index.report.skipped_missing
             );
         }
+        // Separate line, because `icat extract` cannot move this number: OCR ran and found no text.
+        if index.report.skipped_empty > 0 {
+            println!(
+                "{} had text extracted but it was empty — nothing to index, and re-running \
+                 extraction will not change that",
+                index.report.skipped_empty
+            );
+        }
     }
     Ok(())
 }
@@ -606,6 +658,13 @@ fn cmd_search(args: &Args) -> Result<(), String> {
         },
         if raw { " · RAW" } else { "" }
     );
+    if outcome.no_searchable_terms {
+        println!(
+            "nothing was searched for: every word in that query is a stopword or shorter than {} \
+             characters, so none of them are in the index. This is not the same as finding nothing.",
+            text_index::MIN_TOKEN_LEN
+        );
+    }
     if !outcome.unknown_terms.is_empty() {
         println!("never on screen: {}", outcome.unknown_terms.join(", "));
     }
@@ -707,9 +766,16 @@ fn cmd_timeline(args: &Args) -> Result<(), String> {
     );
     for bucket in &buckets {
         println!(
-            "{:<22} {:>5} img ({} rep, {} exact, {} near) · {} chars",
+            "{:<22} {:>5} img{} ({} rep, {} exact, {} near) · {} chars",
             bucket.id,
             bucket.images,
+            // Said plainly, because the topics printed underneath describe the WHOLE bucket while
+            // these counts describe only the part your range let through.
+            if bucket.partial {
+                format!(" of {}", bucket.members)
+            } else {
+                String::new()
+            },
             bucket.representatives,
             bucket.exact_dupes,
             bucket.near_dupes,
@@ -777,7 +843,13 @@ fn cmd_topics(args: &Args) -> Result<(), String> {
         return Err("nothing is indexed yet".to_string());
     }
     let texts = text_dir_path(&root);
-    let buckets = text_index::timeline(&index, &QueryOptions::default(), width, true);
+    // `--from`/`--to` choose WHICH buckets get named; they never narrow what a bucket is about.
+    // `timeline` fills membership from the whole corpus, so a bucket only half inside the range is
+    // still described — and fingerprinted — as the whole bucket it is. Ignoring these flags here
+    // meant `icat topics --from 7d` quietly queued every bucket in the library, at a model call
+    // and ~12s each.
+    let options = query_options(args, String::new())?;
+    let buckets = text_index::timeline(&index, &options, width, true);
     let mut pending: Vec<text_index::Bucket> = topics::pending(&buckets, &file, width, args.is_set("force"))
         .into_iter()
         .cloned()
@@ -993,10 +1065,13 @@ fn cmd_categorize(args: &Args) -> Result<(), String> {
         .filter(|value| !value.is_empty())
         .collect();
 
+    let mut matched = 0usize;
     if let Some(query) = args.flag("query") {
         let index = load_or_build(&root, args)?;
-        let options = query_options(args, query.to_string())?;
+        let mut options = query_options_for(args, query.to_string(), "until")?;
+        options.limit = write_limit(args)?;
         let outcome = text_index::search(&index, &options, Some(&text_dir_path(&root)));
+        matched = outcome.matched;
         hashes.extend(outcome.hits.iter().map(|hit| hit.hash.clone()));
     }
 
@@ -1041,6 +1116,7 @@ fn cmd_categorize(args: &Args) -> Result<(), String> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "category": category,
+                "queryMatched": matched,
                 "requested": hashes.len(),
                 "changed": changed,
                 "unchanged": hashes.len() - changed - missing,
@@ -1049,6 +1125,9 @@ fn cmd_categorize(args: &Args) -> Result<(), String> {
             .unwrap_or_default()
         );
     } else {
+        if matched > 0 {
+            println!("`--query` matched {matched} images; all of them are being categorized.");
+        }
         println!(
             "{changed} of {} images set to `{category}`{}",
             hashes.len(),
@@ -1270,6 +1349,98 @@ mod tests {
         assert!(args.is_set("dupes"));
         assert!(args.json());
         assert_eq!(args.flag("dupes"), Some("true"));
+    }
+
+    // `--full` used to swallow `tauri`, leaving a one-word query and a confidently wrong answer.
+    // Every switch must leave the words after it alone.
+    #[test]
+    fn a_switch_never_eats_a_following_query_word() {
+        let argv: Vec<String> = ["search", "--full", "tauri", "webview2"].iter().map(|s| s.to_string()).collect();
+        let args = Args::parse(&argv).unwrap();
+        assert!(args.is_set("full"));
+        assert_eq!(
+            args.positional,
+            vec!["tauri".to_string(), "webview2".to_string()],
+            "both query words must survive the switch"
+        );
+
+        for switch in ["dupes", "all", "raw", "json", "group", "force", "hashes", "no-build"] {
+            let argv: Vec<String> = ["search", &format!("--{switch}"), "needle"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let args = Args::parse(&argv).unwrap();
+            assert_eq!(args.positional, vec!["needle".to_string()], "--{switch} ate the query");
+        }
+    }
+
+    // A read pages at 20; a write must not. `categorize --query` inheriting the read default meant
+    // a 1,471-match query silently edited 20 images and called that the match set.
+    #[test]
+    fn a_write_takes_every_match_unless_capped_on_purpose() {
+        let parse = |tokens: &[&str]| {
+            Args::parse(&tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+
+        let uncapped = parse(&["categorize", "--query", "tauri", "--to", "Archive"]);
+        assert_eq!(write_limit(&uncapped).unwrap(), 0, "no cap asked for means all of them");
+        assert_eq!(
+            query_options_for(&uncapped, "tauri".into(), "until").unwrap().limit,
+            20,
+            "the shared builder still carries the READ default — which is exactly why the write \
+             path has to override it rather than inherit it"
+        );
+
+        assert_eq!(write_limit(&parse(&["categorize", "-k", "5"])).unwrap(), 5);
+        assert_eq!(write_limit(&parse(&["categorize", "--limit", "5"])).unwrap(), 5);
+    }
+
+    // `--to` names a CATEGORY in categorize and a TIME in search. Reading the category through the
+    // time parser made `categorize --query … --to <Category>` fail outright, every time.
+    #[test]
+    fn categorize_reads_its_to_as_a_category_not_as_a_time() {
+        let argv: Vec<String> = ["categorize", "--query", "tauri", "--to", "Archive", "--from", "7d"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = Args::parse(&argv).unwrap();
+
+        let options = query_options_for(&args, "tauri".into(), "until")
+            .expect("a category name must not be parsed as a time");
+        assert_eq!(args.flag("to"), Some("Archive"), "the category survives untouched");
+        assert!(options.from.is_some(), "--from still bounds the query");
+        assert!(options.to.is_none(), "and no upper bound was asked for");
+
+        // The upper bound is reachable, just under its own name.
+        let argv: Vec<String> = ["categorize", "--query", "x", "--to", "Archive", "--until", "2026-08-03"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = Args::parse(&argv).unwrap();
+        let options = query_options_for(&args, "x".into(), "until").unwrap();
+        assert_eq!(
+            text_index::format_datetime(options.to.unwrap()),
+            "2026-08-03 23:59",
+            "--until is inclusive of its own day, like --to is elsewhere"
+        );
+
+        // And the reading commands are unchanged.
+        let argv: Vec<String> = ["search", "x", "--to", "2026-08-03"].iter().map(|s| s.to_string()).collect();
+        let args = Args::parse(&argv).unwrap();
+        assert!(query_options(&args, "x".into()).unwrap().to.is_some());
+    }
+
+    #[test]
+    fn a_value_flag_still_takes_the_token_after_it() {
+        let argv: Vec<String> = ["search", "needle", "--from", "7d", "--budget", "0", "--folder", "Root"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = Args::parse(&argv).unwrap();
+        assert_eq!(args.positional, vec!["needle".to_string()]);
+        assert_eq!(args.flag("from"), Some("7d"));
+        assert_eq!(args.number("budget", 6000).unwrap(), 0);
+        assert_eq!(args.all("folder"), vec!["Root".to_string()]);
     }
 
     #[test]

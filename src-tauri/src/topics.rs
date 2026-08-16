@@ -463,6 +463,8 @@ mod tests {
             chars: 0,
             terms: vec!["tauri".into(), "webview2".into()],
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            members: hashes.len(),
+            partial: false,
             topics: Vec::new(),
             notable: Vec::new(),
             topics_stale: false,

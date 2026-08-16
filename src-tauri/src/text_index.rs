@@ -77,7 +77,7 @@ const NEAR_DUPE_MAX_GAP_SECS: i64 = 48 * 3600;
 /// while leaving it findable and reachable — a model asking for depth still gets it.
 const NEAR_DUPE_SCORE_FACTOR: f32 = 0.35;
 
-const MIN_TOKEN_LEN: usize = 2;
+pub const MIN_TOKEN_LEN: usize = 2;
 const MAX_TOKEN_LEN: usize = 40;
 
 /// Keywords kept per document, statistical (tf-idf off the index's own term table). Free — no model
@@ -518,6 +518,16 @@ impl BucketSpec {
 // Build
 // ---------------------------------------------------------------------------------------------
 
+/// Why a source produced no document. Kept apart because the two mean opposite things to the
+/// caller: `Missing` is work `icat extract` would do, `Empty` is a page OCR genuinely found no text
+/// on and re-running would not change. Reporting both as "missing" offers an extraction run that
+/// cannot move the number.
+enum ParseOutcome {
+    Parsed(Box<Parsed>),
+    Empty,
+    Missing,
+}
+
 struct Parsed {
     source: SourceDoc,
     ts: i64,
@@ -539,25 +549,27 @@ pub fn build(sources: &[SourceDoc], text_dir: &Path, categories: &[String], now_
 
     // Reading and tokenizing ~9k files is the whole cost of a build; rayon takes it from seconds to
     // well under one on this machine.
-    let parsed: Vec<Option<Parsed>> = eligible
+    let parsed: Vec<ParseOutcome> = eligible
         .par_iter()
         .map(|source| {
             let path = text_file_path(text_dir, &source.hash);
-            let text = fs::read_to_string(&path).ok()?;
+            let Ok(text) = fs::read_to_string(&path) else {
+                return ParseOutcome::Missing;
+            };
             let normalized = normalize_text(&text);
             if normalized.is_empty() {
-                return None;
+                return ParseOutcome::Empty;
             }
             let tokens = tokenize(&text);
             if tokens.is_empty() {
-                return None;
+                return ParseOutcome::Empty;
             }
             let shingles = shingles(&tokens);
             let (ts, ts_source) = match timestamp_from_name(&source.name) {
                 Some(ts) => (ts, TS_SOURCE_FILENAME),
                 None => ((source.modified_ms / 1000) as i64, TS_SOURCE_MTIME),
             };
-            Some(Parsed {
+            ParseOutcome::Parsed(Box::new(Parsed {
                 source: (*source).clone(),
                 ts,
                 ts_source,
@@ -565,12 +577,19 @@ pub fn build(sources: &[SourceDoc], text_dir: &Path, categories: &[String], now_
                 tokens,
                 shingles,
                 norm_hash: fnv1a(normalized.as_bytes()),
-            })
+            }))
         })
         .collect();
 
-    let missing = parsed.iter().filter(|item| item.is_none()).count();
-    let mut parsed: Vec<Parsed> = parsed.into_iter().flatten().collect();
+    let missing = parsed.iter().filter(|item| matches!(item, ParseOutcome::Missing)).count();
+    let skipped_empty = parsed.iter().filter(|item| matches!(item, ParseOutcome::Empty)).count();
+    let mut parsed: Vec<Parsed> = parsed
+        .into_iter()
+        .filter_map(|item| match item {
+            ParseOutcome::Parsed(item) => Some(*item),
+            _ => None,
+        })
+        .collect();
     // Chronological order is what the near-duplicate window slides along, and it makes the stored
     // docs list readable top to bottom.
     parsed.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.source.hash.cmp(&b.source.hash)));
@@ -714,7 +733,7 @@ pub fn build(sources: &[SourceDoc], text_dir: &Path, categories: &[String], now_
         postings,
         report: BuildReport {
             docs: doc_count,
-            skipped_empty: 0,
+            skipped_empty,
             skipped_missing: missing,
             exact_dupes,
             near_dupes,
@@ -810,6 +829,11 @@ pub struct SearchOutcome {
     /// plainly how many were looked at rather than implying the whole corpus was.
     pub phrase_checked: usize,
     pub phrase_capped: bool,
+    /// The query held words, but every one of them was dropped before it could be looked up — a
+    /// stopword, or shorter than `MIN_TOKEN_LEN`. Nothing was searched for, which is a different
+    /// fact from "searched and found nothing" and from `unknown_terms`' "that word was never on
+    /// screen". Without this the three are one indistinguishable `0 matched`.
+    pub no_searchable_terms: bool,
 }
 
 /// How many candidates a quoted phrase is verified against, in score order.
@@ -819,6 +843,7 @@ pub fn search(index: &TextIndex, options: &QueryOptions, text_dir: Option<&Path>
     let mut outcome = SearchOutcome::default();
     let (terms, phrases) = split_query(&options.query);
     if terms.is_empty() {
+        outcome.no_searchable_terms = options.query.chars().any(|ch| ch.is_alphanumeric());
         return outcome;
     }
 
@@ -1093,6 +1118,8 @@ pub struct Bucket {
     pub id: String,
     pub start: i64,
     pub end: i64,
+    /// Images **in scope** — what the caller's filters let through. This is the count to show, and
+    /// the answer to "how much did I capture in this range".
     pub images: usize,
     pub representatives: usize,
     pub exact_dupes: usize,
@@ -1100,7 +1127,19 @@ pub struct Bucket {
     pub chars: u64,
     /// Statistical keywords — plain tf-idf, always present, no model involved.
     pub terms: Vec<String>,
+    /// Every image the bucket holds, **ignoring the query's filters** — see `members` for why.
+    /// Chronological, which is what `topics::sample_evenly` spreads across.
     pub hashes: Vec<String>,
+    /// Total images in this bucket's time span, before filters. A bucket's *identity* is its whole
+    /// membership: a 48h bucket clipped by `--from` is still the same bucket, so anything keyed on
+    /// membership (the topic fingerprint) must use this and not `images`. Filling `hashes` from the
+    /// filtered set is what made a partially-in-range bucket report itself stale — see the note on
+    /// `topics_stale` below.
+    #[serde(default)]
+    pub members: usize,
+    /// True when filters hid part of this bucket, so `images` describes less than the bucket holds.
+    #[serde(default)]
+    pub partial: bool,
     /// Filled in by the topic layer when it has run for this width (see `topics.rs`). Left empty
     /// rather than defaulted to `terms`, so "no topics yet" stays distinguishable from "the model
     /// looked at this and found these" — the panel shows whichever it actually has.
@@ -1109,7 +1148,9 @@ pub struct Bucket {
     #[serde(default)]
     pub notable: Vec<String>,
     /// True when topics exist but were written against a different set of images than the bucket
-    /// holds now.
+    /// holds now. Compared against **full** membership, never the filtered view: the stored answer
+    /// was written about the whole bucket, so comparing it to a clipped one accuses every
+    /// partially-in-range bucket of having changed when nothing has.
     #[serde(default)]
     pub topics_stale: bool,
 }
@@ -1142,6 +1183,8 @@ pub fn timeline(index: &TextIndex, options: &QueryOptions, width_hours: u32, wit
             chars: 0,
             terms: Vec::new(),
             hashes: Vec::new(),
+            members: 0,
+            partial: false,
             topics: Vec::new(),
             notable: Vec::new(),
             topics_stale: false,
@@ -1152,9 +1195,6 @@ pub fn timeline(index: &TextIndex, options: &QueryOptions, width_hours: u32, wit
             RANK_EXACT_DUPE => entry.exact_dupes += 1,
             RANK_NEAR_DUPE => entry.near_dupes += 1,
             _ => entry.representatives += 1,
-        }
-        if with_hashes {
-            entry.hashes.push(doc.hash.clone());
         }
         // Only representatives contribute keywords, or a screen captured twenty times would decide
         // what the whole bucket was "about".
@@ -1169,7 +1209,25 @@ pub fn timeline(index: &TextIndex, options: &QueryOptions, width_hours: u32, wit
         }
     }
 
+    // Second pass: a bucket's MEMBERSHIP is every document in its time span, whatever the caller
+    // filtered on. The counts above stay filtered — they answer "how much of this is in my range" —
+    // but membership is a property of the bucket itself, and the topic fingerprint is keyed on it.
+    // Reading membership off the filtered pass is what made `--from 7d` clip the newest bucket to
+    // 291 of its 335 images and then report the unchanged topics as stale.
+    //
+    // Docs are stored in chronological order, so pushing in index order keeps `hashes` sorted by
+    // time — which is what `topics::sample_evenly` spreads its prompt across.
+    for doc in index.docs.iter() {
+        if let Some(entry) = grouped.get_mut(&spec.bucket_of(doc.ts)) {
+            entry.members += 1;
+            if with_hashes {
+                entry.hashes.push(doc.hash.clone());
+            }
+        }
+    }
+
     for (bucket_id, bucket) in grouped.iter_mut() {
+        bucket.partial = bucket.members > bucket.images;
         if let Some(weights) = term_weight.get(bucket_id) {
             let mut scored: Vec<(f32, usize)> = weights.iter().map(|(index, weight)| (*weight, *index)).collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1402,6 +1460,92 @@ mod tests {
         assert_eq!(buckets[0].images, 3);
         assert_eq!(buckets[0].exact_dupes, 1);
         assert_eq!(buckets[0].representatives, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The bug this pins, measured on the live library 2026-08-16: `--from 7d` put the cut inside
+    // the newest 48h bucket, so it reported 291 of its 335 images — and the topic layer, which
+    // fingerprints membership, then called an untouched bucket stale. Membership is a property of
+    // the bucket; the filters describe the view.
+    #[test]
+    fn a_filter_clips_a_buckets_counts_but_never_its_membership() {
+        let dir = temp_dir("partialbucket");
+        let index = build_in(
+            &dir,
+            &[
+                ("aaa", "screenshot_20260803_090000_000.png", "alpha subject one"),
+                ("bbb", "screenshot_20260803_233000_000.png", "beta subject two"),
+                ("ccc", "screenshot_20260804_120000_000.png", "gamma subject three"),
+            ],
+        );
+
+        let whole = timeline(&index, &QueryOptions::default(), 48, true);
+        assert_eq!(whole.len(), 1, "48h holds all three");
+        assert_eq!(whole[0].images, 3);
+        assert_eq!(whole[0].members, 3);
+        assert!(!whole[0].partial);
+
+        // A cut landing inside the bucket: only the 08-04 capture is in range.
+        let clipped = timeline(
+            &index,
+            &QueryOptions { from: Some(civil_to_secs(2026, 8, 4, 0, 0, 0)), ..Default::default() },
+            48,
+            true,
+        );
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].images, 1, "counts describe the range");
+        assert_eq!(clipped[0].members, 3, "membership describes the bucket");
+        assert!(clipped[0].partial, "and the caller is told the two differ");
+        assert_eq!(
+            clipped[0].hashes, whole[0].hashes,
+            "identical membership means an identical fingerprint, so a clipped bucket cannot read as stale"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_query_of_only_stopwords_says_so_instead_of_looking_like_a_miss() {
+        let dir = temp_dir("stopwords");
+        let index = build_in(&dir, &[("aaa", "screenshot_20260803_090000_000.png", "webview2 notes")]);
+
+        let stopwords = search(&index, &QueryOptions { query: "the and for".into(), ..Default::default() }, Some(&dir));
+        assert!(stopwords.no_searchable_terms, "nothing was looked up at all");
+        assert!(stopwords.unknown_terms.is_empty(), "and that is not the same as an unknown word");
+
+        // A real word that is simply absent must stay distinguishable from the above.
+        let absent = search(&index, &QueryOptions { query: "kubernetes".into(), ..Default::default() }, Some(&dir));
+        assert!(!absent.no_searchable_terms);
+        assert_eq!(absent.unknown_terms, vec!["kubernetes".to_string()]);
+
+        // As must a genuine search that found nothing in range.
+        let filtered = search(
+            &index,
+            &QueryOptions { query: "webview2".into(), from: Some(civil_to_secs(2027, 1, 1, 0, 0, 0)), ..Default::default() },
+            Some(&dir),
+        );
+        assert!(!filtered.no_searchable_terms);
+        assert!(filtered.unknown_terms.is_empty());
+        assert_eq!(filtered.hits.len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_text_file_is_reported_apart_from_a_missing_one() {
+        let dir = temp_dir("emptyvsmissing");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(text_file_path(&dir, "aaa"), "real content here").unwrap();
+        fs::write(text_file_path(&dir, "bbb"), "   \n\n  ").unwrap();
+        // `ccc` deliberately has no file at all.
+        let sources = vec![
+            source("aaa", "screenshot_20260803_090000_000.png"),
+            source("bbb", "screenshot_20260803_091000_000.png"),
+            source("ccc", "screenshot_20260803_092000_000.png"),
+        ];
+        let index = build(&sources, &dir, &[DEFAULT_TEXT_CATEGORY.to_string()], 0, "1970-01-01T00:00:00Z");
+
+        assert_eq!(index.report.docs, 1);
+        assert_eq!(index.report.skipped_empty, 1, "OCR ran and found nothing — extraction cannot fix it");
+        assert_eq!(index.report.skipped_missing, 1, "never extracted — extraction is exactly the fix");
         let _ = fs::remove_dir_all(&dir);
     }
 
