@@ -44,10 +44,22 @@ window.categorizerAPI = {
   getAutoRefreshSettings: () => invoke('get_auto_refresh_settings'),
   setAutoRefreshSettings: settings => invoke('set_auto_refresh_settings', settings),
 
+  // A nightly refresh runs in a SEPARATE process, so none of the progress events above reach this
+  // window — that process emits them to its own (windowless) event bus. These two are the whole
+  // bridge: the run publishes a small state file, and a stop is a sentinel file it polls for.
+  // Returns null when nothing is running, including when a killed run left a stale file behind.
+  getAutoRefreshRun: () => invoke('get_auto_refresh_run'),
+  cancelAutoRefreshRun: () => invoke('cancel_auto_refresh_run'),
+
   scanLibrary: root => invoke('scan_library', { root }),
   setSourcePattern: (root, preset, regex) => invoke('set_source_pattern', { root, preset, regex }),
   addManualSourceFolder: (root, folderPath) => invoke('add_manual_source_folder', { root, folderPath }),
   removeManualSourceFolder: (root, folderName) => invoke('remove_manual_source_folder', { root, folderName }),
+
+  // How many screenshots were TAKEN over the last N days, from screenshot-tool's own log —
+  // not from this library, which only knows what survived on disk. Takes no root: it is a
+  // property of the machine, not of a folder.
+  getCaptureActivity: days => invoke('get_capture_activity', { days }),
 
   // Text (OCR) analysis
   analyzeText: (root, force) => invoke('analyze_text', { root, force }),

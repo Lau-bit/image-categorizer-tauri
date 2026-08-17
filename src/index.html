@@ -109,6 +109,29 @@
 
       <main class="main">
         <header class="topbar">
+          <!-- The nightly refresh is a separate process, so nothing it does reaches this window's
+               event stream and none of the app's normal progress UI can show it. This banner is the
+               only place a running job becomes visible here, and its Stop button the only way to end
+               one without finding the tray icon. Fed by polling a state file the run heartbeats
+               into — see `auto_run` in lib.rs. Hidden whenever nothing is running.
+
+               It lives inside the topbar, as a full-width flex line above the title, rather than as
+               its own child of `.main`: that grid has exactly two rows, and a third visible child
+               would land in an implicit row and cost the image grid its `minmax(0, 1fr)` track. -->
+          <div class="auto-run-banner hidden" id="auto-run-banner" role="status" aria-live="polite">
+            <span class="auto-run-pulse" aria-hidden="true"></span>
+            <div class="auto-run-body">
+              <div class="auto-run-line">
+                <span class="auto-run-title" id="auto-run-title">Automatic refresh running</span>
+                <span class="auto-run-detail" id="auto-run-detail"></span>
+              </div>
+              <div class="auto-run-track" id="auto-run-track" aria-hidden="true">
+                <div class="auto-run-fill" id="auto-run-fill"></div>
+              </div>
+            </div>
+            <span class="auto-run-limit" id="auto-run-limit"></span>
+            <button class="button auto-run-stop" id="auto-run-stop" type="button" title="Stop the automatic refresh now">Stop</button>
+          </div>
           <div class="topbar-head">
             <!-- Only rendered by the stacked (narrow) layout, where the sidebar costs the grid its
                  vertical space; the stylesheet hides it again once there is room for both. -->
@@ -367,6 +390,13 @@
                fragmented, so a gap is not a defect to chase. -->
           <div class="text-coverage" id="text-coverage"></div>
 
+          <!-- Timeline mode only. Everything else on this panel counts what SURVIVED on disk;
+               this counts what was TAKEN, from screenshot-tool's own log. They disagree after a
+               cleanup by design, so the two figures sit side by side and the gap is never
+               presented as missing data. Quiet, like the coverage line above it — a count of
+               captures is context, not a score. -->
+          <div class="capture-activity hidden" id="capture-activity"></div>
+
           <div class="text-columns">
             <div class="text-results-column">
               <div class="text-results" id="text-results"></div>
@@ -610,8 +640,9 @@
           <p class="dialog-hint">
             Runs a rescan (and, if selected, analysis) once a day via Windows Task Scheduler, even
             if the app isn't open — so the library is already up to date next time you open it.
-            While it runs, a tray icon appears; right-click it and choose "Cancel refresh" to stop
-            immediately, e.g. before a demanding game.
+            If a run is going while this window is open, a banner appears at the top showing what it
+            is doing, with a Stop button. A tray icon appears too; right-click it and choose "Cancel
+            refresh" to stop one when the app isn't open.
           </p>
 
           <label class="check-row">
@@ -644,7 +675,33 @@
                 <input id="auto-refresh-text-extraction-input" type="checkbox">
                 <span>Extract OCR text</span>
               </label>
+              <label class="check-row">
+                <input id="auto-refresh-vision-input" type="checkbox">
+                <span>Vision descriptions (local LLM)</span>
+              </label>
             </div>
+
+            <label class="settings-stack">
+              <span class="settings-label">Stop describing after (minutes)</span>
+              <input id="auto-refresh-vision-minutes-input" class="dialog-input" type="number" min="0" max="1440" step="5">
+            </label>
+            <p class="dialog-hint">
+              How long the nightly run may hold the graphics card. The clock starts when the first
+              description begins, not while it is waiting for a free GPU, and whatever is left is
+              picked up by the next run. <strong>0 means no limit</strong> — with a large backlog
+              that can mean many hours on the card, so it is not the default.
+            </p>
+
+            <label class="check-row">
+              <input id="auto-refresh-gpu-wait-input" type="checkbox">
+              <span>Wait for the GPU to be free before describing (recommended)</span>
+            </label>
+            <p class="dialog-hint">
+              Descriptions need the local model server and the graphics card. With this on, the
+              nightly run watches the GPU and only starts once it has been quiet for a minute — so a
+              catch-up run that fires while you're gaming waits its turn instead of competing. If the
+              card is still busy after 4 hours it gives up and leaves the backlog for the next night.
+            </p>
 
             <label class="check-row">
               <input id="auto-refresh-low-priority-input" type="checkbox">

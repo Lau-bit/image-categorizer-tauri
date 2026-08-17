@@ -25,6 +25,9 @@ const state = {
   analysisQueue: [],   // [{type: 'text'|'nsfw'|'ocr'|'chunk'|'vision', force: bool}]
   analysisRunning: null, // 'text' | 'nsfw' | 'ocr' | 'chunk' | 'vision' | null
   autoRefresh: null,
+  // The nightly run happening in the OTHER process right now, polled from a state file, or null
+  // when none is. Nothing else in this window can see it — see the banner section.
+  autoRun: null,
   chunkPlan: null,
   // Geo layer (own sidecars, independent of categories). `geoSetImages` holds the resolved images
   // of an opened country set — an explicit ordered member list, not a filter over the library.
@@ -124,6 +127,7 @@ const els = {
   textTopicsStop: document.getElementById('text-topics-stop'),
   textTopicsProgress: document.getElementById('text-topics-progress'),
   textCoverage: document.getElementById('text-coverage'),
+  captureActivity: document.getElementById('capture-activity'),
   textResults: document.getElementById('text-results'),
   textDetail: document.getElementById('text-detail'),
   textActions: document.getElementById('text-actions'),
@@ -241,9 +245,19 @@ const els = {
   autoRefreshNsfwInput: document.getElementById('auto-refresh-nsfw-input'),
   autoRefreshTextAnalysisInput: document.getElementById('auto-refresh-text-analysis-input'),
   autoRefreshTextExtractionInput: document.getElementById('auto-refresh-text-extraction-input'),
+  autoRefreshVisionInput: document.getElementById('auto-refresh-vision-input'),
+  autoRefreshVisionMinutesInput: document.getElementById('auto-refresh-vision-minutes-input'),
+  autoRefreshGpuWaitInput: document.getElementById('auto-refresh-gpu-wait-input'),
   autoRefreshLowPriorityInput: document.getElementById('auto-refresh-low-priority-input'),
   autoRefreshToastInput: document.getElementById('auto-refresh-toast-input'),
   autoRefreshStatus: document.getElementById('auto-refresh-status'),
+  autoRunBanner: document.getElementById('auto-run-banner'),
+  autoRunTitle: document.getElementById('auto-run-title'),
+  autoRunDetail: document.getElementById('auto-run-detail'),
+  autoRunTrack: document.getElementById('auto-run-track'),
+  autoRunFill: document.getElementById('auto-run-fill'),
+  autoRunLimit: document.getElementById('auto-run-limit'),
+  autoRunStop: document.getElementById('auto-run-stop'),
   visionEndpointInput: document.getElementById('vision-endpoint-input'),
   visionModelInput: document.getElementById('vision-model-input'),
   visionModelSelect: document.getElementById('vision-model-select'),
@@ -679,6 +693,9 @@ function syncAutoRefreshDialog() {
   els.autoRefreshNsfwInput.checked = autoRefresh.runNsfw;
   els.autoRefreshTextAnalysisInput.checked = autoRefresh.runTextAnalysis;
   els.autoRefreshTextExtractionInput.checked = autoRefresh.runTextExtraction;
+  els.autoRefreshVisionInput.checked = autoRefresh.runVision;
+  els.autoRefreshVisionMinutesInput.value = String(autoRefresh.visionMinutes ?? 30);
+  els.autoRefreshGpuWaitInput.checked = autoRefresh.gpuWait;
   els.autoRefreshLowPriorityInput.checked = autoRefresh.lowPriority;
   els.autoRefreshToastInput.checked = autoRefresh.toast;
   els.autoRefreshOptions.classList.toggle('disabled-section', !autoRefresh.enabled);
@@ -700,6 +717,18 @@ function collectCheckedAutoRefreshRoots() {
   return [...els.autoRefreshRootList.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
 }
 
+const VISION_MINUTES_MAX = 1440;
+
+// Falls back to whatever the backend last reported rather than to a constant, so a half-typed or
+// cleared box can never silently rewrite the limit — least of all to 0, which means "no limit".
+function normalizeVisionMinutes(raw) {
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return state.autoRefresh?.visionMinutes ?? 30;
+  }
+  return Math.min(parsed, VISION_MINUTES_MAX);
+}
+
 async function saveAutoRefreshSettings() {
   const payload = {
     enabled: els.autoRefreshEnabledInput.checked,
@@ -708,6 +737,11 @@ async function saveAutoRefreshSettings() {
     runNsfw: els.autoRefreshNsfwInput.checked,
     runTextAnalysis: els.autoRefreshTextAnalysisInput.checked,
     runTextExtraction: els.autoRefreshTextExtractionInput.checked,
+    runVision: els.autoRefreshVisionInput.checked,
+    // An empty or non-numeric box means "leave it as it was", not 0 — 0 is the explicit
+    // no-limit value and must only ever come from someone actually typing it.
+    visionMinutes: normalizeVisionMinutes(els.autoRefreshVisionMinutesInput.value),
+    gpuWait: els.autoRefreshGpuWaitInput.checked,
     lowPriority: els.autoRefreshLowPriorityInput.checked,
     toast: els.autoRefreshToastInput.checked,
   };
@@ -3952,6 +3986,11 @@ function installEvents() {
   els.autoRefreshNsfwInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshTextAnalysisInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshTextExtractionInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshVisionInput.addEventListener('change', saveAutoRefreshSettings);
+  // `change`, not `input`: a number box fires `input` on every keystroke, so saving on that would
+  // write (and reinstall the scheduled task) for "3" on the way to typing "30".
+  els.autoRefreshVisionMinutesInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshGpuWaitInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshLowPriorityInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshToastInput.addEventListener('change', saveAutoRefreshSettings);
 
@@ -4007,6 +4046,106 @@ async function installFileDropListener() {
   }
 }
 
+// =================================================================================================
+// The automatic-refresh banner
+//
+// A nightly run is a separate process, so there is no event to subscribe to and nothing in this
+// window knows it is happening — that invisibility, and having no way to stop a run from here, is
+// what this section exists to fix. The backend answers from a small state file the run heartbeats
+// into, and returns null once that heartbeat goes stale, so polling is the whole mechanism.
+// =================================================================================================
+
+const AUTO_RUN_POLL_MS = 2000;
+
+function formatAutoRunClock(totalSeconds) {
+  const safe = Math.max(0, Math.round(totalSeconds));
+  const minutes = Math.floor(safe / 60);
+  const seconds = safe % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function autoRunDetailText(run) {
+  const parts = [];
+  if (run.total > 0) {
+    parts.push(`${run.processed.toLocaleString()} / ${run.total.toLocaleString()}`);
+  }
+  if (run.rootTotal > 1 && run.rootIndex > 0) {
+    parts.push(`folder ${run.rootIndex} of ${run.rootTotal}`);
+  }
+  if (run.currentName) parts.push(run.currentName);
+  return parts.join(' — ');
+}
+
+function renderAutoRun(run) {
+  if (!run) {
+    els.autoRunBanner.classList.add('hidden');
+    // The next run gets a live button: leaving it disabled would strand the one control this
+    // banner exists to provide.
+    els.autoRunStop.disabled = false;
+    els.autoRunStop.textContent = 'Stop';
+    return;
+  }
+
+  els.autoRunBanner.classList.remove('hidden');
+  els.autoRunTitle.textContent = run.cancelRequested
+    ? 'Automatic refresh — stopping'
+    : `Automatic refresh: ${run.label || 'running'}`;
+  els.autoRunDetail.textContent = autoRunDetailText(run);
+
+  const hasProgress = run.total > 0;
+  els.autoRunTrack.classList.toggle('hidden', !hasProgress);
+  if (hasProgress) {
+    const percent = Math.min(100, (run.processed / run.total) * 100);
+    els.autoRunFill.style.width = `${percent}%`;
+  }
+
+  // Only the GPU pass is time-limited, and only once it is actually describing — before that the
+  // deadline is 0 and there is nothing honest to count down.
+  if (run.visionDeadlineMs > 0) {
+    const remainingSeconds = (run.visionDeadlineMs - Date.now()) / 1000;
+    els.autoRunLimit.textContent = `${formatAutoRunClock(remainingSeconds)} left of ${run.visionLimitMinutes} min`;
+  } else {
+    els.autoRunLimit.textContent = '';
+  }
+
+  // A pass only notices a stop between images, which for a description is several seconds. Saying
+  // so is what keeps the button from looking broken in the gap.
+  els.autoRunStop.disabled = run.cancelRequested;
+  els.autoRunStop.textContent = run.cancelRequested ? 'Stopping…' : 'Stop';
+}
+
+async function pollAutoRun() {
+  try {
+    state.autoRun = await window.categorizerAPI.getAutoRefreshRun();
+  } catch (error) {
+    // A failed poll says nothing about whether a run exists, so keep showing the last known state
+    // rather than flickering the banner away and back.
+    console.warn('Failed to read the automatic refresh state:', error);
+    return;
+  }
+  renderAutoRun(state.autoRun);
+}
+
+function installAutoRunBanner() {
+  els.autoRunStop.addEventListener('click', async () => {
+    els.autoRunStop.disabled = true;
+    els.autoRunStop.textContent = 'Stopping…';
+    try {
+      await window.categorizerAPI.cancelAutoRefreshRun();
+      showToast('Stopping the automatic refresh — it finishes the image it is on first.');
+    } catch (error) {
+      showToast(errorText(error));
+      els.autoRunStop.disabled = false;
+      els.autoRunStop.textContent = 'Stop';
+    }
+    // Don't wait out the poll interval to reflect it.
+    pollAutoRun();
+  });
+
+  pollAutoRun();
+  setInterval(pollAutoRun, AUTO_RUN_POLL_MS);
+}
+
 async function installAnalysisListeners() {
   const listeners = [
     window.categorizerAPI.onTextAnalysisProgress(({ processed, total, currentName }) => {
@@ -4054,6 +4193,7 @@ async function init() {
     await installKindListeners();
     await installTopicListeners();
     await installFileDropListener();
+    installAutoRunBanner();
     await refreshAll();
   } catch (error) {
     setLoading(false);
@@ -4149,6 +4289,9 @@ function setTextMode(mode) {
   state.textMode = mode;
   els.textModeImages.classList.toggle('active', mode === 'images');
   els.textModeBuckets.classList.toggle('active', mode === 'buckets');
+  // Lazy, and only for the mode that asks a question about time. The log is a file read on the
+  // machine, not in the library, so it costs nothing the image list should be paying for.
+  if (mode === 'buckets') loadCaptureActivity();
   runTextQuery();
 }
 
@@ -4371,6 +4514,7 @@ function renderText() {
   els.textView.classList.toggle('buckets-mode', state.textMode === 'buckets');
 
   renderTextCoverage(status);
+  renderCaptureActivity();
   renderTextTopicsBar();
   renderTextActions();
 
@@ -4458,6 +4602,169 @@ function renderTextCoverage(status) {
   }
 
   els.textCoverage.append(line);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Capture activity — how many screenshots were TAKEN, from screenshot-tool's log
+//
+// This panel otherwise measures the library: files on disk, text extracted from them, buckets
+// built over them. That is the right answer to "what can I categorize" and the wrong answer to
+// "how much have I been capturing" — a month cleared out of the save folder is gone from every
+// figure here, and it should not be gone from a record of the user's own habit.
+//
+// So the log is read as a SECOND, INDEPENDENT source and the two are never reconciled. The strip
+// shows the act; the timeline beside it shows what survived. A gap between them is a cleanup, not
+// a defect, and nothing here is allowed to call it missing data.
+//
+// ⚠ Every zero is qualified before it is drawn. The tool is a tray app that records only while it
+// runs, and the log can be switched off in its own settings, so "0 screenshots" has three possible
+// meanings and only one of them is about the user. `coverage.conclusive` is what separates them —
+// see `capture_log.rs`.
+// ---------------------------------------------------------------------------------------------
+
+const CAPTURE_ACTIVITY_DAYS = 30;
+
+/** Loaded once per app run, then reused: the log is on disk and slow-moving, and the timeline is
+ *  re-rendered on every keystroke in the search box. */
+async function loadCaptureActivity() {
+  if (state.captureActivity !== undefined || state.captureActivityLoading) return;
+  state.captureActivityLoading = true;
+  try {
+    state.captureActivity = await categorizerAPI.getCaptureActivity(CAPTURE_ACTIVITY_DAYS);
+  } catch (error) {
+    // A missing or unreadable log is a normal state, not an error worth a toast: most machines
+    // will never have screenshot-tool on them. The strip simply stays hidden.
+    console.warn('capture log unavailable', error);
+    state.captureActivity = { blocked: 'not_installed' };
+  } finally {
+    state.captureActivityLoading = false;
+  }
+  if (state.textMode === 'buckets') renderCaptureActivity();
+}
+
+/** The one sentence that must be right: why there is nothing to show. Four different reasons and
+ *  collapsing any two of them says something false about either the tool or the user. */
+function captureBlockedText(blocked) {
+  switch (blocked) {
+    case 'logging_disabled':
+      // A SETTING, not an outage. The tool may be capturing perfectly right now, and calling this
+      // "not running" would be a false statement about software that is open.
+      return 'Capture logging is switched off in Screenshot Tool\'s settings.';
+    case 'never_logged':
+      return 'Screenshot Tool has not logged anything yet.';
+    default:
+      return null; // not installed — say nothing at all rather than explain an absent app
+  }
+}
+
+/** Minutes as the coarsest unit that still says something: a log four hours old should not be
+ *  described in minutes, and one three weeks old should not be described in hours. */
+function humanizeMinutes(minutes) {
+  if (minutes < 90) return `${Math.max(1, Math.round(minutes))} min`;
+  if (minutes < 2880) return `${Math.round(minutes / 60)} hours`;
+  return `${Math.round(minutes / 1440)} days`;
+}
+
+function renderCaptureActivity() {
+  const el = els.captureActivity;
+  el.innerHTML = '';
+
+  const data = state.captureActivity;
+  const show = state.textMode === 'buckets' && !!data;
+  el.classList.toggle('hidden', !show);
+  if (!show) return;
+
+  if (data.blocked) {
+    const text = captureBlockedText(data.blocked);
+    if (!text) {
+      el.classList.add('hidden');
+      return;
+    }
+    const note = document.createElement('span');
+    note.className = 'capture-note';
+    note.textContent = text;
+    el.append(note);
+    return;
+  }
+
+  const days = Object.entries(data.by_day || {});
+  const peak = days.reduce((max, [, n]) => Math.max(max, n), 0);
+
+  const label = document.createElement('span');
+  label.className = 'capture-label';
+  label.textContent = 'Screenshots taken';
+  label.title =
+    'From Screenshot Tool\'s own log, not from this library. It records the act, so it does not ' +
+    'fall when you delete or move pictures — the two are meant to disagree.';
+  el.append(label);
+
+  // The bars. One per day in the window, including days with none: a missing bar and a zero bar
+  // are different claims, and only drawing the days that had captures would quietly hide every
+  // quiet day.
+  const strip = document.createElement('div');
+  strip.className = 'capture-strip';
+  for (const [day, count] of days) {
+    const bar = document.createElement('div');
+    bar.className = 'capture-bar';
+    bar.style.setProperty('--h', peak > 0 ? `${Math.max(4, (count / peak) * 100)}%` : '0%');
+    bar.title = `${day} — ${formatCount(count)} screenshot${count === 1 ? '' : 's'}`;
+    strip.append(bar);
+  }
+  el.append(strip);
+
+  const stats = document.createElement('span');
+  stats.className = 'capture-stats';
+  const parts = [`${formatCount(data.total)} in ${data.days} days`];
+  if (data.median_per_active_day != null) {
+    // The baseline is stated with the total and never as a verdict. "A lot" and "a little" only
+    // mean anything against this user's own habit, and the app has no business ranking their day.
+    parts.push(`typically ${formatCount(data.median_per_active_day)} on a day you capture`);
+  }
+  if (data.peak_hour != null) parts.push(`busiest around ${String(data.peak_hour).padStart(2, '0')}:00`);
+  stats.textContent = parts.join(' · ');
+  el.append(stats);
+
+  // ⚠ The qualifier on every count. Zero screenshots with the tool closed is not a measurement,
+  // and a running tool that has not heartbeat into this window yet is not evidence of anything.
+  if (data.coverage && data.coverage.coverage_pct < 50) {
+    const cov = document.createElement('span');
+    cov.className = 'capture-note';
+    if (!data.coverage.conclusive) {
+      cov.textContent = 'Coverage not yet established — treat low counts as unknown, not as zero.';
+    } else {
+      // Named against the log's own lifetime when it is younger than the window, so a two-day-old
+      // log does not read as twenty-eight days of a closed app.
+      const period = data.coverage.truncated_to_log
+        ? `the log's ${humanizeMinutes(data.coverage.window_min)} of history`
+        : 'this window';
+      cov.textContent =
+        `Screenshot Tool was open for ${data.coverage.coverage_pct}% of ${period}, so this is a ` +
+        'sample of when it was running, not of the period.';
+    }
+    el.append(cov);
+  }
+
+  // Stated plainly and only when it exists, so the difference against the library has a named
+  // cause rather than looking like a scan that lost files.
+  if (data.failed > 0) {
+    const failed = document.createElement('span');
+    failed.className = 'capture-note';
+    failed.textContent = `${formatCount(data.failed)} failed to save a file`;
+    failed.title =
+      'The screenshot was taken but the PNG never landed, so no file for it exists in any folder. ' +
+      'Expected to be missing here — not a fault in this library.';
+    el.append(failed);
+  }
+
+  if (data.unknown_schema && data.unknown_schema.length) {
+    const schema = document.createElement('span');
+    schema.className = 'capture-note';
+    schema.textContent = `${data.unknown_schema.length} log file(s) in a newer format — not counted`;
+    schema.title =
+      `${data.unknown_schema.join(', ')} use a schema this app does not parse, so those months are ` +
+      'missing from every figure here. Not a quiet month — an unread one.';
+    el.append(schema);
+  }
 }
 
 function renderTextActions() {

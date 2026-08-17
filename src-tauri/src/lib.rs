@@ -1,6 +1,8 @@
 mod sidecar_lock;
 use sidecar_lock::SidecarLock;
 
+mod auto_run;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,13 +14,15 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use rayon::prelude::*;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, WebviewWindow,
+    AppHandle, Emitter, Listener, LogicalPosition, LogicalSize, Manager, Position, Size,
+    WebviewWindow,
 };
 use tauri_plugin_notification::NotificationExt;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS};
@@ -41,11 +45,19 @@ use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROM
 mod model_lease;
 use model_lease::{IdleLeaseStatus, ModelLease};
 
+// Holds the nightly vision pass back while somebody else is using the GPU. Only the headless job
+// consults it — an interactive Describe run is the user asking for the GPU on purpose.
+mod gpu_gate;
+
 mod geo;
 
 mod kinds;
 
 mod review;
+
+// Reads screenshot-tool's capture log — how many screenshots were TAKEN, as opposed to how many
+// are still in the library. The two are never reconciled; see the module docs.
+mod capture_log;
 
 // Public because `src/bin/icat.rs` — the agent-facing CLI — links this crate as a library and needs
 // to reach `text_cli::run`. The rest of the app treats them like any other module.
@@ -119,6 +131,22 @@ const NUDENET_MODEL_FILENAMES: &[&str] = &["320n.onnx", "nudenet-320n.onnx", "nu
 const HEADLESS_REFRESH_ARG: &str = "--headless-refresh";
 const AUTO_REFRESH_TASK_NAME: &str = "ImageCategorizerAutoRefresh";
 const DEFAULT_AUTO_REFRESH_TIME: &str = "04:00";
+
+/// How long the nightly description pass may hold the GPU before stopping itself and leaving the
+/// rest for the next night.
+///
+/// The pass used to run until the backlog was empty, and the scheduled task sets
+/// `ExecutionTimeLimit=PT0S`, so nothing bounded it at all. On this machine that is not a
+/// theoretical concern: ~60,000 images still needed describing at roughly 12/minute, which is some
+/// 80 hours of continuous GPU time — a "nightly" job that would still be saturating the card in the
+/// middle of the next working day. A bounded slice per night converges on the same backlog without
+/// ever being the reason the machine is busy.
+const DEFAULT_VISION_LIMIT_MINUTES: u32 = 30;
+
+/// Upper bound on the configured limit — a day. Past this the setting is indistinguishable from the
+/// unlimited option it already has (`0`), and a typo'd four-digit number should not silently mean
+/// "most of a week".
+const MAX_VISION_LIMIT_MINUTES: u32 = 24 * 60;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -137,6 +165,15 @@ struct AppSettings {
     auto_refresh_nsfw: Option<bool>,
     auto_refresh_text_analysis: Option<bool>,
     auto_refresh_text_extraction: Option<bool>,
+    // The local-LLM description pass. `None` = off: it is the only pass that needs the GPU and a
+    // running model server, so unlike the others it is not something to switch on for someone by
+    // default. `auto_refresh_gpu_wait` (default on) holds it back while the card is in use.
+    auto_refresh_vision: Option<bool>,
+    // How long the nightly description pass may hold the GPU, in minutes; `0` = until the backlog
+    // is done. See `DEFAULT_VISION_LIMIT_MINUTES` for why this defaults to a limit rather than to
+    // the old unbounded behaviour.
+    auto_refresh_vision_minutes: Option<u32>,
+    auto_refresh_gpu_wait: Option<bool>,
     auto_refresh_low_priority: Option<bool>,
     auto_refresh_toast: Option<bool>,
     last_auto_refresh_at: Option<String>,
@@ -280,6 +317,9 @@ struct AutoRefreshSettingsView {
     run_nsfw: bool,
     run_text_analysis: bool,
     run_text_extraction: bool,
+    run_vision: bool,
+    vision_minutes: u32,
+    gpu_wait: bool,
     low_priority: bool,
     toast: bool,
     task_installed: bool,
@@ -410,7 +450,9 @@ impl Default for PendingAnalysis {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+// `Deserialize` because a headless run reads these back off its own event bus to mirror progress
+// into the cross-process run state — see `install_progress_mirror`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TextAnalysisProgress {
     processed: usize,
@@ -453,6 +495,12 @@ struct ChunkControl {
 struct VisionControl {
     running: AtomicBool,
     cancel: AtomicBool,
+    /// Set by the headless supervisor when it stopped the pass at its time limit rather than
+    /// because somebody cancelled. It stops the run *through* `cancel` — reusing the one flag the
+    /// loop already checks every image, instead of adding a second check to the same hot path — so
+    /// this is what tells the two apart afterwards. Never set by the GUI's Describe button, which
+    /// is deliberately unlimited.
+    hit_time_limit: AtomicBool,
 }
 
 #[derive(Default)]
@@ -3554,6 +3602,8 @@ fn scheduled_task_installed() -> bool {
 
 fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
     let settings = load_app_settings(app);
+    // Read before the struct literal moves `auto_refresh_roots` out of `settings`.
+    let vision_minutes = vision_limit_minutes(&settings);
     AutoRefreshSettingsView {
         enabled: settings.auto_refresh_enabled,
         time: settings.auto_refresh_time.unwrap_or_else(|| DEFAULT_AUTO_REFRESH_TIME.to_string()),
@@ -3561,6 +3611,9 @@ fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
         run_nsfw: settings.auto_refresh_nsfw.unwrap_or(true),
         run_text_analysis: settings.auto_refresh_text_analysis.unwrap_or(true),
         run_text_extraction: settings.auto_refresh_text_extraction.unwrap_or(false),
+        run_vision: settings.auto_refresh_vision.unwrap_or(false),
+        vision_minutes,
+        gpu_wait: settings.auto_refresh_gpu_wait.unwrap_or(true),
         low_priority: settings.auto_refresh_low_priority.unwrap_or(true),
         toast: settings.auto_refresh_toast.unwrap_or(true),
         task_installed: scheduled_task_installed(),
@@ -3574,6 +3627,35 @@ fn get_auto_refresh_settings(app: AppHandle) -> AutoRefreshSettingsView {
     auto_refresh_settings_view(&app)
 }
 
+/// The nightly description pass's GPU budget, in minutes. `0` means "run the backlog down".
+///
+/// Unset reads as [`DEFAULT_VISION_LIMIT_MINUTES`] rather than as unlimited: an existing install
+/// has no value here, and the whole reason this exists is that unlimited was the wrong default.
+fn vision_limit_minutes(settings: &AppSettings) -> u32 {
+    settings
+        .auto_refresh_vision_minutes
+        .unwrap_or(DEFAULT_VISION_LIMIT_MINUTES)
+        .min(MAX_VISION_LIMIT_MINUTES)
+}
+
+/// What a nightly refresh running *in another process* is currently doing, or `None` when none is.
+///
+/// The GUI polls this — see `auto_run` for why a separate process cannot be observed any other way.
+#[tauri::command]
+fn get_auto_refresh_run(app: AppHandle) -> Option<auto_run::RunState> {
+    auto_run::read_live(&app)
+}
+
+/// Asks a running nightly refresh to stop. Returns as soon as the request is recorded; the run
+/// itself stops at its next per-image check, which the banner reflects as "Stopping…".
+#[tauri::command]
+fn cancel_auto_refresh_run(app: AppHandle) -> Result<(), String> {
+    if auto_run::read_live(&app).is_none() {
+        return Err("No automatic refresh is running.".to_string());
+    }
+    auto_run::request_cancel(&app)
+}
+
 #[tauri::command]
 fn set_auto_refresh_settings(
     app: AppHandle,
@@ -3583,10 +3665,18 @@ fn set_auto_refresh_settings(
     run_nsfw: bool,
     run_text_analysis: bool,
     run_text_extraction: bool,
+    run_vision: bool,
+    vision_minutes: u32,
+    gpu_wait: bool,
     low_priority: bool,
     toast: bool,
 ) -> Result<AutoRefreshSettingsView, String> {
     let time = validate_time_of_day(&time)?;
+    if vision_minutes > MAX_VISION_LIMIT_MINUTES {
+        return Err(format!(
+            "The description time limit must be {MAX_VISION_LIMIT_MINUTES} minutes or less (0 = no limit)."
+        ));
+    }
     let mut settings = load_app_settings(&app);
     settings.auto_refresh_enabled = enabled;
     settings.auto_refresh_time = Some(time.clone());
@@ -3594,6 +3684,9 @@ fn set_auto_refresh_settings(
     settings.auto_refresh_nsfw = Some(run_nsfw);
     settings.auto_refresh_text_analysis = Some(run_text_analysis);
     settings.auto_refresh_text_extraction = Some(run_text_extraction);
+    settings.auto_refresh_vision = Some(run_vision);
+    settings.auto_refresh_vision_minutes = Some(vision_minutes);
+    settings.auto_refresh_gpu_wait = Some(gpu_wait);
     settings.auto_refresh_low_priority = Some(low_priority);
     settings.auto_refresh_toast = Some(toast);
     save_app_settings(&app, &settings)?;
@@ -3620,6 +3713,108 @@ fn capped_thread_count() -> usize {
 // event loop runs on the main thread to keep the tray icon's Cancel menu responsive. Sequentially
 // reconciles + analyzes every opted-in root, honouring the same per-pass toggles as the GUI's
 // "Analyze New" controls, then persists a summary and exits the process.
+/// Sets every pass's cancel flag. The passes each poll their own control between items, so this is
+/// all a stop consists of — whether it came from the tray menu or from the GUI's Stop button.
+fn cancel_all_passes(app: &AppHandle) {
+    app.state::<NsfwControl>().cancel.store(true, Ordering::SeqCst);
+    app.state::<AnalysisControl>().cancel.store(true, Ordering::SeqCst);
+    app.state::<OcrTextControl>().cancel.store(true, Ordering::SeqCst);
+    app.state::<ChunkControl>().cancel.store(true, Ordering::SeqCst);
+    app.state::<VisionControl>().cancel.store(true, Ordering::SeqCst);
+}
+
+/// Publishes the run's state once a second, and is the one place that acts on the two things that
+/// can stop it from outside the passes themselves: a stop requested by the GUI, and the vision
+/// pass's time limit.
+///
+/// Both live here rather than inside the pass loops for the same reason — the loops already check
+/// `control.cancel` between items, so driving them through that flag needs no new checks in any hot
+/// path and works identically for every pass. It also means the heartbeat keeps beating during a
+/// long `scan_and_reconcile` (minutes on a 90k-image root) that reports no progress of its own,
+/// which is what stops the GUI from calling a working run stale.
+fn spawn_run_supervisor(app: &AppHandle, shared: &Arc<Mutex<auto_run::RunState>>) {
+    let app = app.clone();
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || loop {
+        {
+            // Held across the whole body, including the publish: `run_headless_refresh` sets
+            // `finished` under this same lock, so once it has, no further publish can start and the
+            // file it then deletes stays deleted.
+            let Ok(mut state) = shared.lock() else { return };
+            if state.finished {
+                return;
+            }
+            state.heartbeat_ms = auto_run::now_ms();
+
+            if !state.cancel_requested && auto_run::cancel_requested(&app) {
+                state.cancel_requested = true;
+                state.label = "Stopping…".to_string();
+                cancel_all_passes(&app);
+            }
+
+            // The GPU budget. `vision_deadline_ms` is only set once descriptions are actually
+            // flowing, so the hours the GPU gate may spend waiting for a free card are not charged
+            // against it.
+            let deadline = state.vision_deadline_ms;
+            if deadline > 0 && !state.hit_time_limit && auto_run::now_ms() >= deadline {
+                state.hit_time_limit = true;
+                state.label = "Stopping — reached the time limit".to_string();
+                let control = app.state::<VisionControl>();
+                control.hit_time_limit.store(true, Ordering::SeqCst);
+                control.cancel.store(true, Ordering::SeqCst);
+            }
+
+            auto_run::publish(&app, &state);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
+}
+
+/// Mirrors each pass's progress events into the shared run state.
+///
+/// The passes already emit exactly this, once per item, for the GUI's status line. In a headless
+/// run there is no window to receive it — but `app.emit` also reaches Rust listeners in the same
+/// process, so subscribing here picks up every pass's progress without touching a single pass.
+fn install_progress_mirror(app: &AppHandle, shared: &Arc<Mutex<auto_run::RunState>>) {
+    for event_name in [
+        "nsfw-analysis-progress",
+        "text-analysis-progress",
+        "text-extraction-progress",
+        "chunk-scan-progress",
+        "vision-analysis-progress",
+    ] {
+        let shared = Arc::clone(shared);
+        app.listen(event_name, move |event| {
+            let Ok(progress) = serde_json::from_str::<TextAnalysisProgress>(event.payload()) else {
+                return;
+            };
+            let Ok(mut state) = shared.lock() else { return };
+            state.processed = progress.processed;
+            state.total = progress.total;
+            state.current_name = Some(progress.current_name);
+        });
+    }
+}
+
+/// Records which pass is running now, so the banner names it rather than showing a bare count.
+fn set_run_phase(shared: &Arc<Mutex<auto_run::RunState>>, phase: &str, label: &str) {
+    let Ok(mut state) = shared.lock() else { return };
+    state.phase = phase.to_string();
+    state.label = label.to_string();
+    // Stale counts from the pass that just ended would otherwise show against the new pass's name
+    // until its first progress event lands.
+    state.processed = 0;
+    state.total = 0;
+    state.current_name = None;
+}
+
+fn set_run_root(shared: &Arc<Mutex<auto_run::RunState>>, root: &str, index: usize, total: usize) {
+    let Ok(mut state) = shared.lock() else { return };
+    state.root = Some(root.to_string());
+    state.root_index = index;
+    state.root_total = total;
+}
+
 fn run_headless_refresh(app: &AppHandle) {
     let settings = load_app_settings(app);
 
@@ -3646,6 +3841,23 @@ fn run_headless_refresh(app: &AppHandle) {
     }
     let _ = rayon::ThreadPoolBuilder::new().num_threads(capped_thread_count()).build_global();
 
+    // A stop asked for while nothing was running — or one written just as the previous run exited —
+    // must not cancel tonight's job before it starts.
+    auto_run::clear_cancel(app);
+    let shared = Arc::new(Mutex::new(auto_run::RunState {
+        pid: std::process::id(),
+        started_at: now_iso(),
+        started_ms: auto_run::now_ms(),
+        heartbeat_ms: auto_run::now_ms(),
+        phase: "starting".to_string(),
+        label: "Starting the nightly refresh".to_string(),
+        root_total: roots.len(),
+        vision_limit_minutes: vision_limit_minutes(&settings),
+        ..auto_run::RunState::default()
+    }));
+    install_progress_mirror(app, &shared);
+    spawn_run_supervisor(app, &shared);
+
     let show_toast = settings.auto_refresh_toast.unwrap_or(true);
     if show_toast {
         let _ = app
@@ -3663,18 +3875,22 @@ fn run_headless_refresh(app: &AppHandle) {
     let run_nsfw = settings.auto_refresh_nsfw.unwrap_or(true);
     let run_text_analysis_pass = settings.auto_refresh_text_analysis.unwrap_or(true);
     let run_text_extraction_pass = settings.auto_refresh_text_extraction.unwrap_or(false);
+    let run_vision_pass = settings.auto_refresh_vision.unwrap_or(false);
 
     let total_roots = roots.len();
     let mut folders_done = 0usize;
     let mut cancelled = false;
 
-    for root in &roots {
+    for (root_index, root) in roots.iter().enumerate() {
         let root_buf = PathBuf::from(root);
+        set_run_root(&shared, root, root_index + 1, total_roots);
+        set_run_phase(&shared, "scanning", "Scanning for new images");
         if scan_and_reconcile(&root_buf).is_err() {
             continue;
         }
 
         if run_nsfw && !cancelled {
+            set_run_phase(&shared, "explicit", "Explicit content analysis");
             let control = app.state::<NsfwControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
@@ -3684,6 +3900,7 @@ fn run_headless_refresh(app: &AppHandle) {
             }
         }
         if run_text_analysis_pass && !cancelled {
+            set_run_phase(&shared, "text", "Text analysis");
             let control = app.state::<AnalysisControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
@@ -3693,6 +3910,7 @@ fn run_headless_refresh(app: &AppHandle) {
             }
         }
         if run_text_extraction_pass && !cancelled {
+            set_run_phase(&shared, "ocr", "Extracting OCR text");
             let control = app.state::<OcrTextControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
@@ -3710,7 +3928,33 @@ fn run_headless_refresh(app: &AppHandle) {
         }
     }
 
-    let summary = if cancelled {
+    // The vision pass is deliberately a second phase over the same roots rather than another step
+    // inside the loop above, for two reasons. The GPU gate must be consulted exactly once — after
+    // the first batch of descriptions starts, *this* process is what is pinning the card, so a
+    // re-check per root would see a busy GPU and stall a run that is working (see `gpu_gate`). And
+    // descriptions depend on NSFW scores: `pending_vision` skips anything not yet scored, so
+    // finishing the scoring for every root first is what stops the last root's images being passed
+    // over as "not yet Explicit-analyzed".
+    let vision_note = if run_vision_pass && !cancelled {
+        match run_headless_vision(app, &settings, &roots, &shared) {
+            HeadlessVisionOutcome::Ran => Some("Descriptions run.".to_string()),
+            HeadlessVisionOutcome::Cancelled => {
+                cancelled = true;
+                Some("Descriptions cancelled.".to_string())
+            }
+            HeadlessVisionOutcome::HitTimeLimit => Some(format!(
+                "Descriptions stopped at the {}-minute limit; the rest is left for the next run.",
+                vision_limit_minutes(&settings)
+            )),
+            HeadlessVisionOutcome::SkippedGpuBusy => {
+                Some("Descriptions skipped — the GPU stayed busy.".to_string())
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut summary = if cancelled {
         format!(
             "Cancelled after {folders_done} of {total_roots} folder{}.",
             if total_roots == 1 { "" } else { "s" }
@@ -3718,11 +3962,24 @@ fn run_headless_refresh(app: &AppHandle) {
     } else {
         format!("Completed {folders_done} folder{}.", if folders_done == 1 { "" } else { "s" })
     };
+    if let Some(note) = vision_note {
+        summary.push(' ');
+        summary.push_str(&note);
+    }
 
     let mut settings = load_app_settings(app);
     settings.last_auto_refresh_at = Some(now_iso());
     settings.last_auto_refresh_summary = Some(summary.clone());
     let _ = save_app_settings(app, &settings);
+
+    // Stop the supervisor before removing the file, or its next tick would republish a run that has
+    // ended and leave the GUI showing a banner for it until the staleness window expired. Setting
+    // this under the lock is what makes the ordering hold — see `spawn_run_supervisor`.
+    if let Ok(mut state) = shared.lock() {
+        state.finished = true;
+    }
+    auto_run::clear(app);
+    auto_run::clear_cancel(app);
 
     if show_toast {
         let _ = app
@@ -3734,6 +3991,116 @@ fn run_headless_refresh(app: &AppHandle) {
     }
 
     app.exit(0);
+}
+
+enum HeadlessVisionOutcome {
+    Ran,
+    Cancelled,
+    /// The pass used up its GPU budget with work still pending. Distinct from `Cancelled` because
+    /// nobody asked for it and nothing is wrong — it is the normal end of a nightly slice.
+    HitTimeLimit,
+    /// The GPU never freed up inside the gate's budget, so the descriptions were left for the next
+    /// run rather than forced onto a card somebody else is using.
+    SkippedGpuBusy,
+}
+
+/// Whether the vision model still has to be loaded onto the card.
+///
+/// This is the input that keeps the GPU gate from deadlocking against itself: a resident 26B model
+/// leaves far less free VRAM than loading one needs, so requiring load-sized headroom when nothing
+/// needs loading would block forever (see `gpu_gate`).
+///
+/// `Unknown` counts as "needs loading" — the conservative direction. Being wrong that way costs a
+/// wait; being wrong the other way starts a load that does not fit and runs ~10x slower off system
+/// RAM. An endpoint that is not LM Studio always answers `Unknown` (only its native `/api/v0/models`
+/// reports residency), which is the same situation as a server that is simply down: the pass would
+/// fail anyway.
+fn vision_model_needs_loading(settings: &AppSettings) -> bool {
+    let Some(models_url) = vision_rest_models_url(settings) else {
+        return true;
+    };
+    let api_key = vision_api_key(settings);
+    vision::model_state(
+        &vision::build_probe_agent(),
+        &models_url,
+        &vision_model(settings),
+        api_key.as_deref(),
+    ) != vision::ModelState::Loaded
+}
+
+/// Describes every opted-in root with the local vision model, once the GPU is free to do it.
+///
+/// Called only from the nightly job. The interactive Describe button has no gate on purpose: a user
+/// pressing it is asking for the GPU deliberately, and making them wait behind their own game would
+/// be absurd. It is the unattended run that has to be a good neighbour.
+fn run_headless_vision(
+    app: &AppHandle,
+    settings: &AppSettings,
+    roots: &[String],
+    shared: &Arc<Mutex<auto_run::RunState>>,
+) -> HeadlessVisionOutcome {
+    let cancelled = || app.state::<VisionControl>().cancel.load(Ordering::SeqCst);
+    app.state::<VisionControl>().hit_time_limit.store(false, Ordering::SeqCst);
+
+    if settings.auto_refresh_gpu_wait.unwrap_or(true) {
+        set_run_phase(shared, "gpu-wait", "Waiting for the GPU to be free");
+        let needs_vram = vision_model_needs_loading(settings);
+        let show_toast = settings.auto_refresh_toast.unwrap_or(true);
+        let announce_wait = |sample: gpu_gate::GpuSample| {
+            if show_toast {
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Image Categorizer")
+                    .body(format!(
+                        "GPU busy ({}% in use). Waiting for it to free up before describing images.",
+                        sample.utilization_pct
+                    ))
+                    .show();
+            }
+        };
+        match gpu_gate::wait_until_free(needs_vram, &cancelled, &announce_wait) {
+            gpu_gate::GateOutcome::Proceed => {}
+            gpu_gate::GateOutcome::Cancelled => return HeadlessVisionOutcome::Cancelled,
+            gpu_gate::GateOutcome::TimedOut => return HeadlessVisionOutcome::SkippedGpuBusy,
+        }
+    }
+
+    // Arm the budget only now. Everything above this line is the gate, which has its own (much
+    // longer) ceiling and does not touch the card — charging its wait against the GPU budget could
+    // let a run that finally got a free card immediately stop again with nothing described.
+    let limit_minutes = vision_limit_minutes(settings);
+    if limit_minutes > 0 {
+        if let Ok(mut state) = shared.lock() {
+            state.vision_deadline_ms = auto_run::now_ms() + u64::from(limit_minutes) * 60_000;
+            state.vision_limit_minutes = limit_minutes;
+        }
+    }
+    set_run_phase(shared, "vision", "Describing images");
+
+    // The deadline is enforced by the supervisor, which stops the pass through `VisionControl`, so
+    // check it first: it sets `cancel` too, and reading that alone would report a cancellation
+    // nobody asked for.
+    let hit_limit = || app.state::<VisionControl>().hit_time_limit.load(Ordering::SeqCst);
+
+    for root in roots {
+        if hit_limit() {
+            return HeadlessVisionOutcome::HitTimeLimit;
+        }
+        if cancelled() {
+            return HeadlessVisionOutcome::Cancelled;
+        }
+        let control = app.state::<VisionControl>();
+        control.running.store(true, Ordering::SeqCst);
+        run_vision_analysis(app, &PathBuf::from(root), false);
+        if hit_limit() {
+            return HeadlessVisionOutcome::HitTimeLimit;
+        }
+        if cancelled() {
+            return HeadlessVisionOutcome::Cancelled;
+        }
+    }
+    HeadlessVisionOutcome::Ran
 }
 
 // ============================================================================
@@ -4852,6 +5219,22 @@ struct GeoStatusView {
 /// Cheap on purpose: it stats five sidecars and parses the four SMALL ones, never the multi-megabyte
 /// records file. That is what lets the panel re-check freshness on every focus rather than only when
 /// the user happens to navigate away and back.
+/// How many screenshots were TAKEN over the last `days`, from screenshot-tool's own log.
+///
+/// Deliberately says nothing about this library. The library counts what survived on disk; this
+/// counts the act, and the two disagreeing after a cleanup is expected rather than a fault. The UI
+/// shows them side by side and must never present the gap as missing data — see `capture_log`.
+///
+/// Cheap: a few hundred KB of TSV, versus the 14.6 GB the save folder was measured at. That is the
+/// main reason this exists as a log at all rather than as a walk over the filenames.
+#[tauri::command]
+fn get_capture_activity(days: Option<u32>) -> capture_log::CaptureActivity {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    capture_log::read(days.unwrap_or(30).clamp(1, 3650), now_ms)
+}
+
 #[tauri::command]
 fn get_geo_status(root: String) -> Result<GeoStatusView, String> {
     let root_buf = root_path(&root)?;
@@ -5700,11 +6083,7 @@ pub fn run() {
                     .show_menu_on_left_click(true)
                     .on_menu_event(move |app, event| {
                         if event.id() == &cancel_item_id {
-                            app.state::<NsfwControl>().cancel.store(true, Ordering::SeqCst);
-                            app.state::<AnalysisControl>().cancel.store(true, Ordering::SeqCst);
-                            app.state::<OcrTextControl>().cancel.store(true, Ordering::SeqCst);
-                            app.state::<ChunkControl>().cancel.store(true, Ordering::SeqCst);
-                            app.state::<VisionControl>().cancel.store(true, Ordering::SeqCst);
+                            cancel_all_passes(app);
                         }
                     });
                 if let Some(icon) = app.default_window_icon().cloned() {
@@ -5756,6 +6135,9 @@ pub fn run() {
             extract_text,
             get_app_settings,
             get_auto_refresh_settings,
+            get_auto_refresh_run,
+            cancel_auto_refresh_run,
+            get_capture_activity,
             get_chunk_plan,
             get_geo_coverage,
             get_geo_location_images,

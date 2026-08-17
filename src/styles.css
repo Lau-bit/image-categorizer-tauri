@@ -579,6 +579,112 @@ body.light-mode .drop-overlay {
   color: var(--muted);
 }
 
+/* The nightly-refresh banner. A full-width flex line at the top of the topbar, full-bled back out
+   over the topbar's own horizontal padding so it reads as a strip across the window rather than as
+   another control inside the header. */
+.auto-run-banner {
+  flex: 0 0 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: -10px -18px 0;
+  padding: 7px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* `.hidden` is a bare class defined near the top of this file, so it ties with `.auto-run-banner`
+   on specificity and LOSES on source order — the banner would never hide. This rule is what makes
+   toggling the class work at all. */
+.auto-run-banner.hidden {
+  display: none;
+}
+
+/* Signals "this is happening right now" without a spinner's constant motion in the corner of the
+   eye — the run can last half an hour. */
+.auto-run-pulse {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: auto-run-pulse 2s ease-in-out infinite;
+}
+
+@keyframes auto-run-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auto-run-pulse {
+    animation: none;
+  }
+}
+
+.auto-run-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* Lets the detail line ellipsize instead of pushing Stop off the edge on a narrow window. */
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.auto-run-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.auto-run-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.auto-run-detail {
+  color: var(--muted-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.auto-run-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.auto-run-track.hidden {
+  display: none;
+}
+
+.auto-run-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+/* The time budget. Tabular figures so a counting-down number doesn't jitter its own width. */
+.auto-run-limit {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.auto-run-stop {
+  flex: 0 0 auto;
+  padding: 3px 12px;
+}
+
 .topbar {
   display: flex;
   align-items: center;
@@ -2402,6 +2508,63 @@ body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
 
 .text-coverage-stale {
   color: var(--accent);
+}
+
+/* Screenshots TAKEN, from Screenshot Tool's log — a second source beside the library's own
+   timeline. Styled to match .text-coverage above rather than to stand out: it is context for the
+   buckets, not a scoreboard, and a count of captures is never a verdict on a day. */
+.capture-activity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 0 0 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.capture-label {
+  color: var(--muted-strong);
+}
+
+/* Fixed height so a quiet stretch keeps the row from resizing as the window is re-read. Bars are
+   bottom-aligned and one per DAY, including days with none — a missing bar and a zero bar are
+   different claims. */
+.capture-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 22px;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.capture-bar {
+  width: 5px;
+  flex: 0 0 auto;
+  height: var(--h, 0%);
+  min-height: 1px;
+  background: var(--accent-soft);
+  border-top: 1px solid var(--accent);
+  border-radius: 1px 1px 0 0;
+}
+
+.capture-bar:hover {
+  background: var(--accent);
+}
+
+.capture-stats {
+  color: var(--muted);
+}
+
+/* Every caveat on this row — low coverage, failed saves, an unparsed month — shares one quiet
+   style. None of them is a warning: they are the reasons this count and the library's count are
+   allowed to disagree. */
+.capture-note {
+  color: var(--muted);
+  font-style: italic;
 }
 
 .text-columns {
