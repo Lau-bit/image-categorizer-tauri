@@ -12,6 +12,12 @@
 //!
 //! Redacting at read rather than at index time is what lets this pattern list grow without a
 //! rebuild: a pattern added today covers text extracted last month on the very next query.
+//!
+//! **Every credential in this module's tests is synthetic, and must stay that way.** The tests read
+//! naturally as a place for a "real" example — the pattern list is only convincing against input
+//! that looks genuine — and that is exactly how the live `visionApiKey` came to sit in
+//! `removes_the_apps_own_key_shape` and be pushed to a public repo. Match the *shape* of a
+//! credential; never its value. A fixture is source, and source here is published.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -120,9 +126,12 @@ mod tests {
 
     #[test]
     fn removes_the_apps_own_key_shape() {
-        // The real shape sitting in this app's settings.json today.
-        let (out, report) = redact("visionApiKey: sk-lm-2C8fQux7:HSe0hh46275SOiE2ij2B done");
-        assert!(!out.contains("HSe0hh46275SOiE2ij2B"), "{out}");
+        // A synthetic stand-in built to the shape LM Studio issues (`sk-lm-<id>:<secret>`), which
+        // is the shape this app's own `visionApiKey` has. It must stay synthetic: a real key used
+        // as a fixture here is a real key published to this repo, and one was — see the note at the
+        // top of the module. Never paste a live value in to make the assertion more convincing.
+        let (out, report) = redact("visionApiKey: sk-lm-EXAMPLE1:NOTAREALKEY000000 done");
+        assert!(!out.contains("NOTAREALKEY000000"), "{out}");
         assert!(out.contains("done"), "surrounding text must survive: {out}");
         assert!(!report.is_empty());
     }

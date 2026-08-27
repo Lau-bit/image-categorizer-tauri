@@ -1347,11 +1347,30 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     Ok(view)
 }
 
+// The Windows directory, for naming a system binary absolutely. `CreateProcess` resolves a bare
+// `explorer.exe` against the current directory before `System32`, so a stray executable dropped
+// beside a library folder could stand in for it; an absolute path removes that possibility.
+#[cfg(target_os = "windows")]
+fn windows_dir() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
 fn launch_path(path: &Path) -> Result<(), String> {
+    // Windows: `explorer.exe <path>` reaches the same default handler `start` would — for a file
+    // and for a folder alike — but explorer is not a shell, so it never re-reads the path looking
+    // for operators.
+    //
+    // This must not go back through `cmd /C start`. Rust quotes an argument only when it holds a
+    // space or a tab, so any path without one arrived at cmd bare, and cmd read `&` in it as a
+    // command separator: opening an image named `cat&whoami&x.jpg` out of a space-free folder ran
+    // `whoami`. Filenames carrying `&` are legal and survive any download or archive extraction,
+    // which is precisely how images reach this app.
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", ""]).arg(path);
+        let mut command = Command::new(windows_dir().join("explorer.exe"));
+        command.arg(path);
         command
     };
 
@@ -3094,7 +3113,9 @@ fn reveal_image(file_path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let path = path.canonicalize().map_err(|error| format!("Failed to resolve file location: {error}"))?;
-        Command::new("explorer.exe")
+        // Absolute for the same reason as `launch_path`. Explorer is not a shell, so `&` in the
+        // path is inert here and only the binary's identity was ever in question.
+        Command::new(windows_dir().join("explorer.exe"))
             .arg(format!("/select,\"{}\"", path.to_string_lossy()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
