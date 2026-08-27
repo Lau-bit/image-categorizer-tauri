@@ -51,6 +51,13 @@ window.categorizerAPI = {
   getAutoRefreshRun: () => invoke('get_auto_refresh_run'),
   cancelAutoRefreshRun: () => invoke('cancel_auto_refresh_run'),
 
+  // What the next scheduled run would have to process, counted off each folder's last scan rather
+  // than off the disk — a scan of a large root takes minutes and this is a screen, not a job.
+  getAutoRefreshQueue: () => invoke('get_auto_refresh_queue'),
+  // Launches the scheduled run now, as a separate process, exactly as the nightly trigger does.
+  // Resolves once it has been started, not when it finishes: watch `getAutoRefreshRun` for that.
+  runAutoRefreshNow: () => invoke('run_auto_refresh_now'),
+
   scanLibrary: root => invoke('scan_library', { root }),
   setSourcePattern: (root, preset, regex) => invoke('set_source_pattern', { root, preset, regex }),
   addManualSourceFolder: (root, folderPath) => invoke('add_manual_source_folder', { root, folderPath }),

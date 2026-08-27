@@ -1292,8 +1292,17 @@ body.dialog-open .dialog-scrim {
   overflow-y: auto;
 }
 
+/* Two columns, and everything inside them tightened. Stacked, these groups were taller than the
+   whole rest of the panel put together, which is absurd for what they are: a handful of short,
+   fixed-size controls. Each group is its own grid item, so a narrow window folds them back to one
+   column without any of them being cut in half. */
 #auto-refresh-options {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  /* Both halves, always — an auto-placed grid otherwise sizes rows to min-content and clips the
+     taller group to a sliver. */
+  grid-auto-rows: max-content;
+  align-items: start;
   gap: 10px;
 }
 
@@ -2892,6 +2901,816 @@ body.light-mode .geo-legend-item.tier-deep { color: #1f6437; }
 body.view-text .search-input,
 body.view-text .sort-select {
   display: none;
+}
+
+/* ==============================
+   Dashboard
+   Same structural rules as the geo, text and automation panels — own scroll container, sticky
+   toolbar bleeding into the gutters — so all four behave identically when they swap places with the
+   image grid.
+
+   One colour rule carries most of the meaning here: `is-manual` (accent) marks everything the USER
+   did, and everything a pass did stays neutral grey. That is the distinction the whole view exists
+   to draw, so it is the only place a colour is spent.
+   ============================== */
+
+.dash-view {
+  height: 100%;
+  min-height: 0;
+  /* Same no-top-padding rule as the other panels: a scroll container's padding is part of its
+     sticky constraint, so the toolbar would park below it and let content scroll through the gap. */
+  padding: 0 18px 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Search and sort act on an image grid that is not on screen. The Analyze row goes too: it reports
+   what is outstanding for the passes ticked in IT, which is a narrower, differently-scoped version
+   of the same number this view puts in a card of its own. */
+body.view-dashboard .search-input,
+body.view-dashboard .sort-select,
+body.view-dashboard .analysis-controls {
+  display: none;
+}
+
+.dash-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin: 0 -18px;
+  padding: 12px 18px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.dash-toolbar .button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.dash-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.dash-asof {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dash-range {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.dash-range-button {
+  padding: 0 11px;
+  height: 30px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted-strong);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.dash-range-button:last-child {
+  border-right: 0;
+}
+
+.dash-range-button:hover {
+  background: var(--panel-raised);
+}
+
+.dash-range-button.is-active {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+/* --- tiles --- */
+
+.dash-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-auto-rows: max-content;
+  align-items: start;
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.dash-tile {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-soft);
+}
+
+.dash-tile-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.dash-tile-label {
+  margin-top: 4px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.dash-tile-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- cards --- */
+
+.dash-cards {
+  display: grid;
+  /* 320, not 360: at the default window the panel is ~723px wide once the scrollbar is out, and a
+     360 minimum needs 732 — every card fell to its own row for nine pixels. */
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  /* Both halves, always — an auto-placed grid otherwise sizes rows to min-content and clips the
+     taller card to a sliver. */
+  grid-auto-rows: max-content;
+  align-items: start;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.dash-card {
+  display: grid;
+  gap: 9px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  min-width: 0;
+}
+
+.dash-card-wide {
+  grid-column: 1 / -1;
+}
+
+.dash-card h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 720;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.dash-card > div {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dash-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dash-caption {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* --- horizontal bars --- */
+
+.dash-bar-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.dash-bar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.dash-bar-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash-bar-count {
+  flex: 0 0 auto;
+  color: var(--muted-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.dash-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-raised);
+  overflow: hidden;
+}
+
+.dash-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--muted);
+}
+
+/* The one colour on the screen: this row is something the USER did, not something a pass did. */
+.dash-bar-row.is-manual .dash-bar-fill {
+  background: var(--accent);
+}
+
+.dash-bar-row.is-capture .dash-bar-fill {
+  background: var(--muted-strong);
+}
+
+.dash-bar-row.is-muted .dash-bar-label,
+.dash-bar-row.is-muted .dash-bar-count {
+  color: var(--muted);
+}
+
+.dash-bar-row.is-muted .dash-bar-fill {
+  background: var(--border-strong);
+}
+
+/* Nothing outstanding is a resting state, not a result — same treatment as the Analyze row's
+   readout and the Automation queue's chips. */
+.dash-bar-row.is-clear .dash-bar-note {
+  color: var(--muted);
+}
+
+.dash-bar-note {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- day strips --- */
+
+.dash-strip-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-auto-rows: max-content;
+  align-items: start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.dash-strip-block {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dash-strip-title {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.dash-strip-wrap {
+  min-width: 0;
+}
+
+.dash-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 62px;
+  padding: 0 1px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.dash-strip-bar {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: var(--h, 0%);
+  border-radius: 2px 2px 0 0;
+  background: var(--muted);
+}
+
+.dash-strip.is-manual .dash-strip-bar {
+  background: var(--accent);
+}
+
+.dash-strip.is-capture .dash-strip-bar {
+  background: var(--muted-strong);
+}
+
+/* A day with nothing keeps its column and draws a floor rather than vanishing: a missing bar and a
+   zero bar are different claims, and the quiet days are most of what a usage pattern is. */
+.dash-strip-bar.is-empty {
+  height: 1px;
+  background: var(--border-strong);
+}
+
+/* The axis. Deliberately the SAME flex geometry as `.dash-strip` — one cell per column, same gap,
+   same padding — so a tick sits exactly under the column it names. Laying labels out by percentage
+   instead would drift against the bars by the accumulated 1px gaps, which over 365 columns is most
+   of a bar's width. */
+.dash-axis {
+  display: flex;
+  gap: 1px;
+  padding: 0 1px;
+  margin-top: 5px;
+  min-width: 0;
+}
+
+.dash-axis-cell {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 13px;
+}
+
+.dash-axis-cell > span {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The end labels are pinned inside the box instead of centred on their column, or half of each
+   would hang outside the card and be clipped. The tick MARK below stays on the column regardless,
+   so the position itself is never misstated. */
+.dash-axis-cell.is-first > span {
+  left: 0;
+  transform: none;
+}
+
+.dash-axis-cell.is-last > span {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+.dash-axis-cell.is-tick::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  width: 1px;
+  height: 3px;
+  background: var(--border-strong);
+}
+
+/* ==============================
+   Automation
+   The scheduled run's own screen. Same structural rules as the geo and text panels — own scroll
+   container, sticky toolbar bleeding into the gutters — because all three swap places with the
+   image grid and any difference between them shows up as a jump when you switch tabs.
+
+   The palette carries the whole point of the panel: a queue with nothing in it is the GOOD state
+   here, not an empty result. So `is-clear` recedes (muted, no border) while `is-warn` is the only
+   thing allowed to draw the eye, and it is reserved for a schedule that cannot do what it says —
+   a missing folder, a task that was never installed.
+   ============================== */
+
+.auto-view {
+  height: 100%;
+  min-height: 0;
+  /* Same no-top-padding rule as `.geo-view`: a scroll container's padding is part of its sticky
+     constraint, so the toolbar would park below it and let content scroll through the gap. */
+  padding: 0 18px 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Search and sort go for the same reason as in the other two panels — they act on an image grid
+   that is not on screen. The Analyze row goes for a reason unique to this view: it reports how many
+   images are new for the passes ticked in IT, against the root open in the sidebar, which is a
+   different question from the one this panel answers two rows below in a much bigger number. Two
+   counts of "what is left to do" stacked on top of each other is worse than either alone. */
+body.view-automation .search-input,
+body.view-automation .sort-select,
+body.view-automation .analysis-controls {
+  display: none;
+}
+
+.auto-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin: 0 -18px;
+  padding: 12px 18px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.auto-toolbar .button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.auto-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.auto-counted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auto-state-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.auto-state-chip.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.auto-state-chip.is-running {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+/* On, and with nothing waiting. The state the panel exists to make legible, and the one that must
+   not look like a warning. */
+.auto-state-chip.is-clear,
+.auto-state-chip.is-off {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.auto-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  /* Both halves, always: without them an auto-placed grid sizes its rows to min-content and clips
+     the taller card to a sliver — the trap this codebase has already been bitten by twice. */
+  grid-auto-rows: max-content;
+  align-items: start;
+  gap: 14px;
+  padding-top: 14px;
+}
+
+.auto-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  min-width: 0;
+}
+
+/* The controls are a column of full-width rows; letting them share a track with the two reporting
+   cards squeezes every checkbox label onto two lines. */
+.auto-card-wide {
+  grid-column: 1 / -1;
+}
+
+/* The moved settings blocks default to the same surface as the card they now sit in, which reads as
+   one flat sheet. They came from a dialog whose background was a shade darker. */
+.auto-card-wide .settings-stack,
+.auto-card-wide .check-row {
+  background: var(--panel);
+}
+
+/* Dialog padding is generous because a dialog has one column and all the room it wants. In a
+   two-column card that same padding is the difference between the schedule fitting on screen and
+   not. */
+.auto-card-wide .settings-stack {
+  padding: 9px 10px;
+  gap: 7px;
+}
+
+.auto-card-wide .check-row {
+  padding: 7px 9px;
+  gap: 9px;
+}
+
+.auto-card-wide .settings-label {
+  margin-bottom: 0;
+}
+
+/* Tick boxes beside each other rather than under: four one-line options in a column is four rows
+   for four words each. Folds to one column below the min, which is where the labels stop fitting. */
+.auto-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-auto-rows: max-content;
+  gap: 6px;
+}
+
+/* Spans both columns: three options plus a line of prose reads as a footer to the whole block, and
+   squeezed into one column its note would wrap to five lines. */
+.auto-span-all {
+  grid-column: 1 / -1;
+}
+
+/* Grid and flex items are min-CONTENT sized by default, so one long folder path makes its row wider
+   than the column and spills it over the card beside it — the ellipsis on the label never gets a
+   chance to fire. Every level between the grid and the text has to opt out. */
+#auto-refresh-options > *,
+.auto-check-grid > *,
+.manual-folder-list,
+.auto-refresh-root-row {
+  min-width: 0;
+}
+
+.auto-time-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.auto-time-select,
+.auto-minutes-input {
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.auto-time-select {
+  /* Wide enough for two digits plus the native arrow, and fixed so the hour and minute boxes match
+     each other rather than sizing to their own longest option. */
+  width: 62px;
+}
+
+.auto-minutes-input {
+  width: 82px;
+}
+
+.auto-time-select:focus,
+.auto-minutes-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.auto-time-colon {
+  color: var(--muted-strong);
+  font-weight: 700;
+}
+
+/* Rides on the control's own row instead of taking a paragraph under it — the whole point of these
+   two fields is that their explanation is one clause long. */
+.auto-inline-hint {
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.auto-card h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 720;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.auto-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.auto-note-lead {
+  margin-bottom: 4px;
+}
+
+/* --- The run --- */
+
+.auto-live {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.auto-live-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.auto-live-pulse {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: auto-run-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auto-live-pulse {
+    animation: none;
+  }
+}
+
+.auto-live-label {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-live-limit {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.auto-live-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.auto-live-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.auto-live-detail {
+  color: var(--muted-strong);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-facts {
+  display: grid;
+  gap: 0;
+  margin: 0;
+}
+
+.auto-fact {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.auto-fact:last-child {
+  border-bottom: 0;
+}
+
+.auto-fact dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auto-fact dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.auto-fact.is-off dd {
+  color: var(--muted);
+}
+
+.auto-fact.is-clear dd {
+  color: var(--muted-strong);
+}
+
+/* The one tone that asks to be looked at: the schedule says it will do something it cannot. */
+.auto-fact.is-warn dd {
+  color: var(--danger);
+}
+
+/* --- The queue --- */
+
+.auto-queue {
+  display: grid;
+  gap: 10px;
+}
+
+.auto-queue-headline {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.auto-queue-headline.is-clear,
+.auto-queue-headline.is-off {
+  color: var(--muted);
+}
+
+.auto-queue-headline.is-warn {
+  color: var(--danger);
+}
+
+.auto-queue-row {
+  display: grid;
+  gap: 6px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.auto-queue-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted-strong);
+}
+
+.auto-queue-body {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.auto-queue-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.auto-queue-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Nothing outstanding for this pass — a resting state, exactly as in the Analyze row's readout. */
+.auto-queue-chip.is-clear {
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.auto-queue-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A zero here is the good news, so it stops looking like a badge. */
+.count-pill.is-clear {
+  background: transparent;
+  color: var(--muted);
 }
 
 @media (max-width: 1180px) {

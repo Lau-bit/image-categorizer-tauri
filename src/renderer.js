@@ -25,9 +25,19 @@ const state = {
   analysisQueue: [],   // [{type: 'text'|'nsfw'|'ocr'|'chunk'|'vision', force: bool}]
   analysisRunning: null, // 'text' | 'nsfw' | 'ocr' | 'chunk' | 'vision' | null
   autoRefresh: null,
+  // Dashboard. Only the window and the capture read are held: every other figure is recomputed
+  // from `library.images` on each paint, because a full pass over 50k records is ~3 ms and a cache
+  // is a way for the numbers to be one category assignment out of date.
+  dashDays: 90,
+  dashCaptures: undefined,
+  dashCapturesLoading: false,
   // The nightly run happening in the OTHER process right now, polled from a state file, or null
   // when none is. Nothing else in this window can see it — see the banner section.
   autoRun: null,
+  // What the next scheduled run would find waiting for it, per folder. Read on demand rather than
+  // polled: it is a statement about the last scan of each folder, and nothing between two opens of
+  // this tab can change it except a run, which reloads it on the way out.
+  autoQueue: null,
   chunkPlan: null,
   // Geo layer (own sidecars, independent of categories). `geoSetImages` holds the resolved images
   // of an opened country set — an explicit ordered member list, not a filter over the library.
@@ -101,6 +111,19 @@ const els = {
   navButtons: document.getElementById('nav-buttons'),
   navBackButton: document.getElementById('nav-back-button'),
   navForwardButton: document.getElementById('nav-forward-button'),
+  dashboardTab: document.getElementById('dashboard-tab'),
+  dashView: document.getElementById('dash-view'),
+  dashRange: document.getElementById('dash-range'),
+  dashRefreshButton: document.getElementById('dash-refresh-button'),
+  dashAsOf: document.getElementById('dash-asof'),
+  dashTiles: document.getElementById('dash-tiles'),
+  dashUsage: document.getElementById('dash-usage'),
+  dashOwn: document.getElementById('dash-own'),
+  dashActivity: document.getElementById('dash-activity'),
+  dashCaptures: document.getElementById('dash-captures'),
+  dashCoverage: document.getElementById('dash-coverage'),
+  dashContents: document.getElementById('dash-contents'),
+  dashFolders: document.getElementById('dash-folders'),
   allTab: document.getElementById('all-tab'),
   allCount: document.getElementById('all-count'),
   unclassifiedTab: document.getElementById('unclassified-tab'),
@@ -109,6 +132,23 @@ const els = {
   geoCount: document.getElementById('geo-count'),
   textTab: document.getElementById('text-tab'),
   textCount: document.getElementById('text-count'),
+  automationTab: document.getElementById('automation-tab'),
+  automationCount: document.getElementById('automation-count'),
+  autoView: document.getElementById('auto-view'),
+  autoStateChip: document.getElementById('auto-state-chip'),
+  autoRunNowButton: document.getElementById('auto-run-now-button'),
+  autoStopButton: document.getElementById('auto-stop-button'),
+  autoRecheckButton: document.getElementById('auto-recheck-button'),
+  autoCounted: document.getElementById('auto-counted'),
+  autoLive: document.getElementById('auto-live'),
+  autoLiveLabel: document.getElementById('auto-live-label'),
+  autoLiveLimit: document.getElementById('auto-live-limit'),
+  autoLiveTrack: document.getElementById('auto-live-track'),
+  autoLiveFill: document.getElementById('auto-live-fill'),
+  autoLiveDetail: document.getElementById('auto-live-detail'),
+  autoFacts: document.getElementById('auto-facts'),
+  autoQueue: document.getElementById('auto-queue'),
+  openAutomationButton: document.getElementById('open-automation-button'),
   textView: document.getElementById('text-view'),
   textQuery: document.getElementById('text-query'),
   textFrom: document.getElementById('text-from'),
@@ -240,7 +280,8 @@ const els = {
   nsfwModelReport: document.getElementById('nsfw-model-report'),
   autoRefreshEnabledInput: document.getElementById('auto-refresh-enabled-input'),
   autoRefreshOptions: document.getElementById('auto-refresh-options'),
-  autoRefreshTimeInput: document.getElementById('auto-refresh-time-input'),
+  autoRefreshHour: document.getElementById('auto-refresh-hour'),
+  autoRefreshMinute: document.getElementById('auto-refresh-minute'),
   autoRefreshRootList: document.getElementById('auto-refresh-root-list'),
   autoRefreshNsfwInput: document.getElementById('auto-refresh-nsfw-input'),
   autoRefreshTextAnalysisInput: document.getElementById('auto-refresh-text-analysis-input'),
@@ -250,7 +291,6 @@ const els = {
   autoRefreshGpuWaitInput: document.getElementById('auto-refresh-gpu-wait-input'),
   autoRefreshLowPriorityInput: document.getElementById('auto-refresh-low-priority-input'),
   autoRefreshToastInput: document.getElementById('auto-refresh-toast-input'),
-  autoRefreshStatus: document.getElementById('auto-refresh-status'),
   autoRunBanner: document.getElementById('auto-run-banner'),
   autoRunTitle: document.getElementById('auto-run-title'),
   autoRunDetail: document.getElementById('auto-run-detail'),
@@ -646,18 +686,6 @@ async function openChunkPlanFile() {
   }
 }
 
-function formatAutoRefreshStatus(autoRefresh) {
-  if (!autoRefresh) return '';
-  const parts = [];
-  parts.push(autoRefresh.taskInstalled ? 'Scheduled task: installed.' : 'Scheduled task: not installed.');
-  if (autoRefresh.lastRunAt) {
-    parts.push(`Last run: ${formatDate(Date.parse(autoRefresh.lastRunAt))} — ${autoRefresh.lastRunSummary || ''}`);
-  } else {
-    parts.push('Last run: never.');
-  }
-  return parts.join(' ');
-}
-
 function renderAutoRefreshRootList() {
   const knownRoots = state.settings?.knownRoots || [];
   const selected = new Set(state.autoRefresh?.roots || []);
@@ -685,11 +713,38 @@ function renderAutoRefreshRootList() {
   }
 }
 
-function syncAutoRefreshDialog() {
+const DEFAULT_AUTO_REFRESH_TIME = '04:00';
+
+// `<input type="time">` is not an option here: WebView2 formats it from the BROWSER's UI locale,
+// which is en-US on this machine, so it renders "04:00 AM" — and setting `lang` on the document or
+// on the element changes nothing (measured). Two selects state the 24-hour clock outright, and
+// they have the second virtue of being unable to hold a time that does not exist.
+function fillTimeSelects() {
+  if (els.autoRefreshHour.options.length) return;
+  const pad = value => String(value).padStart(2, '0');
+  for (let hour = 0; hour < 24; hour += 1) els.autoRefreshHour.append(new Option(pad(hour), pad(hour)));
+  for (let minute = 0; minute < 60; minute += 1) els.autoRefreshMinute.append(new Option(pad(minute), pad(minute)));
+}
+
+function setAutoRefreshTime(time) {
+  fillTimeSelects();
+  const [hour, minute] = String(time || DEFAULT_AUTO_REFRESH_TIME).split(':');
+  els.autoRefreshHour.value = (hour || '04').padStart(2, '0');
+  els.autoRefreshMinute.value = (minute || '00').padStart(2, '0');
+}
+
+// Falls back to the stored time rather than to a constant, for the same reason the vision-minutes
+// box does: a select that somehow holds nothing must not quietly reschedule the run to midnight.
+function autoRefreshTimeValue() {
+  const stored = String(state.autoRefresh?.time || DEFAULT_AUTO_REFRESH_TIME).split(':');
+  return `${els.autoRefreshHour.value || stored[0]}:${els.autoRefreshMinute.value || stored[1] || '00'}`;
+}
+
+function syncAutoRefreshControls() {
   const autoRefresh = state.autoRefresh;
   if (!autoRefresh) return;
   els.autoRefreshEnabledInput.checked = autoRefresh.enabled;
-  els.autoRefreshTimeInput.value = autoRefresh.time;
+  setAutoRefreshTime(autoRefresh.time);
   els.autoRefreshNsfwInput.checked = autoRefresh.runNsfw;
   els.autoRefreshTextAnalysisInput.checked = autoRefresh.runTextAnalysis;
   els.autoRefreshTextExtractionInput.checked = autoRefresh.runTextExtraction;
@@ -699,7 +754,6 @@ function syncAutoRefreshDialog() {
   els.autoRefreshLowPriorityInput.checked = autoRefresh.lowPriority;
   els.autoRefreshToastInput.checked = autoRefresh.toast;
   els.autoRefreshOptions.classList.toggle('disabled-section', !autoRefresh.enabled);
-  els.autoRefreshStatus.textContent = formatAutoRefreshStatus(autoRefresh);
   renderAutoRefreshRootList();
 }
 
@@ -710,7 +764,8 @@ async function loadAutoRefreshSettings() {
     state.autoRefresh = null;
     showToast(errorText(error));
   }
-  syncAutoRefreshDialog();
+  syncAutoRefreshControls();
+  if (state.currentView === 'automation') renderAutoPanel();
 }
 
 function collectCheckedAutoRefreshRoots() {
@@ -732,7 +787,7 @@ function normalizeVisionMinutes(raw) {
 async function saveAutoRefreshSettings() {
   const payload = {
     enabled: els.autoRefreshEnabledInput.checked,
-    time: els.autoRefreshTimeInput.value || '04:00',
+    time: autoRefreshTimeValue(),
     roots: collectCheckedAutoRefreshRoots(),
     runNsfw: els.autoRefreshNsfwInput.checked,
     runTextAnalysis: els.autoRefreshTextAnalysisInput.checked,
@@ -748,10 +803,12 @@ async function saveAutoRefreshSettings() {
   els.autoRefreshOptions.classList.toggle('disabled-section', !payload.enabled);
   try {
     state.autoRefresh = await window.categorizerAPI.setAutoRefreshSettings(payload);
-    els.autoRefreshStatus.textContent = formatAutoRefreshStatus(state.autoRefresh);
   } catch (error) {
     showToast(errorText(error));
   }
+  // Which folders and which passes are exactly what the queue counts, and the panel shows the two
+  // a scroll apart — so a toggle re-answers the queue rather than leaving the old number standing.
+  await loadAutoRefreshQueue();
 }
 
 function renderManualFolderList() {
@@ -906,6 +963,7 @@ function renderSidebar() {
 
   setCountPill(els.allCount, allCount);
   setCountPill(els.unclassifiedCount, unclassifiedCount);
+  els.dashboardTab.classList.toggle('active', state.currentView === 'dashboard');
   els.allTab.classList.toggle('active', state.currentView === 'all');
   els.unclassifiedTab.classList.toggle('active', state.currentView === 'unclassified');
   // An opened set still belongs to Geo, so the tab stays lit while browsing one.
@@ -913,6 +971,11 @@ function renderSidebar() {
   setCountPill(els.geoCount, state.geoSummary?.stats?.taggedTotal || 0);
   els.textTab.classList.toggle('active', state.currentView === 'text');
   setCountPill(els.textCount, state.textStatus?.docs || 0);
+  els.automationTab.classList.toggle('active', state.currentView === 'automation');
+  // The pill is what the next scheduled run would process, so a schedule with nothing to do reads
+  // as a calm 0 rather than as an unknown. `is-clear` is what stops that 0 looking like a fault.
+  setCountPill(els.automationCount, state.autoQueue?.scheduledPending || 0);
+  els.automationCount.classList.toggle('is-clear', (state.autoQueue?.scheduledPending || 0) === 0);
 
   els.categoryList.innerHTML = '';
   const categories = library?.categories || [];
@@ -1028,7 +1091,9 @@ function renderSidebar() {
 
 function renderHeader() {
   const library = state.library;
-  if (state.currentView === 'all') {
+  if (state.currentView === 'dashboard') {
+    els.viewTitle.textContent = 'Dashboard';
+  } else if (state.currentView === 'all') {
     els.viewTitle.textContent = 'All Images';
   } else if (state.currentView === 'unclassified') {
     els.viewTitle.textContent = 'Unclassified';
@@ -1036,6 +1101,8 @@ function renderHeader() {
     els.viewTitle.textContent = 'Geo Coverage';
   } else if (state.currentView === 'text') {
     els.viewTitle.textContent = 'Extracted Text';
+  } else if (state.currentView === 'automation') {
+    els.viewTitle.textContent = 'Automation';
   } else if (state.currentView === 'geoSet') {
     els.viewTitle.textContent = state.geoSetTitle || 'Country Set';
   } else {
@@ -1270,16 +1337,24 @@ function render() {
   // the grid's virtual scrolling and drop handling never see any of this.
   const geoActive = state.currentView === 'geo';
   const textActive = state.currentView === 'text';
-  els.mainDropTarget.classList.toggle('hidden', geoActive || textActive);
+  const autoActive = state.currentView === 'automation';
+  const dashActive = state.currentView === 'dashboard';
+  els.mainDropTarget.classList.toggle('hidden', geoActive || textActive || autoActive || dashActive);
   els.geoView.classList.toggle('hidden', !geoActive);
   els.textView.classList.toggle('hidden', !textActive);
+  els.autoView.classList.toggle('hidden', !autoActive);
+  els.dashView.classList.toggle('hidden', !dashActive);
   // Lets the stylesheet compact the header for this view: the search box and the sort order act on
   // the image grid, which is exactly what this view replaces, so they are inert here and the panel
   // gets their rows back. The text panel has its own query box for the same reason.
   document.body.classList.toggle('view-geo', geoActive);
   document.body.classList.toggle('view-text', textActive);
+  document.body.classList.toggle('view-automation', autoActive);
+  document.body.classList.toggle('view-dashboard', dashActive);
   if (geoActive) renderGeo();
   else if (textActive) renderText();
+  else if (autoActive) renderAutoPanel();
+  else if (dashActive) renderDashboard();
   else renderImages();
 }
 
@@ -1341,6 +1416,9 @@ async function refreshAll() {
   // Geo is a read of three small sidecars, so the sidebar tally can be filled in without making
   // the scan wait on it.
   if (state.library) void loadGeoSummaryOnly();
+  // A rescan rewrote the very records the scheduled queue is counted from, so its numbers are now
+  // one scan out of date — including the moment a Rescan is what clears the last of the backlog.
+  void loadAutoRefreshQueue();
   if (state.library) {
     setStatus(`Up to date — ${imageCountLabel(state.library.images.length)}.`);
   } else if (state.settings?.lastRoot) {
@@ -1413,6 +1491,8 @@ function navEntryLabel(entry) {
   if (entry.view === 'unclassified') return 'Unclassified';
   if (entry.view === 'geo') return 'Geo Coverage';
   if (entry.view === 'text') return 'Extracted Text';
+  if (entry.view === 'automation') return 'Automation';
+  if (entry.view === 'dashboard') return 'Dashboard';
   if (entry.view === 'geoSet') return entry.geoSetTitle || 'country set';
   return entry.category || 'category';
 }
@@ -1426,8 +1506,10 @@ function captureNavScroll() {
   // Geo Coverage would record the grid's 0 over the set list's real offset.
   const geoActive = state.currentView === 'geo';
   const textActive = state.currentView === 'text';
+  const autoActive = state.currentView === 'automation';
+  const dashActive = state.currentView === 'dashboard';
   entry.scroll = {
-    main: geoActive || textActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
+    main: geoActive || textActive || autoActive || dashActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
     geo: geoActive ? els.geoView.scrollTop : entry.scroll.geo,
     geoSets: geoActive ? els.geoSets.scrollTop : entry.scroll.geoSets,
   };
@@ -3007,7 +3089,6 @@ async function importFromPicker(chooser) {
 function openSettingsDialog() {
   syncSettingsDialog();
   syncNsfwModelHint();
-  loadAutoRefreshSettings();
   loadVisionAndChunkSettings();
   // Reads the live window rect, so it has to be re-fetched on every open rather than cached.
   loadWindowDefaults();
@@ -3836,10 +3917,12 @@ function onPointerDragEnd(event) {
 function installEvents() {
   resetNavHistory(state.currentView);
   installNavShortcuts();
+  installDashboard();
   els.allTab.addEventListener('click', selectAll);
   els.unclassifiedTab.addEventListener('click', selectUnclassified);
   els.geoTab.addEventListener('click', selectGeo);
   els.textTab.addEventListener('click', selectText);
+  installAutomationPanel();
   wireTextPanel();
   els.geoRunButton.addEventListener('click', () => void runSelectedGeoPipeline());
   els.geoStopButton.addEventListener('click', () => void stopGeoPipeline());
@@ -3982,7 +4065,8 @@ function installEvents() {
   els.openChunkPlanButton.addEventListener('click', openChunkPlanFile);
   els.discardChunkPlanButton.addEventListener('click', discardChunkPlan);
   els.autoRefreshEnabledInput.addEventListener('change', saveAutoRefreshSettings);
-  els.autoRefreshTimeInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshHour.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshMinute.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshNsfwInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshTextAnalysisInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshTextExtractionInput.addEventListener('change', saveAutoRefreshSettings);
@@ -4115,6 +4199,7 @@ function renderAutoRun(run) {
 }
 
 async function pollAutoRun() {
+  const wasRunning = Boolean(state.autoRun);
   try {
     state.autoRun = await window.categorizerAPI.getAutoRefreshRun();
   } catch (error) {
@@ -4124,6 +4209,15 @@ async function pollAutoRun() {
     return;
   }
   renderAutoRun(state.autoRun);
+  if (state.currentView === 'automation') renderAutoPanel();
+  // A run that just ended left behind a new summary and a smaller queue. This is the one moment
+  // either can change without the user touching anything, so it is the one moment worth re-reading
+  // them — polling for either would be spending a folder read a second on an answer that only moves
+  // a few times a day.
+  if (wasRunning && !state.autoRun) {
+    void loadAutoRefreshSettings();
+    void loadAutoRefreshQueue();
+  }
 }
 
 function installAutoRunBanner() {
@@ -4144,6 +4238,1110 @@ function installAutoRunBanner() {
 
   pollAutoRun();
   setInterval(pollAutoRun, AUTO_RUN_POLL_MS);
+}
+
+// =================================================================================================
+// Dashboard
+//
+// A meta view. It holds no images and answers no question about any single one of them — every
+// figure here is a second reading of data the other views already carry, and the point is the SHAPE
+// of it: what this library is made of, how far each pass has got through it, and, above all, which
+// of it the user did themselves and when.
+//
+// COMPUTED IN THIS WINDOW, ON EVERY PAINT. `state.library.images` is already here — the scan handed
+// it over — and a full pass over 49,837 records measures 3.4 ms. So there is no command, no second
+// read of a 28 MB sidecar, and no cache that can be one category assignment out of date. The search
+// box is hidden in this view (see `body.view-dashboard`), so the paint-per-keystroke that would make
+// a cache worth having cannot happen here.
+//
+// The ONE thing not computed here is pass coverage's outstanding half: that comes from
+// `library.pending`, the backend's own mask table. Those are the passes' eligibility rules — an
+// image is skipped for four different reasons and only Rust knows all four — and a second copy of
+// them in JavaScript is exactly how a dashboard starts quietly disagreeing with the queue it
+// describes.
+//
+// TWO RULES ABOUT HONESTY, both of which cost real code below:
+//   * Counts of DIFFERENT things never share a scale. Hand-sorting and automatic classification get
+//     separate strips with their own peaks, because 220 by hand against 48,953 by machine is not a
+//     comparison, it is an invisible sliver.
+//   * The capture log and the library are never reconciled. The log is the ACT; the library is what
+//     SURVIVED. A gap between them is a cleanup, and nothing here may call it missing data — the
+//     same rule the Extracted Text panel's strip follows, for the same reason.
+// =================================================================================================
+
+// The three the app creates and maintains itself (`ensure_analysis_categories` in lib.rs). Every
+// other category in the library is one the user typed, which is the whole distinction the
+// "Categories you made yourself" card exists to draw.
+const BUILT_IN_CATEGORIES = new Set(['Explicit', 'Low Text', 'High Text']);
+
+// `classified_by` as the backend stamps it. `auto` is the text pass, `auto-nsfw` the explicit one;
+// `manual` is only ever written by an assignment the user made, and the auto passes are forbidden
+// from overwriting it — which is what makes it a durable record of hand-sorting rather than a
+// snapshot of the last scan.
+const CLASSIFIER_LABELS = {
+  manual: 'By hand',
+  auto: 'Text pass',
+  'auto-nsfw': 'Explicit pass',
+  none: 'Not categorized',
+};
+
+function localDayKey(ms) {
+  const date = new Date(ms);
+  // Local, not UTC: `classified_at` is stored as UTC but the question is which of the user's own
+  // days they were sorting on, and slicing the ISO string would move late-evening work to tomorrow.
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+// A continuous run of day keys ending today. Days with nothing are kept, and drawn as empty bars: a
+// missing bar and a zero bar are different claims, and only drawing the busy days would quietly
+// erase every quiet one — which is most of what a usage pattern actually is.
+function recentDayKeys(days) {
+  const keys = [];
+  const cursor = new Date();
+  cursor.setHours(12, 0, 0, 0); // midday, so a DST shift cannot skip or repeat a day
+  cursor.setDate(cursor.getDate() - (days - 1));
+  for (let index = 0; index < days; index += 1) {
+    keys.push(localDayKey(cursor.getTime()));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return keys;
+}
+
+// One walk of the library, everything at once. Split into more passes it would read better and cost
+// as many times more; at 50k records and one paint per view switch, one walk is the right shape.
+function computeDashboardStats() {
+  const images = state.library?.images || [];
+  const stats = {
+    total: images.length,
+    bytes: 0,
+    byClassifier: { manual: 0, auto: 0, 'auto-nsfw': 0, none: 0 },
+    categories: new Map(),
+    unclassified: 0,
+    done: { nsfw: 0, words: 0, extract: 0, described: 0 },
+    text: { chars: 0, words: 0, measured: 0, low: 0, high: 0 },
+    video: { frames: 0, titles: new Set() },
+    descChars: 0,
+    folders: new Map(),
+    fileFirstMs: 0,
+    fileLastMs: 0,
+    activity: new Map(),   // day -> { manual, auto }
+    activityFirst: null,
+    activityLast: null,
+  };
+
+  for (const image of images) {
+    stats.bytes += image.size || 0;
+
+    const classifier = image.classifiedBy || 'none';
+    if (stats.byClassifier[classifier] === undefined) stats.byClassifier[classifier] = 0;
+    stats.byClassifier[classifier] += 1;
+
+    if (image.category) {
+      stats.categories.set(image.category, (stats.categories.get(image.category) || 0) + 1);
+      if (image.category === 'Low Text') stats.text.low += 1;
+      if (image.category === 'High Text') stats.text.high += 1;
+    } else {
+      stats.unclassified += 1;
+    }
+
+    if (image.nsfwScore != null) stats.done.nsfw += 1;
+    if (image.ocrWordCount != null) {
+      stats.done.words += 1;
+      stats.text.measured += 1;
+      stats.text.words += image.ocrWordCount;
+    }
+    if (image.ocrTextChars != null) {
+      stats.done.extract += 1;
+      stats.text.chars += image.ocrTextChars;
+    }
+    if (image.visionDescChars != null) {
+      stats.done.described += 1;
+      stats.descChars += image.visionDescChars;
+    }
+    // Only a real title survives into an ImageView — a frame that was scanned and turned out not to
+    // be a video carries `Some("")` in the record and arrives here as null. So this counts video
+    // frames, and CANNOT be used to say how many title strips have been read; that number comes off
+    // the pending table instead.
+    if (image.videoTitle) {
+      stats.video.frames += 1;
+      stats.video.titles.add(image.videoTitle);
+    }
+
+    const folder = image.sourceFolder || 'Root';
+    stats.folders.set(folder, (stats.folders.get(folder) || 0) + 1);
+
+    if (image.modifiedMs) {
+      if (!stats.fileFirstMs || image.modifiedMs < stats.fileFirstMs) stats.fileFirstMs = image.modifiedMs;
+      if (image.modifiedMs > stats.fileLastMs) stats.fileLastMs = image.modifiedMs;
+    }
+
+    if (image.classifiedAt) {
+      const at = Date.parse(image.classifiedAt);
+      if (!Number.isNaN(at)) {
+        const key = localDayKey(at);
+        const bucket = stats.activity.get(key) || { manual: 0, auto: 0 };
+        // Both auto classifiers land in one bucket: the split that matters on this strip is you
+        // versus the machine, and which pass the machine used is the coverage card's question.
+        if (classifier === 'manual') bucket.manual += 1;
+        else bucket.auto += 1;
+        stats.activity.set(key, bucket);
+        if (!stats.activityFirst || at < stats.activityFirst) stats.activityFirst = at;
+        if (!stats.activityLast || at > stats.activityLast) stats.activityLast = at;
+      }
+    }
+  }
+  return stats;
+}
+
+// Outstanding work per pass, straight off the backend's mask table — the passes' own answer, never
+// re-derived here. See the header for why that line is drawn where it is.
+function dashPendingFor(bit) {
+  const masks = state.library?.pending?.byPassMask;
+  if (!masks) return null;
+  return masks.reduce((sum, count, mask) => (mask & bit ? sum + count : sum), 0);
+}
+
+// --- small builders -----------------------------------------------------------------------------
+
+function dashElement(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function dashTile(value, label, sub, { tone = '' } = {}) {
+  const tile = dashElement('div', `dash-tile${tone ? ` ${tone}` : ''}`);
+  tile.append(dashElement('div', 'dash-tile-value', value));
+  tile.append(dashElement('div', 'dash-tile-label', label));
+  if (sub) {
+    const subLine = dashElement('div', 'dash-tile-sub', sub);
+    subLine.title = sub;
+    tile.append(subLine);
+  }
+  return tile;
+}
+
+// A labelled horizontal bar. `max` is passed in rather than inferred so a group of rows shares one
+// scale on purpose, and two groups never share one by accident.
+function dashBarRow(label, count, max, { note = '', tone = '', title = '' } = {}) {
+  const row = dashElement('div', `dash-bar-row${tone ? ` ${tone}` : ''}`);
+  const head = dashElement('div', 'dash-bar-head');
+  const name = dashElement('span', 'dash-bar-label', label);
+  name.title = title || label;
+  head.append(name, dashElement('span', 'dash-bar-count', formatCount(count)));
+  const track = dashElement('div', 'dash-bar-track');
+  const fill = dashElement('div', 'dash-bar-fill');
+  fill.style.width = max > 0 ? `${Math.max(count > 0 ? 1.5 : 0, (count / max) * 100)}%` : '0%';
+  track.append(fill);
+  row.append(head, track);
+  if (note) row.append(dashElement('div', 'dash-bar-note', note));
+  return row;
+}
+
+// A run of day columns. Every strip carries its own peak in the caption, because two strips on this
+// screen never share a scale and a reader who assumes they do would draw the wrong conclusion from
+// the taller one.
+// A day key as an axis tick. The year is appended only when it is not the current one — on a 90-day
+// strip every tick would otherwise carry the same four digits, and on a Year strip that crosses New
+// Year the two halves must not be confusable.
+function formatAxisDate(dayKey) {
+  const [year, month, day] = String(dayKey).split('-').map(Number);
+  if (!year || !month || !day) return dayKey;
+  const date = new Date(year, month - 1, day);
+  const short = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
+  return year === new Date().getFullYear() ? short : `${short} ${year}`;
+}
+
+// Evenly spaced tick positions, always including the first and last column. `desired` is passed by
+// the caller rather than derived from a measured width: the strips live in cards that reflow, and a
+// tick count that changed on every resize would be worse than one that is simply chosen for the
+// widest a card gets.
+function dashAxisIndices(length, desired) {
+  if (length <= 1) return [0];
+  const count = Math.max(2, Math.min(desired, length));
+  const indices = new Set();
+  for (let step = 0; step < count; step += 1) {
+    indices.add(Math.round((step * (length - 1)) / (count - 1)));
+  }
+  return [...indices].sort((a, b) => a - b);
+}
+
+// How many columns a strip may draw. A bar cannot shrink below 2px without the browser rounding
+// some of them away entirely, and with a 1px gap that puts the ceiling at (width + 1) / 3 — about
+// 112 columns in the 337px a paired card gets. Measured the hard way: a 365-day strip laid out at
+// 1094px and ran clean off the side of the card, taking its axis with it.
+const DASH_MAX_COLUMNS = 90;
+
+// Days per column. The ladder is 1 → a week → a month rather than an arbitrary divisor, because a
+// column has to be nameable: "Jun 15 – Jun 21" means something and "the fourth 4-day block" does not.
+function chooseBucketDays(length) {
+  if (length <= DASH_MAX_COLUMNS) return 1;
+  if (Math.ceil(length / 7) <= DASH_MAX_COLUMNS) return 7;
+  return 30;
+}
+
+// Groups a run of daily entries into wider columns, counting BACK from today so the newest column is
+// always a whole one. A partial bucket at the recent end would read as a slump that never happened;
+// at the old end it is a rendering artifact of a window start nobody chose, and the tooltip names
+// the real range either way.
+function bucketDayEntries(entries) {
+  const bucketDays = chooseBucketDays(entries.length);
+  if (bucketDays === 1) return { entries, bucketDays };
+
+  const buckets = [];
+  for (let end = entries.length; end > 0; end -= bucketDays) {
+    const slice = entries.slice(Math.max(0, end - bucketDays), end);
+    const from = slice[0].label;
+    const to = slice[slice.length - 1].label;
+    buckets.unshift({
+      label: from === to ? from : `${from} → ${to}`,
+      axis: formatAxisDate(from),
+      count: slice.reduce((sum, entry) => sum + entry.count, 0),
+    });
+  }
+  return { entries: buckets, bucketDays };
+}
+
+// What a column stands for, said out loud whenever it is not one day. A bar that silently means a
+// week is a chart that lies about its own resolution.
+function bucketNote(bucketDays) {
+  // The axis names each column by its FIRST day, so the rightmost tick reads earlier than the data
+  // actually runs — "dated by their first day" is what stops that looking like a chart that stops
+  // six days ago.
+  if (bucketDays === 7) return 'weekly columns, dated by their first day';
+  if (bucketDays > 1) return `${bucketDays}-day columns, dated by their first day`;
+  return '';
+}
+
+// The axis under a strip. Built as the SAME flex geometry as the bars — one cell per column, same
+// gap, same padding — so a tick sits exactly under the column it names. Positioning labels by
+// percentage instead would drift against the bars by the accumulated gap, which on a 365-column
+// strip is most of a bar.
+function dashStripAxis(entries, ticks) {
+  const axis = dashElement('div', 'dash-axis');
+  const marked = new Set(entries.length ? dashAxisIndices(entries.length, ticks) : []);
+  entries.forEach((entry, index) => {
+    const cell = dashElement('div', 'dash-axis-cell');
+    if (marked.has(index) && entry.axis) {
+      cell.classList.add('is-tick');
+      // The end labels are pinned to the edges of the box rather than centred on their column: a
+      // centred one would hang half its width outside the card and be clipped. The tick MARK stays
+      // on the column either way, so nothing about the position is misstated.
+      if (index === 0) cell.classList.add('is-first');
+      if (index === entries.length - 1) cell.classList.add('is-last');
+      cell.append(dashElement('span', null, entry.axis));
+    }
+    axis.append(cell);
+  });
+  return axis;
+}
+
+function dashDayStrip(entries, { tone = '', emptyText = '', ticks = 4 } = {}) {
+  const wrap = dashElement('div', 'dash-strip-wrap');
+  const peak = entries.reduce((max, entry) => Math.max(max, entry.count), 0);
+  if (!peak) {
+    wrap.append(dashElement('p', 'dash-note', emptyText || 'Nothing in this window.'));
+    return wrap;
+  }
+  const strip = dashElement('div', `dash-strip${tone ? ` ${tone}` : ''}`);
+  for (const entry of entries) {
+    const bar = dashElement('div', 'dash-strip-bar');
+    bar.style.setProperty('--h', `${entry.count > 0 ? Math.max(6, (entry.count / peak) * 100) : 0}%`);
+    bar.title = `${entry.label} — ${formatCount(entry.count)}`;
+    if (entry.count === 0) bar.classList.add('is-empty');
+    strip.append(bar);
+  }
+  wrap.append(strip);
+  wrap.append(dashStripAxis(entries, ticks));
+  return wrap;
+}
+
+// The date behind a peak. "busiest day 7,765" is a number you cannot look up anywhere else in the
+// app, and on a 365-column strip you cannot read its position off the axis either.
+function dashPeakEntry(entries) {
+  return entries.reduce((best, entry) => (entry.count > (best?.count ?? 0) ? entry : best), null);
+}
+
+function dashCaption(text) {
+  return dashElement('p', 'dash-caption', text);
+}
+
+// --- the cards ----------------------------------------------------------------------------------
+
+function renderDashboardTiles(stats) {
+  const container = els.dashTiles;
+  container.innerHTML = '';
+  const share = (count) => (stats.total ? `${Math.round((count / stats.total) * 100)}%` : '—');
+
+  container.append(dashTile(formatCount(stats.total), 'Images', formatBytes(stats.bytes)));
+  container.append(dashTile(
+    share(stats.total - stats.unclassified),
+    'Categorized',
+    `${formatCount(stats.unclassified)} still unclassified`,
+  ));
+  container.append(dashTile(
+    formatCount(stats.byClassifier.manual || 0),
+    'Sorted by hand',
+    stats.total ? `${((stats.byClassifier.manual || 0) / stats.total * 100).toFixed(1)}% of the library` : '',
+  ));
+  container.append(dashTile(
+    share(stats.done.described),
+    'Described',
+    `${formatCount(stats.done.described)} images · ${countLabel(stats.descChars)} characters`,
+  ));
+  container.append(dashTile(
+    countLabel(stats.text.chars),
+    'Characters of text read',
+    `from ${formatCount(stats.done.extract)} images`,
+  ));
+  container.append(dashTile(
+    formatCount(stats.video.titles.size),
+    'Videos recognised',
+    `${formatCount(stats.video.frames)} frames · ${formatCount(stats.total - stats.video.frames)} stills`,
+  ));
+}
+
+function renderDashboardUsage(stats) {
+  const container = els.dashUsage;
+  container.innerHTML = '';
+
+  const rows = Object.entries(stats.byClassifier)
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1]);
+  const max = rows.reduce((peak, [, count]) => Math.max(peak, count), 0);
+  for (const [key, count] of rows) {
+    container.append(dashBarRow(CLASSIFIER_LABELS[key] || key, count, max, {
+      tone: key === 'manual' ? 'is-manual' : '',
+      title: key === 'manual'
+        ? 'A category you assigned yourself. The automatic passes are forbidden from overwriting one, so this survives every rescan.'
+        : 'Assigned by an analysis pass, and reassigned whenever the thresholds move.',
+    }));
+  }
+
+  const manual = stats.byClassifier.manual || 0;
+  container.append(dashCaption(manual
+    ? `${formatCount(manual)} of ${formatCount(stats.total)} images carry a category you chose — `
+      + `${(manual / Math.max(1, stats.total) * 100).toFixed(1)}%. The rest were classified by a pass, `
+      + 'and would be reclassified if you moved a threshold.'
+    : 'Nothing has been categorized by hand yet — every category in this library was assigned by a pass.'));
+}
+
+function renderDashboardOwnCategories(stats) {
+  const container = els.dashOwn;
+  container.innerHTML = '';
+
+  const own = [...stats.categories.entries()]
+    .filter(([name]) => !BUILT_IN_CATEGORIES.has(name))
+    .sort((a, b) => b[1] - a[1]);
+  const builtIn = [...stats.categories.entries()].filter(([name]) => BUILT_IN_CATEGORIES.has(name));
+  const builtInTotal = builtIn.reduce((sum, [, count]) => sum + count, 0);
+
+  if (!own.length) {
+    container.append(dashElement('p', 'dash-note',
+      'None yet. Every category here is one the app maintains itself — add one from the sidebar and '
+      + 'whatever you file into it shows up on this card.'));
+  } else {
+    const max = own.reduce((peak, [, count]) => Math.max(peak, count), 0);
+    for (const [name, count] of own) {
+      container.append(dashBarRow(name, count, max, { tone: 'is-manual' }));
+    }
+    container.append(dashCaption(
+      `${own.length} categor${own.length === 1 ? 'y' : 'ies'} of your own, holding `
+      + `${formatCount(own.reduce((sum, [, count]) => sum + count, 0))} images.`));
+  }
+
+  container.append(dashElement('p', 'dash-note',
+    `${builtIn.length} built-in categor${builtIn.length === 1 ? 'y' : 'ies'} `
+    + `(${builtIn.map(([name]) => name).join(', ') || 'none yet'}) hold ${formatCount(builtInTotal)} — `
+    + 'those are maintained by the passes and move on their own when a threshold changes.'));
+}
+
+function renderDashboardActivity(stats) {
+  const container = els.dashActivity;
+  container.innerHTML = '';
+
+  const days = recentDayKeys(state.dashDays);
+  const entryFor = (day, key) => ({ label: day, axis: formatAxisDate(day), count: stats.activity.get(day)?.[key] || 0 });
+  const manualEntries = days.map(day => entryFor(day, 'manual'));
+  const autoEntries = days.map(day => entryFor(day, 'auto'));
+  const manualTotal = manualEntries.reduce((sum, entry) => sum + entry.count, 0);
+  const autoTotal = autoEntries.reduce((sum, entry) => sum + entry.count, 0);
+  const manualPeak = dashPeakEntry(manualEntries);
+  const autoPeak = dashPeakEntry(autoEntries);
+  const manualDays = manualEntries.filter(entry => entry.count > 0).length;
+  // The chart may be bucketed; every NUMBER below still comes off the raw days, so "busiest Jun 17
+  // with 62" stays a statement about a day even when the bar beside it covers a week.
+  const manualStrip = bucketDayEntries(manualEntries);
+  const autoStrip = bucketDayEntries(autoEntries);
+  const bucketing = bucketNote(manualStrip.bucketDays);
+
+  // ⚠ Two strips, two scales, and the peaks stated on both. Stacked into one chart the hand-sorted
+  // bars would round to nothing against a pass that classified 7,765 images in a day — the reader
+  // would conclude they never sort anything by hand, which is the opposite of what the data says.
+  const bench = dashElement('div', 'dash-strip-pair');
+
+  const manualBlock = dashElement('div', 'dash-strip-block');
+  manualBlock.append(dashElement('div', 'dash-strip-title', 'Sorted by hand'));
+  manualBlock.append(dashDayStrip(manualStrip.entries, {
+    tone: 'is-manual',
+    emptyText: 'No hand-sorting in this window.',
+    ticks: 3,
+  }));
+  manualBlock.append(dashCaption(manualTotal
+    ? `${formatCount(manualTotal)} across ${manualDays} day${manualDays === 1 ? '' : 's'} · `
+      + `busiest ${formatAxisDate(manualPeak.label)} with ${formatCount(manualPeak.count)}`
+      + (bucketing ? ` · ${bucketing}` : '')
+    : 'Nothing in this window.'));
+  bench.append(manualBlock);
+
+  const autoBlock = dashElement('div', 'dash-strip-block');
+  autoBlock.append(dashElement('div', 'dash-strip-title', 'Classified by a pass'));
+  autoBlock.append(dashDayStrip(autoStrip.entries, {
+    emptyText: 'No passes classified anything in this window.',
+    ticks: 3,
+  }));
+  autoBlock.append(dashCaption(autoTotal
+    ? `${formatCount(autoTotal)} · busiest ${formatAxisDate(autoPeak.label)} with ${formatCount(autoPeak.count)}`
+      + ' — its own scale, not the one above'
+    : 'Nothing in this window.'));
+  bench.append(autoBlock);
+
+  container.append(bench);
+
+  const notes = [];
+  if (stats.activityLast) notes.push(`Last category assigned ${formatDate(stats.activityLast)}`);
+  if (stats.activityFirst) notes.push(`first ${formatDate(stats.activityFirst)}`);
+  container.append(dashCaption(
+    `${notes.join(' · ')}${notes.length ? '. ' : ''}`
+    + 'A day is counted when an image CHANGED category, not when a scan looked at it — a pass that '
+    + 'confirms what it already decided leaves no mark here.'));
+}
+
+function renderDashboardCoverage(stats) {
+  const container = els.dashCoverage;
+  container.innerHTML = '';
+
+  const eligible = state.library?.pending?.eligibleImages ?? 0;
+  const chunkPending = dashPendingFor(2);
+  const rows = [
+    { label: 'Explicit scored', done: stats.done.nsfw, pending: dashPendingFor(1) },
+    { label: 'Text measured', done: stats.done.words, pending: dashPendingFor(4) },
+    { label: 'Text extracted', done: stats.done.extract, pending: dashPendingFor(8) },
+    // No record field can answer this one: a frame that was scanned and is not a video stores an
+    // empty title, which the view collapses to null. So it is derived the only honest way available,
+    // off the pool the pass actually draws from.
+    { label: 'Video titles read', done: chunkPending == null ? null : Math.max(0, eligible - chunkPending), pending: chunkPending },
+    { label: 'Described', done: stats.done.described, pending: dashPendingFor(16) },
+  ];
+
+  for (const row of rows) {
+    if (row.done == null || row.pending == null) continue;
+    // Share of the work this pass HAS, never of the whole library: Describe deliberately skips
+    // 12,000 deduped video frames, and counting those against it would report it as half finished
+    // when it has almost nothing left to do.
+    const scope = row.done + row.pending;
+    // Held below 100 while anything is outstanding. 49,829 of 49,843 rounds to 100%, and "100% ·
+    // 14 still to do" on one line reads as a contradiction rather than as a rounding.
+    const rounded = scope > 0 ? Math.round((row.done / scope) * 100) : 100;
+    const pct = row.pending > 0 ? Math.min(99, rounded) : 100;
+    container.append(dashBarRow(row.label, row.done, Math.max(1, scope), {
+      note: row.pending > 0
+        ? `${pct}% · ${formatCount(row.pending)} still to do`
+        : `${pct}% · nothing outstanding`,
+      tone: row.pending > 0 ? '' : 'is-clear',
+      title: `${formatCount(row.done)} done, ${formatCount(row.pending)} outstanding, out of the ${formatCount(scope)} images this pass covers.`,
+    }));
+  }
+
+  const skips = state.library?.pending;
+  if (skips) {
+    const skipped = (skips.visionSkippedVideo || 0) + (skips.visionSkippedExplicit || 0)
+      + (skips.visionSkippedCategory || 0) + (skips.visionSkippedUnscored || 0);
+    if (skipped > 0) {
+      container.append(dashCaption(
+        `Describe leaves ${formatCount(skipped)} images alone on purpose: `
+        + `${formatCount(skips.visionSkippedVideo)} duplicate video frames, `
+        + `${formatCount(skips.visionSkippedCategory)} in omitted categories, `
+        + `${formatCount(skips.visionSkippedExplicit)} explicit, `
+        + `${formatCount(skips.visionSkippedUnscored)} not yet scored. They are not counted above.`));
+    }
+  }
+}
+
+function renderDashboardContents(stats) {
+  const container = els.dashContents;
+  container.innerHTML = '';
+
+  const categories = [...stats.categories.entries()].sort((a, b) => b[1] - a[1]);
+  const max = Math.max(stats.unclassified, ...categories.map(([, count]) => count), 1);
+  for (const [name, count] of categories) {
+    container.append(dashBarRow(name, count, max, {
+      tone: BUILT_IN_CATEGORIES.has(name) ? '' : 'is-manual',
+      title: BUILT_IN_CATEGORIES.has(name) ? `${name} — maintained by a pass` : `${name} — your own category`,
+    }));
+  }
+  if (stats.unclassified > 0) {
+    container.append(dashBarRow('Unclassified', stats.unclassified, max, { tone: 'is-muted' }));
+  }
+
+  const avgWords = stats.text.measured ? Math.round(stats.text.words / stats.text.measured) : 0;
+  const facts = [
+    `${formatCount(avgWords)} words of text on a typical image`,
+    stats.video.frames
+      ? `${formatCount(stats.video.frames)} frames belong to ${formatCount(stats.video.titles.size)} videos`
+      : null,
+    stats.fileFirstMs
+      ? `Files span ${formatDate(stats.fileFirstMs)} → ${formatDate(stats.fileLastMs)}`
+      : null,
+  ].filter(Boolean);
+  container.append(dashCaption(facts.join(' · ')));
+}
+
+function renderDashboardFolders(stats) {
+  const container = els.dashFolders;
+  container.innerHTML = '';
+
+  // Sorted by NAME, not by size: these folders are dated here, so name order is time order and the
+  // card doubles as a timeline of when material arrived. Sorting by count would destroy that.
+  const folders = [...stats.folders.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const max = folders.reduce((peak, [, count]) => Math.max(peak, count), 0);
+  for (const [name, count] of folders) {
+    container.append(dashBarRow(name, count, max));
+  }
+  container.append(dashCaption(
+    `${folders.length} source folder${folders.length === 1 ? '' : 's'} · `
+    + `${formatBytes(stats.bytes)} in total. Folders switched off for analysis still appear here — `
+    + 'this is what is on disk, not what the passes look at.'));
+}
+
+// --- the capture log ----------------------------------------------------------------------------
+//
+// A SECOND, INDEPENDENT source, and the only one on this screen that is not about the library. It
+// records the act of taking a screenshot; the library records what survived. The two are never
+// reconciled — a month cleared out of the save folder is gone from every other figure here and must
+// not be gone from a record of the user's own habit. See `capture_log.rs` and the Extracted Text
+// panel's strip, which follows the identical rule.
+
+async function loadDashboardCaptures({ force = false } = {}) {
+  if (state.dashCapturesLoading) return;
+  if (state.dashCaptures !== undefined && state.dashCaptures?.days === state.dashDays && !force) return;
+  state.dashCapturesLoading = true;
+  try {
+    state.dashCaptures = await window.categorizerAPI.getCaptureActivity(state.dashDays);
+  } catch (error) {
+    // A machine without screenshot-tool is the normal case, not an error worth a toast.
+    console.warn('capture log unavailable', error);
+    state.dashCaptures = { blocked: 'not_installed' };
+  } finally {
+    state.dashCapturesLoading = false;
+  }
+  if (state.currentView === 'dashboard') renderDashboard();
+}
+
+function renderDashboardCaptures() {
+  const container = els.dashCaptures;
+  container.innerHTML = '';
+  const data = state.dashCaptures;
+
+  if (!data) {
+    container.append(dashElement('p', 'dash-note', 'Reading the capture log…'));
+    return;
+  }
+  if (data.blocked) {
+    // Four different reasons for "nothing here", and collapsing any two says something false about
+    // either the tool or the user. `not_installed` deliberately explains nothing at all.
+    const text = captureBlockedText(data.blocked);
+    container.append(dashElement('p', 'dash-note',
+      text || 'Screenshot Tool is not on this machine, so there is no record of captures to read.'));
+    return;
+  }
+
+  // `by_day` holds ONLY the days that had captures, so drawing its entries directly would space 12
+  // scattered days evenly across the width and read as 12 consecutive ones. The strip is rebuilt
+  // over a continuous run of days instead, with the quiet ones drawn as floors.
+  //
+  // Clamped to the log's own lifetime, not to the window: a log that started 11 days ago has
+  // nothing to say about the 79 days before it, and drawing those as empty would assert the user
+  // captured nothing on days that were never observed. `covers_from` is the log's first day.
+  const windowKeys = recentDayKeys(state.dashDays);
+  const logStart = data.coverage?.covers_from || Object.keys(data.by_day || {})[0];
+  const dayKeys = logStart ? windowKeys.filter(key => key >= logStart) : windowKeys;
+  const captureStrip = bucketDayEntries(
+    dayKeys.map(key => ({ label: key, axis: formatAxisDate(key), count: data.by_day?.[key] || 0 })),
+  );
+  container.append(dashDayStrip(captureStrip.entries, {
+    // A full-width card, so it can carry twice the ticks the paired strips above can.
+    tone: 'is-capture',
+    emptyText: 'No captures recorded in this window.',
+    ticks: 6,
+  }));
+
+  // ⚠ The period has to be the LOG's, not the window's, whenever the log is younger. "4,098 in 90
+  // days" off eleven days of history is a rate understated eightfold, and nothing else on screen
+  // would contradict it — the coverage caveat below only fires under 50%.
+  const spanDays = dayKeys.length;
+  const parts = [data.coverage?.truncated_to_log
+    ? `${formatCount(data.total)} taken over the log's ${spanDays} day${spanDays === 1 ? '' : 's'} of history`
+    : `${formatCount(data.total)} taken in ${data.days} days`];
+  if (data.active_days) {
+    parts.push(data.active_days >= spanDays
+      ? 'on every one of them'
+      : `on ${formatCount(data.active_days)} of those days`);
+  }
+  if (data.median_per_active_day != null) {
+    // Stated as this user's own baseline and never as a verdict: "a lot" only means anything against
+    // their own habit, and the app has no business ranking their day.
+    parts.push(`typically ${formatCount(data.median_per_active_day)} on a day you capture`);
+  }
+  if (data.total_on_record && data.total_on_record !== data.total) {
+    parts.push(`${formatCount(data.total_on_record)} on record all-time`);
+  }
+  const captureBucketing = bucketNote(captureStrip.bucketDays);
+  if (captureBucketing) parts.push(captureBucketing);
+  container.append(dashCaption(parts.join(' · ')));
+
+  const hours = data.by_hour || [];
+  if (hours.some(count => count > 0)) {
+    const block = dashElement('div', 'dash-strip-block');
+    block.append(dashElement('div', 'dash-strip-title', 'Hour of the day'));
+    block.append(dashDayStrip(
+      hours.map((count, hour) => {
+        const label = `${String(hour).padStart(2, '0')}:00`;
+        // Every third hour: 24 columns take a tick each three across a wide card without touching.
+        return { label, axis: hour % 3 === 0 ? label : '', count };
+      }),
+      { tone: 'is-capture', ticks: 24 },
+    ));
+    // The prose that used to say which end was which is gone — the axis says it, and in more places.
+    if (data.peak_hour != null) {
+      block.append(dashCaption(`Busiest around ${String(data.peak_hour).padStart(2, '0')}:00`));
+    }
+    container.append(block);
+  }
+
+  const modes = Object.entries(data.by_mode || {}).sort((a, b) => b[1] - a[1]);
+  if (modes.length) {
+    const max = modes[0][1];
+    const block = dashElement('div', 'dash-strip-block');
+    block.append(dashElement('div', 'dash-strip-title', 'How you capture'));
+    for (const [mode, count] of modes) block.append(dashBarRow(mode, count, max, { tone: 'is-capture' }));
+    container.append(block);
+  }
+
+  // ⚠ Every zero qualified before it is read. The tool records only while it runs, so a low count
+  // has three possible meanings and only one of them is about the user.
+  if (data.coverage && data.coverage.coverage_pct < 50) {
+    if (!data.coverage.conclusive) {
+      container.append(dashElement('p', 'dash-note',
+        'Coverage not yet established — treat low counts here as unknown, not as zero.'));
+    } else {
+      const period = data.coverage.truncated_to_log
+        ? `the log's ${humanizeMinutes(data.coverage.window_min)} of history`
+        : 'this window';
+      container.append(dashElement('p', 'dash-note',
+        `Screenshot Tool was open for ${data.coverage.coverage_pct}% of ${period}, so this is a sample `
+        + 'of when it was running, not of the period.'));
+    }
+  }
+  if (data.failed > 0) {
+    container.append(dashElement('p', 'dash-note',
+      `${formatCount(data.failed)} captures never landed a file — expected to be missing from the library.`));
+  }
+  container.append(dashElement('p', 'dash-note',
+    'From Screenshot Tool\'s own log, not from this library: it records the act, so it does not fall '
+    + 'when you delete or move pictures. The two are meant to disagree.'));
+}
+
+// --- entry points -------------------------------------------------------------------------------
+
+function renderDashboard() {
+  for (const button of els.dashRange.querySelectorAll('.dash-range-button')) {
+    button.classList.toggle('is-active', Number(button.dataset.days) === state.dashDays);
+  }
+
+  if (!state.library) {
+    els.dashTiles.innerHTML = '';
+    for (const node of [els.dashUsage, els.dashOwn, els.dashActivity, els.dashCoverage, els.dashContents, els.dashFolders]) {
+      node.innerHTML = '';
+      node.append(dashElement('p', 'dash-note', 'Choose a root folder to measure.'));
+    }
+    els.dashAsOf.textContent = '';
+    renderDashboardCaptures();
+    return;
+  }
+
+  const stats = computeDashboardStats();
+  els.dashAsOf.textContent = `${formatCount(stats.total)} images · measured at the last scan`;
+  renderDashboardTiles(stats);
+  renderDashboardUsage(stats);
+  renderDashboardOwnCategories(stats);
+  renderDashboardActivity(stats);
+  renderDashboardCaptures();
+  renderDashboardCoverage(stats);
+  renderDashboardContents(stats);
+  renderDashboardFolders(stats);
+}
+
+function selectDashboard() {
+  cancelPointerDrag();
+  pushNavEntry(navEntry('dashboard'));
+  state.currentView = 'dashboard';
+  state.currentCategory = null;
+  render();
+  void loadDashboardCaptures();
+}
+
+function installDashboard() {
+  els.dashboardTab.addEventListener('click', selectDashboard);
+  els.dashRange.addEventListener('click', event => {
+    const button = event.target.closest('.dash-range-button');
+    if (!button) return;
+    const days = Number(button.dataset.days);
+    if (!days || days === state.dashDays) return;
+    state.dashDays = days;
+    render();
+    // The library half re-answers instantly off records already here; only the log has to be re-read.
+    void loadDashboardCaptures();
+  });
+  els.dashRefreshButton.addEventListener('click', async () => {
+    els.dashRefreshButton.disabled = true;
+    try {
+      await refreshAll();
+      await loadDashboardCaptures({ force: true });
+    } finally {
+      els.dashRefreshButton.disabled = false;
+    }
+  });
+}
+
+// =================================================================================================
+// Automation
+//
+// The scheduled run is the one part of this app that acts while nobody is watching, and everything
+// about it used to be split between a banner that only exists mid-run and a paragraph at the bottom
+// of a dialog. This panel puts the three questions in one place, in the order they get asked: is it
+// on and what is it doing, what is waiting for it, and what should it be doing.
+//
+// The controls in the third card were MOVED here from Settings rather than mirrored. Two live
+// copies of one schedule is a way to set it twice and mean neither, and duplicate element ids are
+// not a thing the DOM offers anyway.
+//
+// The queue is the part worth being careful about. It is counted from each folder's stored records,
+// not from the disk: a scan of a 90k-image root takes minutes, which is the right price for a run's
+// first act and the wrong one for opening a tab. So every number here is "as of the last scan", the
+// panel says so in as many words, and nothing pretends a count of an unscanned folder is zero.
+// =================================================================================================
+
+const AUTO_PASS_LABEL = { nsfw: 'Explicit', text: 'Text', ocr: 'Extract Text', vision: 'Describe' };
+const AUTO_PASS_BIT = { nsfw: 1, text: 4, ocr: 8, vision: 16 };
+
+function selectAutomation() {
+  cancelPointerDrag();
+  pushNavEntry(navEntry('automation'));
+  state.currentView = 'automation';
+  state.currentCategory = null;
+  render();
+  // Both are cheap and both go stale on their own clock — the task can be disabled in Task
+  // Scheduler, and a run that finished since the last look rewrote the queue and the summary.
+  void loadAutoRefreshSettings();
+  void loadAutoRefreshQueue();
+}
+
+async function loadAutoRefreshQueue() {
+  try {
+    state.autoQueue = await window.categorizerAPI.getAutoRefreshQueue();
+  } catch (error) {
+    // A failed read is not "nothing queued" — leave the last known counts up rather than replacing
+    // them with a zero that would read as an answer.
+    console.warn('Failed to read the scheduled queue:', error);
+    return;
+  }
+  renderSidebar();
+  if (state.currentView === 'automation') renderAutoPanel();
+}
+
+// The union over the passes a run is set to perform, for one folder — same mask arithmetic as the
+// Analyze row's readout, and same reason: an image new to two passes is one image to process.
+function autoQueuePassCount(folder, passes) {
+  const masks = folder?.pending?.byPassMask;
+  if (!masks) return 0;
+  const selection = passes.reduce((bits, pass) => bits | (AUTO_PASS_BIT[pass] || 0), 0);
+  return masks.reduce((sum, count, mask) => (mask & selection ? sum + count : sum), 0);
+}
+
+function autoFactRow(term, detail, { tone = '' } = {}) {
+  const row = document.createElement('div');
+  row.className = `auto-fact${tone ? ` ${tone}` : ''}`;
+  const dt = document.createElement('dt');
+  dt.textContent = term;
+  const dd = document.createElement('dd');
+  dd.textContent = detail;
+  dd.title = detail;
+  row.append(dt, dd);
+  return row;
+}
+
+function renderAutoFacts() {
+  const auto = state.autoRefresh;
+  els.autoFacts.innerHTML = '';
+  if (!auto) {
+    els.autoFacts.append(autoFactRow('Schedule', 'Could not be read.', { tone: 'is-warn' }));
+    return;
+  }
+
+  els.autoFacts.append(
+    auto.enabled
+      ? autoFactRow('Schedule', `On — every day at ${auto.time}`)
+      : autoFactRow('Schedule', 'Off — nothing runs on its own', { tone: 'is-off' }),
+  );
+
+  // The OS's own answer, not this app's opinion of it: a task disabled or deleted in Task Scheduler
+  // is invisible to the toggle above, and that gap is exactly what this row is for.
+  if (auto.taskInstalled) {
+    const detail = [auto.taskNextRun ? `next ${auto.taskNextRun}` : null, auto.taskStatus]
+      .filter(Boolean)
+      .join(' · ');
+    els.autoFacts.append(autoFactRow('Windows task', detail ? `Installed — ${detail}` : 'Installed'));
+  } else {
+    els.autoFacts.append(autoFactRow(
+      'Windows task',
+      auto.enabled ? 'Not installed — nothing will fire on its own' : 'Not installed',
+      { tone: auto.enabled ? 'is-warn' : 'is-off' },
+    ));
+  }
+
+  const folders = auto.roots || [];
+  els.autoFacts.append(folders.length
+    ? autoFactRow(`Folder${folders.length === 1 ? '' : 's'}`, folders.join(' · '))
+    : autoFactRow('Folders', 'None picked', { tone: auto.enabled ? 'is-warn' : 'is-off' }));
+
+  const passes = (state.autoQueue?.scheduledPasses || []).map(pass => AUTO_PASS_LABEL[pass] || pass);
+  els.autoFacts.append(passes.length
+    ? autoFactRow('Passes', passes.join(' · '))
+    : autoFactRow('Passes', 'None — a run would only rescan for new files', { tone: 'is-off' }));
+
+  if (auto.runVision) {
+    els.autoFacts.append(autoFactRow(
+      'Describe limit',
+      auto.visionMinutes > 0
+        ? `${auto.visionMinutes} min of GPU time per run${auto.gpuWait ? ', after the card is free' : ''}`
+        : 'No limit — it runs the backlog down',
+      { tone: auto.visionMinutes > 0 ? '' : 'is-warn' },
+    ));
+  }
+
+  if (auto.lastRunAt) {
+    els.autoFacts.append(autoFactRow(
+      'Last run',
+      `${formatDate(Date.parse(auto.lastRunAt))} — ${auto.lastRunSummary || 'no summary recorded'}`,
+      // A run that found nothing is the uneventful outcome, not a result to be read twice.
+      { tone: auto.lastRunNoWork ? 'is-clear' : '' },
+    ));
+  } else {
+    els.autoFacts.append(autoFactRow('Last run', 'Never'));
+  }
+}
+
+function autoQueueNote(text, tone = '') {
+  const note = document.createElement('p');
+  note.className = `auto-queue-headline${tone ? ` ${tone}` : ''}`;
+  note.textContent = text;
+  return note;
+}
+
+function renderAutoQueueFolder(folder, passes) {
+  const row = document.createElement('div');
+  row.className = 'auto-queue-row';
+
+  const path = document.createElement('div');
+  path.className = 'auto-queue-path';
+  path.textContent = folder.root;
+  path.title = folder.root;
+  row.append(path);
+
+  const body = document.createElement('div');
+  body.className = 'auto-queue-body';
+
+  if (!folder.exists) {
+    body.append(autoQueueNote('Folder not found — the run skips it.', 'is-warn'));
+    row.append(body);
+    return row;
+  }
+  if (!folder.scanned) {
+    // Refusing to say "0" here is the point: nothing has ever been counted in this folder, and a
+    // zero would be indistinguishable from one that is genuinely up to date.
+    body.append(autoQueueNote('Never scanned — the run scans it first, then works through whatever it finds.'));
+    row.append(body);
+    return row;
+  }
+
+  const chips = document.createElement('div');
+  chips.className = 'auto-queue-chips';
+  for (const pass of passes) {
+    const count = autoQueuePassCount(folder, [pass]);
+    const chip = document.createElement('span');
+    chip.className = `auto-queue-chip${count ? '' : ' is-clear'}`;
+    chip.textContent = `${AUTO_PASS_LABEL[pass] || pass} ${formatCount(count)}`;
+    if (pass === 'vision' && folder.visionUnlockable > 0) {
+      // Describe's count is a snapshot taken before scoring: an unscored image is invisible to it
+      // and becomes its work later in the very same run. "Describe 0" out of thousands reads as a
+      // bug until the number that went missing is on screen too.
+      chip.textContent += ` (+${formatCount(folder.visionUnlockable)} once scored)`;
+      chip.classList.remove('is-clear');
+    }
+    chips.append(chip);
+  }
+  body.append(chips);
+
+  const meta = document.createElement('div');
+  meta.className = 'auto-queue-meta';
+  const counted = folder.countedAtMs ? `counted ${formatDate(folder.countedAtMs)}` : 'never counted';
+  meta.textContent = `${formatCount(folder.knownImages)} images known · ${counted}`;
+  body.append(meta);
+
+  row.append(body);
+  return row;
+}
+
+function renderAutoQueue() {
+  const queue = state.autoQueue;
+  const container = els.autoQueue;
+  container.innerHTML = '';
+  if (!queue) {
+    container.append(autoQueueNote('Not counted yet.'));
+    return;
+  }
+
+  const passes = queue.scheduledPasses || [];
+  const folders = queue.folders || [];
+
+  // Three different kinds of "nothing", and collapsing them into one number is how a schedule that
+  // cannot work reads as a schedule with nothing to do.
+  if (!queue.enabled) {
+    container.append(autoQueueNote('Automatic runs are off, so nothing is queued.', 'is-off'));
+  } else if (!folders.length) {
+    container.append(autoQueueNote('No folders are picked, so a run would have nothing to look at.', 'is-warn'));
+  } else if (!passes.length) {
+    container.append(autoQueueNote('No passes are ticked — a run would rescan for new files and stop there.', 'is-off'));
+  } else if (queue.nothingToDo) {
+    container.append(autoQueueNote(
+      'Nothing to process. Every folder is up to date for the passes that are scheduled, so the next run will '
+      + 'rescan for new files, find nothing to do, and finish.',
+      'is-clear',
+    ));
+  } else {
+    container.append(autoQueueNote(
+      `${formatCount(queue.scheduledPending)} image${queue.scheduledPending === 1 ? '' : 's'} queued for the next run.`,
+    ));
+  }
+
+  for (const folder of folders) {
+    container.append(renderAutoQueueFolder(folder, passes));
+  }
+}
+
+function renderAutoLive() {
+  const run = state.autoRun;
+  els.autoLive.classList.toggle('hidden', !run);
+  els.autoStopButton.classList.toggle('hidden', !run);
+  // Run Now would launch a second process behind the one already going, and the backend refuses it
+  // anyway — saying so with the button is cheaper than saying it with an error.
+  els.autoRunNowButton.disabled = Boolean(run);
+  if (!run) return;
+
+  els.autoLiveLabel.textContent = run.cancelRequested ? 'Stopping…' : (run.label || 'Running');
+  els.autoLiveDetail.textContent = [
+    autoRunDetailText(run),
+    run.startedMs ? `started ${formatDate(run.startedMs)}` : '',
+  ].filter(Boolean).join(' — ');
+
+  const hasProgress = run.total > 0;
+  els.autoLiveTrack.classList.toggle('hidden', !hasProgress);
+  if (hasProgress) els.autoLiveFill.style.width = `${Math.min(100, (run.processed / run.total) * 100)}%`;
+
+  els.autoLiveLimit.textContent = run.visionDeadlineMs > 0
+    ? `${formatAutoRunClock((run.visionDeadlineMs - Date.now()) / 1000)} left of ${run.visionLimitMinutes} min`
+    : '';
+  els.autoStopButton.disabled = Boolean(run.cancelRequested);
+  els.autoStopButton.textContent = run.cancelRequested ? 'Stopping…' : '■ Stop Run';
+}
+
+function renderAutoPanel() {
+  const auto = state.autoRefresh;
+  const queue = state.autoQueue;
+
+  if (state.autoRun) {
+    els.autoStateChip.textContent = 'Running now';
+    els.autoStateChip.className = 'auto-state-chip is-running';
+  } else if (!auto?.enabled) {
+    els.autoStateChip.textContent = 'Off';
+    els.autoStateChip.className = 'auto-state-chip is-off';
+  } else if (queue?.nothingToDo) {
+    els.autoStateChip.textContent = 'On — nothing queued';
+    els.autoStateChip.className = 'auto-state-chip is-clear';
+  } else if (queue?.scheduledPending) {
+    els.autoStateChip.textContent = `On — ${formatCount(queue.scheduledPending)} queued`;
+    els.autoStateChip.className = 'auto-state-chip is-on';
+  } else {
+    els.autoStateChip.textContent = 'On';
+    els.autoStateChip.className = 'auto-state-chip is-on';
+  }
+
+  const counted = (queue?.folders || [])
+    .map(folder => folder.countedAtMs)
+    .filter(Boolean)
+    .sort((a, b) => a - b)[0];
+  els.autoCounted.textContent = counted ? `Counts as of ${formatDate(counted)}` : '';
+
+  renderAutoLive();
+  renderAutoFacts();
+  renderAutoQueue();
+}
+
+function installAutomationPanel() {
+  els.automationTab.addEventListener('click', selectAutomation);
+  els.openAutomationButton.addEventListener('click', () => {
+    closeSettingsDialog();
+    selectAutomation();
+  });
+
+  els.autoRecheckButton.addEventListener('click', async () => {
+    els.autoRecheckButton.disabled = true;
+    try {
+      await loadAutoRefreshSettings();
+      await loadAutoRefreshQueue();
+    } finally {
+      els.autoRecheckButton.disabled = false;
+    }
+  });
+
+  els.autoRunNowButton.addEventListener('click', async () => {
+    els.autoRunNowButton.disabled = true;
+    try {
+      await window.categorizerAPI.runAutoRefreshNow();
+      showToast('Started the scheduled run — it reports itself here and in the banner within a couple of seconds.');
+    } catch (error) {
+      showToast(errorText(error));
+      els.autoRunNowButton.disabled = false;
+      return;
+    }
+    // The run publishes its first state a moment after launching; the poll is what picks it up, and
+    // firing one now saves the panel looking inert for a whole interval.
+    setTimeout(pollAutoRun, 600);
+  });
+
+  els.autoStopButton.addEventListener('click', async () => {
+    els.autoStopButton.disabled = true;
+    els.autoStopButton.textContent = 'Stopping…';
+    try {
+      await window.categorizerAPI.cancelAutoRefreshRun();
+      showToast('Stopping the automatic run — it finishes the image it is on first.');
+    } catch (error) {
+      showToast(errorText(error));
+    }
+    pollAutoRun();
+  });
 }
 
 async function installAnalysisListeners() {
@@ -4194,6 +5392,10 @@ async function init() {
     await installTopicListeners();
     await installFileDropListener();
     installAutoRunBanner();
+    // Fire-and-forget beside the library scan: neither reads the root, and the sidebar's Automation
+    // pill is meant to answer "is anything queued for tonight" without the tab ever being opened.
+    void loadAutoRefreshSettings();
+    void loadAutoRefreshQueue();
     await refreshAll();
   } catch (error) {
     setLoading(false);

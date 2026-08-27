@@ -70,6 +70,11 @@
           <button class="icon-button settings-icon" id="settings-button" type="button" title="Settings">⚙</button>
         </div>
 
+        <!-- First, and with no count pill: it is the view you look at BEFORE the lists, and it
+             counts nothing of its own — every figure in it is about the others. -->
+        <button class="nav-item" id="dashboard-tab" type="button">
+          <span>Dashboard</span>
+        </button>
         <button class="nav-item active" id="all-tab" type="button">
           <span>All Images</span>
           <span class="count-pill" id="all-count">0</span>
@@ -85,6 +90,12 @@
         <button class="nav-item" id="text-tab" type="button">
           <span>Extracted Text</span>
           <span class="count-pill" id="text-count">0</span>
+        </button>
+        <!-- The pill counts what the NEXT scheduled run would have to process, so the sidebar
+             answers "is anything queued for tonight" without opening anything. -->
+        <button class="nav-item" id="automation-tab" type="button">
+          <span>Automation</span>
+          <span class="count-pill" id="automation-count">0</span>
         </button>
 
         <div class="section-title">
@@ -415,6 +426,227 @@
             <button id="text-copy-button" class="button secondary" type="button">Copy text</button>
           </div>
         </section>
+
+        <!-- Dashboard. A meta view: it holds no images and answers no question about a single
+             one of them. Everything here is a second reading of data the other views already carry —
+             the point is the SHAPE of it over time, which no list of tiles can show.
+
+             It is computed entirely in this window, off `state.library.images`, which the scan has
+             already handed over: a full pass over 49,837 records measures 3.4 ms, so there is no
+             backend call, no second read of a 28 MB sidecar, and no way for a figure here to
+             disagree with the grid beside it. Pass COVERAGE is the exception and comes from
+             `library.pending` — those are the passes' own eligibility rules, and a second copy of
+             them in JavaScript is how a dashboard starts quietly lying about a queue. -->
+        <section class="dash-view hidden" id="dash-view">
+          <div class="dash-toolbar">
+            <div class="dash-range" id="dash-range" role="group" aria-label="Time window">
+              <button class="dash-range-button" type="button" data-days="30">30 days</button>
+              <button class="dash-range-button is-active" type="button" data-days="90">90 days</button>
+              <button class="dash-range-button" type="button" data-days="365">Year</button>
+            </div>
+            <button id="dash-refresh-button" class="button secondary" type="button"
+                    title="Re-read the capture log and re-measure the library">Refresh</button>
+            <span class="dash-toolbar-spacer"></span>
+            <span class="dash-asof" id="dash-asof"></span>
+          </div>
+
+          <div class="dash-tiles" id="dash-tiles"></div>
+
+          <div class="dash-cards">
+            <div class="dash-card">
+              <h2>Who did the sorting</h2>
+              <div id="dash-usage"></div>
+            </div>
+
+            <div class="dash-card">
+              <h2>Categories you made yourself</h2>
+              <div id="dash-own"></div>
+            </div>
+
+            <div class="dash-card dash-card-wide">
+              <h2>When things got categorized</h2>
+              <div id="dash-activity"></div>
+            </div>
+
+            <div class="dash-card dash-card-wide">
+              <h2>Screenshots taken</h2>
+              <div id="dash-captures"></div>
+            </div>
+
+            <div class="dash-card">
+              <h2>How far the analysis has got</h2>
+              <div id="dash-coverage"></div>
+            </div>
+
+            <div class="dash-card">
+              <h2>What the library is made of</h2>
+              <div id="dash-contents"></div>
+            </div>
+
+            <div class="dash-card dash-card-wide">
+              <h2>Where the material sits</h2>
+              <div id="dash-folders"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Automation. Same shape as the geo and text panels — its own scroll container, sticky
+             toolbar bleeding into the gutters — so all three behave identically when they swap
+             places with the grid.
+
+             This panel exists because the scheduled run is the one part of the app that acts while
+             nobody is watching, and until now the only trace of it was a line of text at the bottom
+             of a Settings dialog. Three questions, in the order they get asked: is it on and what is
+             it doing, what is waiting for it, and what should it be doing. The controls in the third
+             card were MOVED here rather than mirrored — two copies of a schedule is a way to set it
+             twice and mean neither. -->
+        <section class="auto-view hidden" id="auto-view">
+          <div class="auto-toolbar">
+            <span class="auto-state-chip" id="auto-state-chip"></span>
+            <button id="auto-run-now-button" class="button" type="button"
+                    title="Start the scheduled run right now, exactly as the nightly trigger would">Run Now</button>
+            <button id="auto-stop-button" class="button danger hidden" type="button"
+                    title="Stop the run that is going">&#9632; Stop Run</button>
+            <button id="auto-recheck-button" class="button secondary" type="button"
+                    title="Re-read each folder's records and the Windows task">Recheck</button>
+            <span class="auto-toolbar-spacer"></span>
+            <span class="auto-counted" id="auto-counted"></span>
+          </div>
+
+          <div class="auto-cards">
+            <div class="auto-card">
+              <h2>The run</h2>
+              <!-- Only present while a run is actually going. It duplicates the topbar banner on
+                   purpose: the banner is a notification you may have scrolled past, this is the
+                   page you came to in order to look. -->
+              <div class="auto-live hidden" id="auto-live">
+                <div class="auto-live-head">
+                  <span class="auto-live-pulse" aria-hidden="true"></span>
+                  <span class="auto-live-label" id="auto-live-label"></span>
+                  <span class="auto-live-limit" id="auto-live-limit"></span>
+                </div>
+                <div class="auto-live-track" id="auto-live-track" aria-hidden="true">
+                  <div class="auto-live-fill" id="auto-live-fill"></div>
+                </div>
+                <div class="auto-live-detail" id="auto-live-detail"></div>
+              </div>
+              <dl class="auto-facts" id="auto-facts"></dl>
+              <p class="auto-note">
+                The run never wakes the machine. A 04:00 trigger on a sleeping desktop does not fire
+                at 04:00 — Windows starts the missed run once you are using the PC again, which is
+                exactly when the GPU wait below earns its keep.
+              </p>
+            </div>
+
+            <div class="auto-card">
+              <h2>Queued for the next run</h2>
+              <div class="auto-queue" id="auto-queue"></div>
+              <p class="auto-note">
+                Counted from each folder's last scan, not from the disk right now — reading a
+                90,000-image folder takes minutes, and this page should not. Files added since are
+                found by the run itself and appear here afterwards.
+              </p>
+            </div>
+
+            <div class="auto-card auto-card-wide">
+              <h2>What runs, and when</h2>
+              <p class="auto-note auto-note-lead">
+                Runs once a day through the Windows Task Scheduler, even when the app is closed. A tray
+                icon appears while a run is going; right-click it to cancel one when the app isn't open.
+              </p>
+
+              <label class="check-row">
+                <input id="auto-refresh-enabled-input" type="checkbox">
+                <span>Enable daily automatic refresh</span>
+              </label>
+
+              <!-- Two columns from here down. Every group is a fixed set of short controls, so
+                   stacking them cost the panel more height than the whole rest of the view — and the
+                   schedule is the one thing here you want to take in at a glance rather than scroll. -->
+              <div id="auto-refresh-options">
+                <div class="settings-stack" role="group" aria-label="Run time">
+                  <span class="settings-label">Run time</span>
+                  <!-- Not `<input type="time">`. WebView2 formats that control from the BROWSER's UI
+                       locale, which is en-US here, so it renders "04:00 AM" — and neither the
+                       document's `lang` nor the element's changes it (measured). Two selects are the
+                       only way to state a 24-hour clock from the page, and they cannot hold an
+                       invalid time either. -->
+                  <div class="auto-time-row">
+                    <select id="auto-refresh-hour" class="auto-time-select" aria-label="Hour, 24-hour clock"></select>
+                    <span class="auto-time-colon" aria-hidden="true">:</span>
+                    <select id="auto-refresh-minute" class="auto-time-select" aria-label="Minute"></select>
+                    <span class="auto-inline-hint">24-hour clock</span>
+                  </div>
+                </div>
+
+                <label class="settings-stack">
+                  <span class="settings-label">Stop describing after</span>
+                  <div class="auto-time-row">
+                    <input
+                      id="auto-refresh-vision-minutes-input"
+                      class="dialog-input auto-minutes-input"
+                      type="number" min="0" max="1440" step="5"
+                      title="How long the run may hold the graphics card. The clock starts when the first description begins, not while it is waiting for a free GPU, and whatever is left is picked up by the next run. 0 means no limit — with a large backlog that can mean many hours on the card, so it is not the default."
+                    >
+                    <span class="auto-inline-hint">minutes of GPU time · <strong>0 = no limit</strong></span>
+                  </div>
+                </label>
+
+                <div class="settings-stack">
+                  <span class="settings-label">Folders to refresh</span>
+                  <div class="manual-folder-list" id="auto-refresh-root-list"></div>
+                </div>
+
+                <div class="settings-stack">
+                  <span class="settings-label">What to run</span>
+                  <div class="auto-check-grid">
+                    <label class="check-row">
+                      <input id="auto-refresh-nsfw-input" type="checkbox">
+                      <span>Explicit content analysis</span>
+                    </label>
+                    <label class="check-row">
+                      <input id="auto-refresh-text-analysis-input" type="checkbox">
+                      <span>Text analysis (Low/High Text)</span>
+                    </label>
+                    <label class="check-row">
+                      <input id="auto-refresh-text-extraction-input" type="checkbox">
+                      <span>Extract OCR text</span>
+                    </label>
+                    <label class="check-row">
+                      <input id="auto-refresh-vision-input" type="checkbox">
+                      <span>Vision descriptions (local LLM)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="settings-stack auto-span-all">
+                  <span class="settings-label">How it runs</span>
+                  <div class="auto-check-grid">
+                    <label class="check-row" title="Descriptions need the local model server and the graphics card. With this on, the run watches the GPU and only starts once it has been quiet for a minute — so a catch-up run that fires while you're gaming waits its turn instead of competing. If the card is still busy after 4 hours it gives up and leaves the backlog for the next night.">
+                      <input id="auto-refresh-gpu-wait-input" type="checkbox">
+                      <span>Wait for a free GPU before describing</span>
+                    </label>
+                    <label class="check-row" title="Below-normal OS scheduling priority, so a backlog yields CPU to whatever is in the foreground instead of competing with it.">
+                      <input id="auto-refresh-low-priority-input" type="checkbox">
+                      <span>Run at low OS priority</span>
+                    </label>
+                    <label class="check-row" title="A Windows notification when the run starts and when it finishes, carrying the same summary this panel shows.">
+                      <input id="auto-refresh-toast-input" type="checkbox">
+                      <span>Notify on start and finish</span>
+                    </label>
+                  </div>
+                  <p class="auto-note">
+                    Both of the first two are recommended: they are what keep an unattended run from
+                    being the reason the machine is busy. The GPU wait is skipped entirely when there
+                    is nothing to describe.
+                  </p>
+                </div>
+              </div>
+            </div>
+            </div>
+          </div>
+        </section>
+
         <div class="drop-overlay hidden" id="drop-overlay">
           <div class="drop-overlay-inner">
             <div class="drop-overlay-icon">↓</div>
@@ -638,82 +870,12 @@
         <div class="settings-stack">
           <span class="settings-label">Automatic Daily Refresh</span>
           <p class="dialog-hint">
-            Runs a rescan (and, if selected, analysis) once a day via Windows Task Scheduler, even
-            if the app isn't open — so the library is already up to date next time you open it.
-            If a run is going while this window is open, a banner appears at the top showing what it
-            is doing, with a Stop button. A tray icon appears too; right-click it and choose "Cancel
-            refresh" to stop one when the app isn't open.
+            The schedule, the folders it covers and the passes it runs live on the
+            <strong>Automation</strong> tab, beside the queue those choices decide the size of — a
+            setting whose effect you cannot see is a setting you set twice and mean neither time.
           </p>
-
-          <label class="check-row">
-            <input id="auto-refresh-enabled-input" type="checkbox">
-            <span>Enable daily automatic refresh</span>
-          </label>
-
-          <div id="auto-refresh-options">
-            <label class="settings-stack">
-              <span class="settings-label">Run time</span>
-              <input id="auto-refresh-time-input" class="dialog-input" type="time" step="60">
-            </label>
-
-            <label class="settings-stack">
-              <span class="settings-label">Folders to refresh</span>
-              <div class="manual-folder-list" id="auto-refresh-root-list"></div>
-            </label>
-
-            <div class="settings-stack">
-              <span class="settings-label">What to run</span>
-              <label class="check-row">
-                <input id="auto-refresh-nsfw-input" type="checkbox">
-                <span>Explicit content analysis</span>
-              </label>
-              <label class="check-row">
-                <input id="auto-refresh-text-analysis-input" type="checkbox">
-                <span>Text analysis (Low/High Text)</span>
-              </label>
-              <label class="check-row">
-                <input id="auto-refresh-text-extraction-input" type="checkbox">
-                <span>Extract OCR text</span>
-              </label>
-              <label class="check-row">
-                <input id="auto-refresh-vision-input" type="checkbox">
-                <span>Vision descriptions (local LLM)</span>
-              </label>
-            </div>
-
-            <label class="settings-stack">
-              <span class="settings-label">Stop describing after (minutes)</span>
-              <input id="auto-refresh-vision-minutes-input" class="dialog-input" type="number" min="0" max="1440" step="5">
-            </label>
-            <p class="dialog-hint">
-              How long the nightly run may hold the graphics card. The clock starts when the first
-              description begins, not while it is waiting for a free GPU, and whatever is left is
-              picked up by the next run. <strong>0 means no limit</strong> — with a large backlog
-              that can mean many hours on the card, so it is not the default.
-            </p>
-
-            <label class="check-row">
-              <input id="auto-refresh-gpu-wait-input" type="checkbox">
-              <span>Wait for the GPU to be free before describing (recommended)</span>
-            </label>
-            <p class="dialog-hint">
-              Descriptions need the local model server and the graphics card. With this on, the
-              nightly run watches the GPU and only starts once it has been quiet for a minute — so a
-              catch-up run that fires while you're gaming waits its turn instead of competing. If the
-              card is still busy after 4 hours it gives up and leaves the backlog for the next night.
-            </p>
-
-            <label class="check-row">
-              <input id="auto-refresh-low-priority-input" type="checkbox">
-              <span>Run at low OS priority (recommended — avoids competing with games/other apps)</span>
-            </label>
-
-            <label class="check-row">
-              <input id="auto-refresh-toast-input" type="checkbox">
-              <span>Show a notification when it starts and finishes</span>
-            </label>
-
-            <p class="settings-value" id="auto-refresh-status"></p>
+          <div class="settings-actions">
+            <button class="button compact" id="open-automation-button" type="button" title="Close Settings and open the Automation tab">Open Automation</button>
           </div>
         </div>
 

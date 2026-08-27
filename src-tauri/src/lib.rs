@@ -178,6 +178,11 @@ struct AppSettings {
     auto_refresh_toast: Option<bool>,
     last_auto_refresh_at: Option<String>,
     last_auto_refresh_summary: Option<String>,
+    // Whether that last run found nothing to process. Kept as its own flag rather than sniffed out
+    // of the summary text, so the Automation panel can render "nothing was due" as the calm,
+    // uneventful state it is instead of as a result that has to be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_auto_refresh_no_work: Option<bool>,
     // OpenAI-compatible vision endpoint (LM Studio by default) + the model name to send. Global, so
     // one setting drives the description pass across every library. `vision_api_key` is the bearer
     // token LM Studio requires when its API-token auth is enabled; `None` = send no Authorization.
@@ -323,8 +328,14 @@ struct AutoRefreshSettingsView {
     low_priority: bool,
     toast: bool,
     task_installed: bool,
+    /// What Windows itself says the next fire time is, verbatim. Not parsed and not reformatted:
+    /// schtasks prints it in the machine's own locale, and re-deriving it from `time` would state
+    /// this app's opinion of the schedule where the panel is meant to state the OS's.
+    task_next_run: Option<String>,
+    task_status: Option<String>,
     last_run_at: Option<String>,
     last_run_summary: Option<String>,
+    last_run_no_work: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3610,21 +3621,99 @@ fn auto_refresh_task_xml(exe: &Path, time: &str) -> String {
     )
 }
 
-fn scheduled_task_installed() -> bool {
-    Command::new("schtasks")
-        .args(["/Query", "/TN", AUTO_REFRESH_TASK_NAME])
+/// What Windows knows about the scheduled task, as the Automation panel reports it.
+///
+/// `next_run` and `status` are Windows' own strings, kept verbatim. The alternative — computing
+/// the next fire time from the configured `time` — would look tidier and be a different claim:
+/// it would say when this app *thinks* the job is due, and stay confidently wrong about a task
+/// that has been disabled, deleted, or moved in Task Scheduler. The point of this row is to report
+/// the OS, so it reports the OS.
+#[derive(Debug, Default, Clone)]
+struct ScheduledTaskState {
+    installed: bool,
+    next_run: Option<String>,
+    status: Option<String>,
+}
+
+/// Splits one `/FO CSV` row into its fields. Hand-rolled rather than pulling in a CSV crate: the
+/// row is three quoted fields written by schtasks, and none of them can contain a quote — a task
+/// name with one cannot be registered, and the other two are a formatted date and a status word.
+fn split_csv_row(row: &str) -> Vec<String> {
+    row.trim()
+        .trim_matches('"')
+        .split("\",\"")
+        .map(|field| field.trim().to_string())
+        .collect()
+}
+
+/// Blank and `N/A` both mean "nothing to report" — schtasks prints one or the other depending on
+/// the field and the task's state, and neither is worth showing to somebody.
+fn task_field(fields: &[String], index: usize) -> Option<String> {
+    fields
+        .get(index)
+        .map(|field| field.trim())
+        .filter(|field| !field.is_empty() && !field.eq_ignore_ascii_case("N/A"))
+        .map(str::to_string)
+}
+
+fn scheduled_task_state() -> ScheduledTaskState {
+    let Ok(output) = Command::new("schtasks")
+        .args(["/Query", "/TN", AUTO_REFRESH_TASK_NAME, "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return ScheduledTaskState::default();
+    };
+    if !output.status.success() {
+        return ScheduledTaskState::default();
+    }
+    // The task exists; anything below this point is presentation and may legitimately come back
+    // empty (a locale that formats the date oddly, a Windows build that reorders the columns).
+    let text = String::from_utf8_lossy(&output.stdout);
+    let fields = text.lines().find(|line| !line.trim().is_empty()).map(split_csv_row).unwrap_or_default();
+    ScheduledTaskState {
+        installed: true,
+        next_run: task_field(&fields, 1),
+        status: task_field(&fields, 2),
+    }
+}
+
+/// Starts the nightly job now, by launching this same exe with the flag the scheduled task uses.
+///
+/// Deliberately not `schtasks /Run`: that would only work while the task is installed, and the
+/// thing being tested here is the *run*, not the trigger. The launched process publishes its state
+/// file exactly as a 04:00 run does, so the banner and the panel pick it up within one poll.
+#[tauri::command]
+fn run_auto_refresh_now(app: AppHandle) -> Result<(), String> {
+    if auto_run::read_live(&app).is_some() {
+        return Err("An automatic run is already going.".to_string());
+    }
+    let settings = load_app_settings(&app);
+    if !settings.auto_refresh_enabled {
+        // The run itself re-reads this and exits immediately, which from here would look like a
+        // launch that silently did nothing.
+        return Err("Automatic runs are switched off. Turn them on first.".to_string());
+    }
+    if settings.auto_refresh_roots.is_empty() {
+        return Err("No folders are picked for automatic runs.".to_string());
+    }
+    let exe = std::env::current_exe().map_err(|error| format!("Failed to resolve executable path: {error}"))?;
+    Command::new(exe)
+        .arg(HEADLESS_REFRESH_ARG)
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Failed to start the run: {error}"))
 }
 
 fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
     let settings = load_app_settings(app);
     // Read before the struct literal moves `auto_refresh_roots` out of `settings`.
     let vision_minutes = vision_limit_minutes(&settings);
+    let task = scheduled_task_state();
     AutoRefreshSettingsView {
         enabled: settings.auto_refresh_enabled,
         time: settings.auto_refresh_time.unwrap_or_else(|| DEFAULT_AUTO_REFRESH_TIME.to_string()),
@@ -3637,9 +3726,12 @@ fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
         gpu_wait: settings.auto_refresh_gpu_wait.unwrap_or(true),
         low_priority: settings.auto_refresh_low_priority.unwrap_or(true),
         toast: settings.auto_refresh_toast.unwrap_or(true),
-        task_installed: scheduled_task_installed(),
+        task_installed: task.installed,
+        task_next_run: task.next_run,
+        task_status: task.status,
         last_run_at: settings.last_auto_refresh_at,
         last_run_summary: settings.last_auto_refresh_summary,
+        last_run_no_work: settings.last_auto_refresh_no_work.unwrap_or(false),
     }
 }
 
@@ -3713,6 +3805,246 @@ fn set_auto_refresh_settings(
     save_app_settings(&app, &settings)?;
     configure_scheduled_task(enabled, &time)?;
     Ok(auto_refresh_settings_view(&app))
+}
+
+// ============================================================================
+// What the next scheduled run would have to do
+//
+// The Automation panel has to answer "is anything queued for tonight" without paying for a scan:
+// `scan_and_reconcile` walks and re-hashes every file under a root — minutes on a 90k-image
+// library — which is the right price for a run's first act and an absurd one for opening a tab.
+//
+// So the queue is measured off the sidecar records the last scan left behind: one JSON read per
+// folder, no directory walk. That makes it a statement about the last scan rather than about the
+// disk right now, and the panel says exactly that rather than implying the number is live — files
+// added since are found by the run itself, and turn up here after it.
+//
+// It reuses the very `pending_*` selectors the passes use, by rebuilding a `LibraryView` out of
+// records rather than counting fields by hand. A second copy of the "already done" rules is
+// precisely how a queue readout starts quietly disagreeing with the pass it describes.
+// ============================================================================
+
+/// A `LibraryView` reconstructed from the sidecar alone — no walk, no hashing, no thumbnails.
+///
+/// Only three fields are load-bearing for the `pending_*` selectors (`hash`, `relative_path`,
+/// `source_folder`); the rest ride along because the record already holds them. Two known
+/// differences from a real scan, both stated in the UI rather than papered over here: files added
+/// since the last scan are missing entirely, and duplicates count once (a scan sees two files
+/// sharing a hash as two images, the sidecar holds one record).
+fn library_view_from_records(root: &Path, config: &LibraryConfig) -> LibraryView {
+    let mut folder_counts: HashMap<String, usize> = HashMap::new();
+    let mut images = Vec::with_capacity(config.images.len());
+    for (hash, record) in &config.images {
+        if record.last_known_path.is_empty() {
+            continue;
+        }
+        let source_folder = record_source_folder(&record.last_known_path).to_string();
+        *folder_counts.entry(source_folder.clone()).or_insert(0) += 1;
+        images.push(ImageView {
+            hash: hash.clone(),
+            path: root.join(&record.last_known_path).to_string_lossy().to_string(),
+            thumbnail_path: None,
+            relative_path: record.last_known_path.clone(),
+            name: record
+                .last_known_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&record.last_known_path)
+                .to_string(),
+            source_folder,
+            size: record.size.unwrap_or(0),
+            modified_ms: record.modified_ms.unwrap_or(0),
+            category: record.category.clone(),
+            classified_by: record.classified_by.clone(),
+            classified_at: record.classified_at.clone(),
+            ocr_word_count: record.ocr_word_count,
+            ocr_text_area_ratio: record.ocr_text_area_ratio,
+            ocr_text_chars: record.ocr_text_chars,
+            nsfw_score: record.nsfw_score,
+            nsfw_labels: record.nsfw_labels.clone(),
+            video_title: record.video_title.clone().filter(|title| !title.is_empty()),
+            vision_desc_chars: record.vision_desc_chars,
+        });
+    }
+
+    let mut source_folders: Vec<SourceFolderView> = folder_counts
+        .into_iter()
+        .map(|(name, image_count)| SourceFolderView {
+            relative_path: if name == ROOT_SOURCE_FOLDER { ".".to_string() } else { name.clone() },
+            image_count,
+            included_in_analysis: !config.excluded_analysis_folders.iter().any(|excluded| excluded == &name),
+            name,
+            is_manual: false,
+        })
+        .collect();
+    source_folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let (ocr_word_threshold, ocr_area_threshold) = ocr_thresholds(config);
+    let mut view = LibraryView {
+        root: root.to_string_lossy().to_string(),
+        source_pattern_preset: config.source_pattern_preset.clone(),
+        source_pattern_regex: config.source_pattern_regex.clone(),
+        ocr_word_threshold,
+        ocr_area_threshold,
+        nsfw_score_threshold: nsfw_threshold(config),
+        source_folders,
+        categories: Vec::new(),
+        unclassified_count: 0,
+        images,
+        pending: PendingAnalysis::default(),
+    };
+    view.pending = pending_analysis(&view, config, load_chunk_plan(root).as_ref());
+    view
+}
+
+/// How many images at least one of `bits`'s passes still has work on — a UNION, read out of the
+/// mask table the same way the toolbar's readout reads it. Summing per-pass totals instead would
+/// count an image that is new to both Explicit and Text twice.
+fn pending_for_passes(pending: &PendingAnalysis, bits: usize) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    pending
+        .by_pass_mask
+        .iter()
+        .enumerate()
+        .filter(|(mask, _)| mask & bits != 0)
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+/// The passes a scheduled run is currently configured to perform, as a `PASS_BIT_*` mask.
+///
+/// Video Dedup is deliberately absent: the nightly job has never run it, and the chunk plan it
+/// builds is an interactive decision about which frames are worth describing.
+fn scheduled_pass_bits(settings: &AppSettings) -> usize {
+    let mut bits = 0;
+    if settings.auto_refresh_nsfw.unwrap_or(true) {
+        bits |= PASS_BIT_NSFW;
+    }
+    if settings.auto_refresh_text_analysis.unwrap_or(true) {
+        bits |= PASS_BIT_TEXT;
+    }
+    if settings.auto_refresh_text_extraction.unwrap_or(false) {
+        bits |= PASS_BIT_OCR;
+    }
+    if settings.auto_refresh_vision.unwrap_or(false) {
+        bits |= PASS_BIT_VISION;
+    }
+    bits
+}
+
+/// The pass keys, in queue order, for a mask — the same strings the frontend keys its per-pass
+/// labels and `ANALYSIS_PASS_BIT` table by.
+fn pass_keys(bits: usize) -> Vec<String> {
+    [
+        (PASS_BIT_NSFW, "nsfw"),
+        (PASS_BIT_TEXT, "text"),
+        (PASS_BIT_OCR, "ocr"),
+        (PASS_BIT_VISION, "vision"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| bits & bit != 0)
+    .map(|(_, key)| key.to_string())
+    .collect()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoRunQueueFolder {
+    root: String,
+    /// The folder is still on disk. A missing one is skipped by the run rather than failing it, so
+    /// it is reported here instead of being silently dropped from the total.
+    exists: bool,
+    /// A sidecar exists, i.e. this folder has been scanned at least once. Without one nothing is
+    /// known about it and no count here means anything.
+    scanned: bool,
+    known_images: usize,
+    /// When the sidecar was last written — the moment these counts were true.
+    counted_at_ms: Option<u64>,
+    pending: PendingAnalysis,
+    /// The union over the passes the job is set to run: this folder's share of tonight's work.
+    scheduled_pending: usize,
+    /// Descriptions the Explicit pass would unlock *within the same run*. Vision refuses to look at
+    /// an unscored image, so this work is invisible to `pending` until scoring has happened — and
+    /// counting it is what stops a run being called empty when it is about to have plenty to do.
+    vision_unlockable: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoRunQueue {
+    enabled: bool,
+    scheduled_passes: Vec<String>,
+    folders: Vec<AutoRunQueueFolder>,
+    scheduled_pending: usize,
+    /// Every configured folder has been scanned and none of them has outstanding work for the
+    /// passes the job is set to run.
+    ///
+    /// Deliberately false when a folder has never been scanned, and when no folder or no pass is
+    /// configured at all: "nothing to do" is a claim about work that was counted, and an empty
+    /// configuration is a different thing entirely — one the panel says in its own words.
+    nothing_to_do: bool,
+}
+
+/// What tonight's run would find waiting for it, counted off the last scan of each folder.
+#[tauri::command]
+fn get_auto_refresh_queue(app: AppHandle) -> AutoRunQueue {
+    let settings = load_app_settings(&app);
+    let bits = scheduled_pass_bits(&settings);
+    let mut folders = Vec::new();
+    let mut total = 0usize;
+
+    for root in &settings.auto_refresh_roots {
+        let path = PathBuf::from(root);
+        let exists = path.is_dir();
+        let sidecar = sidecar_path(&path);
+        let scanned = sidecar.is_file();
+        let counted_at_ms = fs::metadata(&sidecar)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as u64);
+
+        let (pending, known_images) = if exists && scanned {
+            let config = load_library_config(&path);
+            let view = library_view_from_records(&path, &config);
+            let known = view.images.len();
+            (view.pending, known)
+        } else {
+            (PendingAnalysis::default(), 0)
+        };
+
+        let scheduled_pending = pending_for_passes(&pending, bits);
+        // Only when the same run will actually do the scoring: with Explicit switched off these
+        // images stay out of reach tonight, so counting them as queued would be a promise the run
+        // has no way to keep.
+        let vision_unlockable = if bits & PASS_BIT_VISION != 0 && bits & PASS_BIT_NSFW != 0 {
+            pending.vision_skipped_unscored
+        } else {
+            0
+        };
+        total += scheduled_pending + vision_unlockable;
+        folders.push(AutoRunQueueFolder {
+            root: root.clone(),
+            exists,
+            scanned,
+            known_images,
+            counted_at_ms,
+            pending,
+            scheduled_pending,
+            vision_unlockable,
+        });
+    }
+
+    let counted_every_folder = !folders.is_empty() && folders.iter().all(|folder| !folder.exists || folder.scanned);
+    AutoRunQueue {
+        enabled: settings.auto_refresh_enabled,
+        scheduled_passes: pass_keys(bits),
+        scheduled_pending: total,
+        nothing_to_do: bits != 0 && counted_every_folder && total == 0,
+        folders,
+    }
 }
 
 // Lowers the whole process to below-normal OS scheduling priority so a nightly backlog yields
@@ -3836,6 +4168,54 @@ fn set_run_root(shared: &Arc<Mutex<auto_run::RunState>>, root: &str, index: usiz
     state.root_total = total;
 }
 
+/// A run's outstanding work per pass, accumulated one folder at a time off the scan each folder
+/// gets anyway.
+#[derive(Debug, Default, Clone, Copy)]
+struct PassQueue {
+    /// Images inside an included folder and an included category — the pool the passes draw from.
+    /// Only ever used to say how much was already up to date in a run that had nothing to do.
+    eligible: usize,
+    nsfw: usize,
+    text: usize,
+    ocr: usize,
+    vision: usize,
+    /// Descriptions this run's own Explicit pass would unlock. Vision refuses to look at an
+    /// unscored image, so these are invisible to `vision` at the moment it is counted — and
+    /// treating a run as empty without them is how a night with thousands of images to describe
+    /// would report "nothing to process" and skip the GPU gate.
+    vision_unlockable: usize,
+}
+
+impl PassQueue {
+    fn add(&mut self, pending: &PendingAnalysis) {
+        self.eligible += pending.eligible_images;
+        self.nsfw += pending_for_passes(pending, PASS_BIT_NSFW);
+        self.text += pending_for_passes(pending, PASS_BIT_TEXT);
+        self.ocr += pending_for_passes(pending, PASS_BIT_OCR);
+        self.vision += pending_for_passes(pending, PASS_BIT_VISION);
+        self.vision_unlockable += pending.vision_skipped_unscored;
+    }
+
+    /// Whether this run has anything at all to do. A plain sum rather than a union of the mask
+    /// table, because the only question ever asked of it is whether it is zero — and for that the
+    /// two agree exactly.
+    fn has_work(&self, run_nsfw: bool, run_text: bool, run_ocr: bool, run_vision: bool) -> bool {
+        (run_nsfw && self.nsfw > 0)
+            || (run_text && self.text > 0)
+            || (run_ocr && self.ocr > 0)
+            || (run_vision && self.has_vision_work(run_nsfw))
+    }
+
+    /// Whether the description pass would find anything, counted before the Explicit pass ran.
+    ///
+    /// Exact in both directions rather than merely safe: with scoring off, an unscored image stays
+    /// out of reach for the whole run, and with it on, the most scoring can add is exactly
+    /// `vision_unlockable`. So zero here means zero afterwards, whichever way the toggle is set.
+    fn has_vision_work(&self, run_nsfw: bool) -> bool {
+        self.vision > 0 || (run_nsfw && self.vision_unlockable > 0)
+    }
+}
+
 fn run_headless_refresh(app: &AppHandle) {
     let settings = load_app_settings(app);
 
@@ -3901,16 +4281,26 @@ fn run_headless_refresh(app: &AppHandle) {
     let total_roots = roots.len();
     let mut folders_done = 0usize;
     let mut cancelled = false;
+    // What each pass actually had to do, summed over every folder. Two things ride on this: passes
+    // with an empty queue are skipped outright (each one otherwise opens with a full
+    // `scan_and_reconcile` of its own, which on a large root is minutes spent to discover there is
+    // nothing to read), and a run that found nothing anywhere says so instead of reporting a
+    // folder count that reads identically to a night of real work.
+    let mut queued = PassQueue::default();
 
     for (root_index, root) in roots.iter().enumerate() {
         let root_buf = PathBuf::from(root);
         set_run_root(&shared, root, root_index + 1, total_roots);
         set_run_phase(&shared, "scanning", "Scanning for new images");
-        if scan_and_reconcile(&root_buf).is_err() {
+        // The scan is the one thing that always runs: it is what discovers the files the counts
+        // below are about. Its view is kept rather than dropped, which is what makes those counts
+        // free — every pass would otherwise re-scan to derive the same answer.
+        let Ok(view) = scan_and_reconcile(&root_buf) else {
             continue;
-        }
+        };
+        queued.add(&view.pending);
 
-        if run_nsfw && !cancelled {
+        if run_nsfw && !cancelled && pending_for_passes(&view.pending, PASS_BIT_NSFW) > 0 {
             set_run_phase(&shared, "explicit", "Explicit content analysis");
             let control = app.state::<NsfwControl>();
             control.running.store(true, Ordering::SeqCst);
@@ -3920,7 +4310,10 @@ fn run_headless_refresh(app: &AppHandle) {
                 cancelled = true;
             }
         }
-        if run_text_analysis_pass && !cancelled {
+        // Counted before the Explicit pass ran, so this can only over-state: scoring removes
+        // images from the text queue (an explicit image is already classified) and never adds
+        // any. Over-stating costs a pass that finds nothing; under-stating would skip real work.
+        if run_text_analysis_pass && !cancelled && pending_for_passes(&view.pending, PASS_BIT_TEXT) > 0 {
             set_run_phase(&shared, "text", "Text analysis");
             let control = app.state::<AnalysisControl>();
             control.running.store(true, Ordering::SeqCst);
@@ -3930,7 +4323,7 @@ fn run_headless_refresh(app: &AppHandle) {
                 cancelled = true;
             }
         }
-        if run_text_extraction_pass && !cancelled {
+        if run_text_extraction_pass && !cancelled && pending_for_passes(&view.pending, PASS_BIT_OCR) > 0 {
             set_run_phase(&shared, "ocr", "Extracting OCR text");
             let control = app.state::<OcrTextControl>();
             control.running.store(true, Ordering::SeqCst);
@@ -3956,7 +4349,16 @@ fn run_headless_refresh(app: &AppHandle) {
     // descriptions depend on NSFW scores: `pending_vision` skips anything not yet scored, so
     // finishing the scoring for every root first is what stops the last root's images being passed
     // over as "not yet Explicit-analyzed".
-    let vision_note = if run_vision_pass && !cancelled {
+    let vision_note = if !run_vision_pass || cancelled {
+        None
+    } else if !queued.has_vision_work(run_nsfw) {
+        // Nothing to describe, and nothing tonight's Explicit pass could unlock. Skipping the gate
+        // here is the payoff for keeping each scan's counts: the gate is a wait of up to four hours
+        // for a card this run would then not have used, and until now it was taken unconditionally
+        // because answering "is there work?" meant a second scan of every root. The scan that
+        // already happened answers it for free.
+        Some("Nothing to describe.".to_string())
+    } else {
         match run_headless_vision(app, &settings, &roots, &shared) {
             HeadlessVisionOutcome::Ran => Some("Descriptions run.".to_string()),
             HeadlessVisionOutcome::Cancelled => {
@@ -3971,19 +4373,32 @@ fn run_headless_refresh(app: &AppHandle) {
                 Some("Descriptions skipped — the GPU stayed busy.".to_string())
             }
         }
-    } else {
-        None
     };
+
+    let no_work = !cancelled
+        && !queued.has_work(run_nsfw, run_text_analysis_pass, run_text_extraction_pass, run_vision_pass);
 
     let mut summary = if cancelled {
         format!(
             "Cancelled after {folders_done} of {total_roots} folder{}.",
             if total_roots == 1 { "" } else { "s" }
         )
+    } else if no_work {
+        // The acknowledgement a run with an empty queue owes. "Completed 1 folder." is what a night
+        // that described a thousand images says too, so a schedule that has had nothing to do for
+        // weeks reads exactly like one that is working — this is the line that tells them apart.
+        // The scan still happened; that is what makes the claim worth anything.
+        format!(
+            "Nothing to process — all {} eligible image{} across {folders_done} folder{} are up to date.",
+            queued.eligible,
+            if queued.eligible == 1 { "" } else { "s" },
+            if folders_done == 1 { "" } else { "s" }
+        )
     } else {
         format!("Completed {folders_done} folder{}.", if folders_done == 1 { "" } else { "s" })
     };
-    if let Some(note) = vision_note {
+    // Redundant next to the sentence above, which already covers every pass including this one.
+    if let Some(note) = vision_note.filter(|_| !no_work) {
         summary.push(' ');
         summary.push_str(&note);
     }
@@ -3991,6 +4406,7 @@ fn run_headless_refresh(app: &AppHandle) {
     let mut settings = load_app_settings(app);
     settings.last_auto_refresh_at = Some(now_iso());
     settings.last_auto_refresh_summary = Some(summary.clone());
+    settings.last_auto_refresh_no_work = Some(no_work);
     let _ = save_app_settings(app, &settings);
 
     // Stop the supervisor before removing the file, or its next tick would republish a run that has
@@ -5832,6 +6248,152 @@ mod pending_selection_tests {
     }
 }
 
+// The Automation panel's queue readout, and the decisions a scheduled run makes from the same
+// counts. What is pinned here is the one thing that would be expensive to get wrong: a run that
+// calls itself empty and skips work, or a gate taken for a pass that had nothing to do.
+#[cfg(test)]
+mod scheduled_queue_tests {
+    use super::*;
+
+    fn record(path: &str) -> ImageRecord {
+        ImageRecord { last_known_path: path.to_string(), ..Default::default() }
+    }
+
+    fn config_with(records: &[(&str, ImageRecord)]) -> LibraryConfig {
+        let mut config = LibraryConfig::default();
+        for (hash, record) in records {
+            config.images.insert((*hash).to_string(), record.clone());
+        }
+        config
+    }
+
+    /// The whole reason the queue is built out of records instead of a scan: it has to place each
+    /// one in its source folder from the stored path alone, or every folder exclusion is ignored.
+    #[test]
+    fn a_view_from_records_places_images_in_their_source_folders() {
+        let config = config_with(&[
+            ("a", record("2026-01/a.png")),
+            ("b", record("loose.png")),
+        ]);
+        let view = library_view_from_records(Path::new("D:/library"), &config);
+
+        let mut folders: Vec<&str> = view.images.iter().map(|image| image.source_folder.as_str()).collect();
+        folders.sort_unstable();
+        assert_eq!(folders, vec!["2026-01", ROOT_SOURCE_FOLDER]);
+    }
+
+    /// A record with no path is not an image anywhere — the scan's own reconciliation treats it the
+    /// same way, and counting it would inflate every queue on screen by whatever junk is in the file.
+    #[test]
+    fn a_record_with_no_path_is_not_an_image() {
+        let config = config_with(&[("ghost", ImageRecord::default())]);
+        assert!(library_view_from_records(Path::new("D:/library"), &config).images.is_empty());
+    }
+
+    /// The counts the panel shows have to be the passes' own answer, not a second implementation of
+    /// it. A described, scored image is work for nobody; an untouched one is work for everybody.
+    #[test]
+    fn queue_counts_come_out_of_the_same_selectors_the_passes_use() {
+        let config = config_with(&[
+            ("fresh", record("2026-01/fresh.png")),
+            (
+                "done",
+                ImageRecord {
+                    last_known_path: "2026-01/done.png".to_string(),
+                    nsfw_score: Some(0.01),
+                    ocr_word_count: Some(4),
+                    ocr_text_chars: Some(9),
+                    vision_desc_chars: Some(120),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let pending = library_view_from_records(Path::new("D:/library"), &config).pending;
+
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_NSFW), 1);
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_OCR), 1);
+        // Describe never looks at an unscored image, so `fresh` is not its work *yet*.
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_VISION), 0);
+        assert_eq!(pending.vision_skipped_unscored, 1);
+    }
+
+    /// A union, never a sum — the same rule the toolbar's readout follows. An image that is new to
+    /// two passes is one image to process, and a queue that double-counts it reads as twice the
+    /// night's work.
+    #[test]
+    fn a_multi_pass_image_counts_once_across_passes() {
+        let config = config_with(&[("fresh", record("2026-01/fresh.png"))]);
+        let pending = library_view_from_records(Path::new("D:/library"), &config).pending;
+
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_NSFW), 1);
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_OCR), 1);
+        assert_eq!(pending_for_passes(&pending, PASS_BIT_NSFW | PASS_BIT_OCR), 1, "union, not 2");
+        assert_eq!(pending_for_passes(&pending, 0), 0, "no pass ticked is no work");
+    }
+
+    #[test]
+    fn scheduled_bits_follow_the_toggles_and_never_include_video_dedup() {
+        let settings = AppSettings {
+            auto_refresh_nsfw: Some(true),
+            auto_refresh_text_analysis: Some(false),
+            auto_refresh_text_extraction: Some(true),
+            auto_refresh_vision: Some(true),
+            ..Default::default()
+        };
+        let bits = scheduled_pass_bits(&settings);
+
+        assert_eq!(bits, PASS_BIT_NSFW | PASS_BIT_OCR | PASS_BIT_VISION);
+        assert_eq!(bits & PASS_BIT_CHUNK, 0, "the nightly job has never run Video Dedup");
+        assert_eq!(pass_keys(bits), vec!["nsfw", "ocr", "vision"]);
+    }
+
+    /// Unset must read as the documented defaults, not as "off": every install that predates a
+    /// toggle has `None` there, and a queue that reported those passes as unscheduled would say a
+    /// run has nothing to do on the exact night it has the most.
+    #[test]
+    fn unset_toggles_read_as_the_defaults_the_run_uses() {
+        assert_eq!(
+            scheduled_pass_bits(&AppSettings::default()),
+            PASS_BIT_NSFW | PASS_BIT_TEXT,
+            "Explicit and Text default on; OCR extraction and Describe default off"
+        );
+    }
+
+    /// The gate skip. Descriptions that Explicit would unlock are invisible to the vision count at
+    /// the moment it is taken, so calling the run empty on that count alone would skip a pass with
+    /// thousands of images waiting — the expensive direction of this decision.
+    #[test]
+    fn unscored_images_still_count_as_description_work_when_explicit_runs() {
+        let queue = PassQueue { vision: 0, vision_unlockable: 4_000, ..PassQueue::default() };
+
+        assert!(queue.has_vision_work(true), "Explicit unlocks them in this same run");
+        assert!(!queue.has_vision_work(false), "with scoring off they stay out of reach all night");
+    }
+
+    #[test]
+    fn a_run_with_every_queue_empty_has_no_work() {
+        let empty = PassQueue { eligible: 500, ..PassQueue::default() };
+        assert!(!empty.has_work(true, true, true, true));
+
+        let one_pass = PassQueue { ocr: 1, ..PassQueue::default() };
+        assert!(one_pass.has_work(false, false, true, false));
+        // Work for a pass this run is not configured to perform is not this run's work.
+        assert!(!one_pass.has_work(true, true, false, true));
+    }
+
+    #[test]
+    fn schtasks_csv_row_splits_into_its_three_fields() {
+        let fields = split_csv_row("\"ImageCategorizerAutoRefresh\",\"27/08/2026 04:00:00\",\"Ready\"");
+
+        assert_eq!(task_field(&fields, 1).as_deref(), Some("27/08/2026 04:00:00"));
+        assert_eq!(task_field(&fields, 2).as_deref(), Some("Ready"));
+        // `N/A` is what schtasks prints for a disabled task's next run; showing it verbatim would
+        // read as a fault rather than as an absence.
+        assert_eq!(task_field(&split_csv_row("\"T\",\"N/A\",\"Disabled\""), 1), None);
+        assert_eq!(task_field(&fields, 9), None, "a column Windows did not print is simply absent");
+    }
+}
+
 // Env-gated harness that runs the real geo derive against a real library and prints the resulting
 // coverage, without a GUI or a model. Set ICAT_GEO_LIBRARY to the library root and run
 // `cargo test geo_derive_against_real_library -- --ignored --nocapture`. Read-only: it derives in
@@ -6157,7 +6719,9 @@ pub fn run() {
             get_app_settings,
             get_auto_refresh_settings,
             get_auto_refresh_run,
+            get_auto_refresh_queue,
             cancel_auto_refresh_run,
+            run_auto_refresh_now,
             get_capture_activity,
             get_chunk_plan,
             get_geo_coverage,
