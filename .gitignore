@@ -2,3 +2,18 @@ node_modules
 src-tauri/target
 dist
 .test-library
+
+# --- secrets / local config (do not commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.npmrc
+api-token.txt
+.*-config.json
+*-config.local.json
+
