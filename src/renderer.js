@@ -3266,6 +3266,9 @@ function setInteractionsLocked(locked) {
   els.analyzeButton.classList.toggle('hidden', locked);
   els.reanalyzeButton.classList.toggle('hidden', locked);
   els.cancelAnalysisButton.classList.toggle('hidden', !locked);
+  // Re-armed for the next run: a press disables it so one Stop can't be sent twice while the pass
+  // unwinds, and nothing else clears that.
+  els.cancelAnalysisButton.disabled = false;
   render();
 }
 
@@ -3484,9 +3487,13 @@ async function startAnalysis(force) {
   await runNextInQueue();
 }
 
+// Stops the running pass *now*: the backend abandons whatever item is in flight rather than
+// waiting it out, so the finished event normally lands within a tick or two of this call. The
+// abandoned item was never written anywhere, so the next run simply does it again.
 async function cancelCurrentAnalysis() {
   // Cancel the running one; the queue will be drained when the finished event fires
   state.analysisQueue = [];
+  els.cancelAnalysisButton.disabled = true;
   try {
     if (state.analysisRunning === 'text') {
       await window.categorizerAPI.cancelTextAnalysis();
@@ -3499,8 +3506,9 @@ async function cancelCurrentAnalysis() {
     } else if (state.analysisRunning === 'vision') {
       await window.categorizerAPI.cancelVisionAnalysis();
     }
-    setStatus('Cancelling…');
+    setStatus('Stopping…');
   } catch (error) {
+    els.cancelAnalysisButton.disabled = false;
     showToast(errorText(error));
   }
 }
@@ -3528,9 +3536,16 @@ async function onAnalysisFinished(type, { status, message }) {
     state.analysisQueue = [];
     state.analysisRunning = null;
     setInteractionsLocked(false);
-    const summary = `${analysisTypeLabel(type)} analysis cancelled.`;
-    showToast(summary);
+    // The pass's own message says how much got done and which item was discarded — strictly more
+    // than "cancelled", and the only place the discarded item is ever named.
+    const summary = message
+      ? `${analysisTypeLabel(type)} stopped. ${message}`
+      : `${analysisTypeLabel(type)} stopped.`;
+    showToast(summary, { sticky: true });
     if (state.library) {
+      // Says what the minutes after a Stop are for. Without it the status line still reads
+      // "Stopping…" through a full rescan, which is exactly how a stop that worked looks stuck.
+      setStatus('Stopped — refreshing library…', true);
       try {
         state.library = await window.categorizerAPI.scanLibrary(state.library.root);
         render();

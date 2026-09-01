@@ -3,6 +3,11 @@ use sidecar_lock::SidecarLock;
 
 mod auto_run;
 
+// Turns every pass's Stop from "after the current item" into "now" by abandoning the in-flight
+// item instead of waiting it out. See the module doc for why the abandoned work is thrown away.
+mod cancellable;
+use cancellable::Interrupted;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -526,6 +531,12 @@ struct KindControl {
     cancel: AtomicBool,
 }
 
+/// What a pass reports when Stop landed during its opening scan, before it reached a single image.
+/// Worth saying out loud: on a large root that scan is minutes long, so "stopped with 0 of 0 done"
+/// would otherwise read as a pass that never started.
+const STOPPED_DURING_SCAN: &str =
+    "It was still scanning, so nothing was analyzed — and the interrupted scan left the library untouched.";
+
 const DEFAULT_TILE_SIZE: u32 = 168;
 const MIN_TILE_SIZE: u32 = 96;
 const MAX_TILE_SIZE: u32 = 280;
@@ -977,6 +988,8 @@ fn scanned_image(
     })
 }
 
+/// Returns `Ok(false)` when `is_cancelled` went true part-way through — the caller throws the
+/// half-built image list away, so an interrupted walk records nothing.
 fn collect_images_in_folder(
     root: &Path,
     source_folder: &str,
@@ -984,9 +997,15 @@ fn collect_images_in_folder(
     depth: usize,
     hash_index: &HashIndex,
     images: &mut Vec<ScannedImage>,
-) -> Result<(), String> {
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, String> {
     let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
     for entry in entries.filter_map(Result::ok) {
+        // Per entry, not per folder: a single month folder can hold tens of thousands of images,
+        // and hashing an uncached one reads 64KB off disk. An atomic load costs nothing next to it.
+        if is_cancelled() {
+            return Ok(false);
+        }
         let path = entry.path();
         let name = path_name(&path);
         if name.starts_with('.') {
@@ -995,11 +1014,14 @@ fn collect_images_in_folder(
         if path.is_file() && is_image_path(&path) {
             let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
             images.push(scanned_image(root, source_folder, path, &metadata, hash_index)?);
-        } else if path.is_dir() && depth < MAX_SCAN_DEPTH {
-            collect_images_in_folder(root, source_folder, &path, depth + 1, hash_index, images)?;
+        } else if path.is_dir()
+            && depth < MAX_SCAN_DEPTH
+            && !collect_images_in_folder(root, source_folder, &path, depth + 1, hash_index, images, is_cancelled)?
+        {
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn collect_direct_images_in_folder(
@@ -1008,9 +1030,13 @@ fn collect_direct_images_in_folder(
     folder: &Path,
     hash_index: &HashIndex,
     images: &mut Vec<ScannedImage>,
-) -> Result<(), String> {
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, String> {
     let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
     for entry in entries.filter_map(Result::ok) {
+        if is_cancelled() {
+            return Ok(false);
+        }
         let path = entry.path();
         let name = path_name(&path);
         if name.starts_with('.') || !path.is_file() || !is_image_path(&path) {
@@ -1019,7 +1045,7 @@ fn collect_direct_images_in_folder(
         let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
         images.push(scanned_image(root, source_folder, path, &metadata, hash_index)?);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Merges freshly computed analysis results into whatever is on disk *now*, rather than writing back
@@ -1187,6 +1213,23 @@ fn reclassify_text_categories(config: &mut LibraryConfig) {
 }
 
 fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
+    // No cancel source: the sync commands behind this one are short user-driven reads, and the CLI
+    // has no Stop button to press. The passes call the cancellable form below instead.
+    scan_and_reconcile_cancellable(root, &|| false)?
+        .ok_or_else(|| "The library scan was stopped.".to_string())
+}
+
+/// `scan_and_reconcile`, but able to give up part-way. Returns `Ok(None)` when `is_cancelled` went
+/// true before the scan reached its write.
+///
+/// A pass's first act is this scan, and on a large root it is *minutes* during which no item-level
+/// cancel check is ever reached — the phase where a Stop button most visibly does nothing. Giving
+/// up here is clean rather than partial: the sidecar is written in exactly one place, at the end,
+/// so an abandoned scan leaves the library file byte-identical and the next run starts over.
+fn scan_and_reconcile_cancellable(
+    root: &Path,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<LibraryView>, String> {
     // Cross-process: image-viewer-tauri writes this same sidecar, and so does
     // a second instance of this app. Held for the whole read-modify-write.
     let _sidecar_lock = SidecarLock::acquire(root);
@@ -1195,20 +1238,41 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
 
     let hash_index = build_hash_index(&config);
     let mut all_images: Vec<ScannedImage> = Vec::new();
-    collect_direct_images_in_folder(root, ROOT_SOURCE_FOLDER, root, &hash_index, &mut all_images)?;
+    if !collect_direct_images_in_folder(root, ROOT_SOURCE_FOLDER, root, &hash_index, &mut all_images, is_cancelled)? {
+        return Ok(None);
+    }
     for (folder_name, _) in &source_folders {
-        collect_images_in_folder(root, folder_name, &root.join(folder_name), 0, &hash_index, &mut all_images)?;
+        if !collect_images_in_folder(
+            root,
+            folder_name,
+            &root.join(folder_name),
+            0,
+            &hash_index,
+            &mut all_images,
+            is_cancelled,
+        )? {
+            return Ok(None);
+        }
     }
 
     let thumb_dir = root.join(THUMBNAIL_DIR_NAME);
     let _ = fs::create_dir_all(&thumb_dir);
+    // The other half of a cold scan's cost. Skipping the remaining tiles the moment Stop lands is
+    // safe because each thumbnail is an independent file on disk: the ones already written stay
+    // written and are reused, and this map is discarded with the rest of the scan below.
     let thumbnail_paths: HashMap<String, String> = all_images
         .par_iter()
         .filter_map(|image| {
+            if is_cancelled() {
+                return None;
+            }
             ensure_thumbnail(&thumb_dir, &image.hash, &image.absolute_path)
                 .map(|path| (image.hash.clone(), path.to_string_lossy().to_string()))
         })
         .collect();
+    if is_cancelled() {
+        return Ok(None);
+    }
 
     let mut seen_hashes = std::collections::HashSet::new();
     for image in &all_images {
@@ -1355,7 +1419,7 @@ fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
     // — therefore refreshes the outstanding counts too, and they can never be from a different
     // moment than the grid beside them.
     view.pending = pending_analysis(&view, &config, load_chunk_plan(root).as_ref());
-    Ok(view)
+    Ok(Some(view))
 }
 
 // The Windows directory, for naming a system binary absolutely. `CreateProcess` resolves a bare
@@ -1772,9 +1836,12 @@ fn cancel_text_analysis(control: tauri::State<'_, AnalysisControl>) -> Result<()
 // library mid-run is picked up by the next scan, never by this one.
 fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
     let control = app.state::<AnalysisControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
-        let view = scan_and_reconcile(root_buf)?;
+        let Some(view) = scan_and_reconcile_cancellable(root_buf, &is_cancelled)? else {
+            return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
+        };
         let config = load_library_config(root_buf);
 
         if !analysis_has_included_folder(&view, &config) {
@@ -1792,7 +1859,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut results: Vec<(String, u32, f32)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -1898,9 +1965,12 @@ fn cancel_text_extraction(control: tauri::State<'_, OcrTextControl>) -> Result<(
 // as well would do work the panel never mentioned and finish reporting a count nobody asked about.
 fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_only: bool) {
     let control = app.state::<OcrTextControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
-        let view = scan_and_reconcile(root_buf)?;
+        let Some(view) = scan_and_reconcile_cancellable(root_buf, &is_cancelled)? else {
+            return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
+        };
         let config = load_library_config(root_buf);
 
         let text_dir = root_buf.join(OCR_TEXT_DIR_NAME);
@@ -1931,7 +2001,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_on
         let mut results: Vec<(String, u32)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -2499,6 +2569,7 @@ fn cancel_topics(control: tauri::State<'_, TopicControl>) -> Result<(), String> 
 /// stopped run keeps every bucket it already paid for.
 fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: bool) {
     let control = app.state::<TopicControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let settings = load_app_settings(app);
@@ -2531,7 +2602,7 @@ fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: b
         let mut failures = 0usize;
 
         for bucket in &pending {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 topics::save(root, &file)?;
                 return Ok(("cancelled", Some(format!("Stopped after {processed} of {total}."))));
             }
@@ -2557,9 +2628,33 @@ fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: b
 
             // Claims the model only when this app is the one loading it, exactly as Describe and
             // Classify do — a run must never shorten the idle life of a load somebody else owns.
-            let reply = model_lease::with_claim(app, &model, || {
-                topics::ask(&agent, &endpoint, &model, api_key.as_deref(), &prompt)
-            });
+            //
+            // One bucket is one model call, so this is the whole cost of a Stop unless it can be
+            // abandoned. Everything the call needs is cloned into the worker; the bucket is
+            // recorded only on the way out of the match below, so an abandoned one stays pending.
+            let reply = {
+                let (agent, endpoint, model, api_key, prompt, app) = (
+                    agent.clone(),
+                    endpoint.clone(),
+                    model.clone(),
+                    api_key.clone(),
+                    prompt.clone(),
+                    app.clone(),
+                );
+                cancellable::until_cancelled(&is_cancelled, move || {
+                    model_lease::with_claim(&app, &model, || {
+                        topics::ask(&agent, &endpoint, &model, api_key.as_deref(), &prompt)
+                    })
+                })
+            };
+            let reply = match reply {
+                Interrupted::Done(reply) => reply,
+                Interrupted::Cancelled => {
+                    topics::save(root, &file)?;
+                    return Ok(("cancelled", Some(format!("Stopped after {processed} of {total}."))));
+                }
+                Interrupted::Lost => Err(format!("Topic worker for {} ended without a result.", bucket.id)),
+            };
 
             match reply {
                 Ok((topic_list, notable)) => {
@@ -3356,6 +3451,7 @@ fn reclassify_nsfw_categories(config: &mut LibraryConfig) {
 
 fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
     let control = app.state::<NsfwControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let Some(model_path) = nsfw_model_path(app) else {
@@ -3370,7 +3466,9 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         };
 
         let mut session = create_session(&model_path)?;
-        let view = scan_and_reconcile(root_buf)?;
+        let Some(view) = scan_and_reconcile_cancellable(root_buf, &is_cancelled)? else {
+            return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
+        };
         let config = load_library_config(root_buf);
 
         let pending: Vec<(String, String, String)> = pending_nsfw(&view, &config, force)
@@ -3384,10 +3482,13 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut results: Vec<(String, f32, Vec<String>)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
+            // Not abandoned mid-item like the model calls are: one ONNX score is ~100 ms, so the
+            // between-items check already answers a Stop faster than a user can notice, and the
+            // `Session` would have to be moved in and out of a worker thread for every image.
             match analyze_image_nsfw(&mut session, Path::new(path)) {
                 Ok(stats) => results.push((hash.clone(), stats.score, stats.labels)),
                 Err(e) => {
@@ -4295,8 +4396,21 @@ fn run_headless_refresh(app: &AppHandle) {
         // The scan is the one thing that always runs: it is what discovers the files the counts
         // below are about. Its view is kept rather than dropped, which is what makes those counts
         // free — every pass would otherwise re-scan to derive the same answer.
-        let Ok(view) = scan_and_reconcile(&root_buf) else {
-            continue;
+        //
+        // Cancellable through the state the supervisor already writes: no pass is running yet, so
+        // the per-pass flags it sets on a Stop say nothing here, and on a large root this scan is
+        // minutes of a run that has been asked to end.
+        let scan_cancelled = {
+            let shared = Arc::clone(&shared);
+            move || shared.lock().map(|state| state.cancel_requested).unwrap_or(false)
+        };
+        let view = match scan_and_reconcile_cancellable(&root_buf, &scan_cancelled) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                cancelled = true;
+                break;
+            }
+            Err(_) => continue,
         };
         queued.add(&view.pending);
 
@@ -4683,9 +4797,12 @@ fn cancel_chunk_scan(control: tauri::State<'_, ChunkControl>) -> Result<(), Stri
 // the chunk plan (preserving frozen selections unless `force`). Mirrors the other passes' skeleton.
 fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
     let control = app.state::<ChunkControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
-        let view = scan_and_reconcile(root_buf)?;
+        let Some(view) = scan_and_reconcile_cancellable(root_buf, &is_cancelled)? else {
+            return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
+        };
         let config = load_library_config(root_buf);
 
         let pending: Vec<(String, String, String)> = pending_chunk(&view, &config, force)
@@ -4699,7 +4816,7 @@ fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut results: Vec<(String, String)> = Vec::new();
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -5010,8 +5127,14 @@ fn cancel_vision_analysis(control: tauri::State<'_, VisionControl>) -> Result<()
 // redone). Eligible = not in an excluded folder, not explicit (per NSFW score), and — when a chunk
 // plan exists — every non-video image plus only the sampled frames of each video. Explicit or
 // not-yet-NSFW-scored images are skipped and counted so the summary explains what was left out.
+//
+// This is the pass Stop is judged on: one image is one model generation, tens of seconds to
+// minutes, so every long-running step here — the scan, the warm-up, each description — is
+// abandoned rather than waited out (`cancellable`). The abandoned image is written nowhere, which
+// is what makes it simply pending again next time.
 fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
     let control = app.state::<VisionControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let settings = load_app_settings(app);
@@ -5019,7 +5142,9 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let model = vision_model(&settings);
         let api_key = vision_api_key(&settings);
 
-        let view = scan_and_reconcile(root_buf)?;
+        let Some(view) = scan_and_reconcile_cancellable(root_buf, &is_cancelled)? else {
+            return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
+        };
         let config = load_library_config(root_buf);
         let plan = load_chunk_plan(root_buf);
 
@@ -5082,9 +5207,29 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         // Actively load the chosen model before the first image. LM Studio JIT-loads a cold model on
         // this poke; if it can't (model not downloaded, wrong token, server down) every image would
         // fail identically, so surface that now with the server's own message instead of grinding.
-        let warmed = model_lease::with_claim(app, &model, || {
-            warm_model(&agent, &endpoint, &model, api_key.as_deref())
-        });
+        //
+        // Abandonable like the descriptions themselves: loading a 26B model onto a cold card is
+        // tens of seconds during which the pass has not reached its loop, and a Stop pressed there
+        // used to sit until the load finished.
+        let warmed = {
+            let (agent, endpoint, model, api_key, app) =
+                (agent.clone(), endpoint.clone(), model.clone(), api_key.clone(), app.clone());
+            cancellable::until_cancelled(&is_cancelled, move || {
+                model_lease::with_claim(&app, &model, || {
+                    warm_model(&agent, &endpoint, &model, api_key.as_deref())
+                })
+            })
+        };
+        let warmed = match warmed {
+            Interrupted::Done(warmed) => warmed,
+            Interrupted::Cancelled => {
+                return Ok((
+                    "cancelled",
+                    Some("It was still loading the model, so nothing was described.".to_string()),
+                ));
+            }
+            Interrupted::Lost => Err("the warm-up worker ended without a result".to_string()),
+        };
         if let Err(error) = warmed {
             return Err(format!(
                 "Describe couldn't load the model \"{model}\". Pick a model that is downloaded in \
@@ -5100,13 +5245,31 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut last_endpoint_error: Option<String> = None;
         let mut results: Vec<(String, u32)> = Vec::new();
 
+        let mut abandoned: Option<String> = None;
+
         for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
-            if control.cancel.load(Ordering::SeqCst) {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
-            match describe_image(&agent, &endpoint, &model, api_key.as_deref(), DESCRIBE_PROMPT, Path::new(path)) {
-                Ok(description) => {
+            // The description is produced on a worker so Stop does not have to wait out a
+            // generation. Nothing here is written until the worker comes back, so an abandoned
+            // image has no description file and no `vision_desc_chars` — `pending_vision` offers it
+            // again on the next run, from the top.
+            let described = {
+                let (agent, endpoint, model, api_key, path) = (
+                    agent.clone(),
+                    endpoint.clone(),
+                    model.clone(),
+                    api_key.clone(),
+                    path.clone(),
+                );
+                cancellable::until_cancelled(&is_cancelled, move || {
+                    describe_image(&agent, &endpoint, &model, api_key.as_deref(), DESCRIBE_PROMPT, Path::new(&path))
+                })
+            };
+            match described {
+                Interrupted::Done(Ok(description)) => {
                     match write_vision_description(&desc_dir, hash, relative_path, name, title.as_deref(), &description, &model) {
                         Ok(chars) => {
                             described_ok += 1;
@@ -5118,11 +5281,20 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                         }
                     }
                 }
-                Err(error) => {
+                Interrupted::Done(Err(error)) => {
                     failures += 1;
                     endpoint_failures += 1;
                     eprintln!("Vision description failed for {path}: {error}");
                     last_endpoint_error = Some(error);
+                }
+                Interrupted::Cancelled => {
+                    cancelled = true;
+                    abandoned = Some(name.clone());
+                    break;
+                }
+                Interrupted::Lost => {
+                    failures += 1;
+                    eprintln!("Vision worker for {path} ended without a result.");
                 }
             }
             // Each request re-armed the endpoint's idle countdown, so the keep-alive has nothing to
@@ -5155,8 +5327,19 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         commit_vision_results(root_buf, &mut results)?;
         write_vision_index(root_buf, &desc_dir)?;
 
-        let described = total - failures;
-        let mut message = format!("Described {described} image{}.", if described == 1 { "" } else { "s" });
+        // Counted, not derived from `total`: a stopped run never reaches most of its queue, and
+        // `total - failures` would report the whole backlog as described.
+        let mut message = if cancelled {
+            format!(
+                "Described {described_ok} of {total} image{}.",
+                if total == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("Described {described_ok} image{}.", if described_ok == 1 { "" } else { "s" })
+        };
+        if let Some(name) = abandoned {
+            message.push_str(&format!(" “{name}” was mid-description and was discarded — it will be redone next run."));
+        }
         if failures > 0 {
             message.push_str(&format!(" {failures} failed (see logs; endpoint {endpoint})."));
         }
@@ -5322,6 +5505,7 @@ fn cancel_kind_classification(control: tauri::State<'_, KindControl>) -> Result<
 /// batch, so a cancel or a crash costs one batch rather than the whole run.
 fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
     let control = app.state::<KindControl>();
+    let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let settings = load_app_settings(app);
@@ -5366,18 +5550,15 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
         let mut failures = 0usize;
         let mut unparsed = 0usize;
 
+        // A Stop can land in two places now — between batches, and part-way through the model call
+        // an abandoned batch was waiting on — so the "stopped" exit is a flag the loop breaks with
+        // rather than two copies of the same save-and-return.
+        let mut stopped = false;
+
         for chunk in pending.chunks(kinds::DEFAULT_BATCH_SIZE) {
-            if control.cancel.load(Ordering::SeqCst) {
-                kinds_file.prompt_version = kinds::KIND_PROMPT_VERSION;
-                kinds_file.version = kinds::KIND_SCHEMA_VERSION;
-                kinds_file.generated_at = now_iso();
-                kinds_file.model = model.clone();
-                kinds_file.note = kinds::KINDS_NOTE.to_string();
-                kinds::save_kinds(root, &kinds_file)?;
-                return Ok((
-                    "cancelled",
-                    Some(format!("Stopped after {processed} of {total}.")),
-                ));
+            if is_cancelled() {
+                stopped = true;
+                break;
             }
 
             let mut scenes = Vec::with_capacity(chunk.len());
@@ -5396,9 +5577,32 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
 
             // Classify never warms first, so its own first batch can be the request that JIT-loads
             // the model — claim the lease here for the same reason Describe claims it at warm-up.
-            let batch = model_lease::with_claim(app, &model, || {
-                kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), &scenes)
-            });
+            //
+            // One batch is one model call, and `kinds_file` is only written after it returns, so an
+            // abandoned batch leaves every hash in it unlabelled and pending for the next run.
+            let batch = {
+                let (agent, endpoint, model, api_key, scenes, app) = (
+                    agent.clone(),
+                    endpoint.clone(),
+                    model.clone(),
+                    api_key.clone(),
+                    scenes.clone(),
+                    app.clone(),
+                );
+                cancellable::until_cancelled(&is_cancelled, move || {
+                    model_lease::with_claim(&app, &model, || {
+                        kinds::classify_batch(&agent, &endpoint, &model, api_key.as_deref(), &scenes)
+                    })
+                })
+            };
+            let batch = match batch {
+                Interrupted::Done(batch) => batch,
+                Interrupted::Cancelled => {
+                    stopped = true;
+                    break;
+                }
+                Interrupted::Lost => Err("the classify worker ended without a result".to_string()),
+            };
             match batch {
                 Ok(labels) => {
                     for (hash, label) in hashes.iter().zip(labels) {
@@ -5437,6 +5641,21 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
                     current_name: format!("{} classified", kinds_file.kinds.len()),
                 },
             );
+        }
+
+        if stopped {
+            // Stamp and save what the completed batches produced — a batch abandoned mid-call put
+            // nothing in here, so its hashes stay unclassified and the next run redoes them.
+            kinds_file.version = kinds::KIND_SCHEMA_VERSION;
+            kinds_file.prompt_version = kinds::KIND_PROMPT_VERSION;
+            kinds_file.generated_at = now_iso();
+            kinds_file.model = model.clone();
+            kinds_file.note = kinds::KINDS_NOTE.to_string();
+            kinds::save_kinds(root, &kinds_file)?;
+            return Ok((
+                "cancelled",
+                Some(format!("Stopped after {processed} of {total}.")),
+            ));
         }
 
         let filled = propagate_and_save_kinds(root, &mut kinds_file, &model)?;
@@ -6533,6 +6752,124 @@ mod geo_real_library_tests {
 // to it. Needs ICAT_GEO_LIBRARY (+ optional ICAT_KIND_SAMPLE, default 40); reads the endpoint,
 // model and token from the app's own saved settings so no secret is handled here.
 // `cargo test classify_kinds_sample -- --ignored --nocapture`
+#[cfg(test)]
+mod scan_stop_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("icat-scan-stop-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    /// A 2x2 PNG is enough: the scan only has to see a file it recognizes as an image.
+    fn write_image(root: &Path, name: &str) {
+        let buffer = image::RgbImage::from_pixel(2, 2, image::Rgb([9u8, 9, 9]));
+        buffer.save(root.join(name)).expect("write test image");
+    }
+
+    #[test]
+    fn a_scan_stopped_part_way_writes_nothing() {
+        let root = temp_root("aborts");
+        for index in 0..8 {
+            write_image(&root, &format!("shot-{index}.png"));
+        }
+
+        // Stop after the scan has looked at a couple of entries — the shape of a user pressing
+        // Stop during the minutes-long opening scan of a large root.
+        let seen = AtomicUsize::new(0);
+        let stop_after_two = || seen.fetch_add(1, Ordering::SeqCst) >= 2;
+
+        let outcome = scan_and_reconcile_cancellable(&root, &stop_after_two).expect("scan should not error");
+        assert!(outcome.is_none(), "a stopped scan must not hand back a library view");
+        assert!(
+            !root.join(SIDECAR_FILE_NAME).exists(),
+            "a stopped scan must leave the sidecar untouched, so the next run starts over"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_same_scan_completes_when_nothing_stops_it() {
+        let root = temp_root("completes");
+        for index in 0..8 {
+            write_image(&root, &format!("shot-{index}.png"));
+        }
+
+        let view = scan_and_reconcile_cancellable(&root, &|| false)
+            .expect("scan should not error")
+            .expect("an uninterrupted scan returns a view");
+        assert_eq!(view.images.len(), 8);
+        assert!(root.join(SIDECAR_FILE_NAME).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+// The claim the Stop button now makes, tested against a real socket: an endpoint that accepts the
+// request and then says nothing is the exact shape of a model still generating, and the pass must
+// come back from it in milliseconds rather than sitting out ureq's 300-second read timeout.
+#[cfg(test)]
+mod describe_stop_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    #[test]
+    fn a_stop_abandons_an_in_flight_description_instead_of_waiting_for_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub endpoint");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // Accept, then stall — no status line, no body. Closed after a few seconds only so the
+            // abandoned worker does not outlive the test binary.
+            if let Ok((mut stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = stream.write_all(b"HTTP/1.1 500 Gone
+Content-Length: 0
+
+");
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("icat-describe-stop-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let image_path = dir.join("frame.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([4u8, 4, 4]))
+            .save(&image_path)
+            .expect("write test image");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+        }
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let path = image_path.clone();
+        let started = Instant::now();
+        let outcome = cancellable::until_cancelled(&|| stop.load(Ordering::SeqCst), move || {
+            let agent = build_agent();
+            describe_image(&agent, &endpoint, "stub-model", None, DESCRIBE_PROMPT, &path)
+        });
+        let elapsed = started.elapsed();
+
+        assert!(matches!(outcome, Interrupted::Cancelled), "a stalled description must read as stopped");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Stop must not wait out the request (took {elapsed:?}; the read timeout alone is 300s)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod kind_sample_tests {
     use super::*;
