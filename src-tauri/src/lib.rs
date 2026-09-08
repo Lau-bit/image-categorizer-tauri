@@ -48,6 +48,10 @@ mod vision;
 use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROMPT};
 
 mod model_lease;
+
+/// Reads `local-llm-control`'s brake, so a pass stops when somebody stops the local model
+/// instead of restarting the load it just had aborted, once per remaining image.
+mod llm_brake;
 use model_lease::{IdleLeaseStatus, ModelLease};
 
 // Holds the nightly vision pass back while somebody else is using the GPU. Only the headless job
@@ -2606,6 +2610,12 @@ fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: b
                 topics::save(root, &file)?;
                 return Ok(("cancelled", Some(format!("Stopped after {processed} of {total}."))));
             }
+            // One bucket is one model call, so an unheeded brake here is one aborted load per
+            // remaining bucket. Same check, same reason, as Describe's loop.
+            if let Some(brake) = llm_brake::held() {
+                topics::save(root, &file)?;
+                return Ok(("cancelled", Some(brake.pass_message(processed, "bucket"))));
+            }
 
             let (prompt, sampled) = topics::prepare(
                 bucket,
@@ -2672,6 +2682,13 @@ fn run_topic_generation(app: &AppHandle, root: &Path, width_hours: u32, force: b
                     );
                 }
                 Err(error) => {
+                    // Uncached, for the reason Describe's failure path gives: the likeliest
+                    // cause of a model call failing right now is a position taken while it was
+                    // in flight, and carrying on would start the next load into the same wall.
+                    if let Some(brake) = llm_brake::held_now() {
+                        topics::save(root, &file)?;
+                        return Ok(("cancelled", Some(brake.pass_message(processed, "bucket"))));
+                    }
                     failures += 1;
                     eprintln!("Topic generation failed for {}: {error}", bucket.id);
                     let _ = app.emit(
@@ -4486,6 +4503,9 @@ fn run_headless_refresh(app: &AppHandle) {
             HeadlessVisionOutcome::SkippedGpuBusy => {
                 Some("Descriptions skipped — the GPU stayed busy.".to_string())
             }
+            HeadlessVisionOutcome::SkippedBraked(brake) => {
+                Some(format!("Descriptions skipped — {}", brake.message))
+            }
         }
     };
 
@@ -4553,6 +4573,11 @@ enum HeadlessVisionOutcome {
     /// The GPU never freed up inside the gate's budget, so the descriptions were left for the next
     /// run rather than forced onto a card somebody else is using.
     SkippedGpuBusy,
+    /// `local-llm-control` is holding a brake, so local model work is being stopped machine-wide.
+    /// Distinct from `SkippedGpuBusy` in the way that matters to whoever reads the summary: the
+    /// card is not busy, somebody deliberately closed it, and the run standing down is the
+    /// intended outcome rather than a missed slot.
+    SkippedBraked(llm_brake::Held),
 }
 
 /// Whether the vision model still has to be loaded onto the card.
@@ -4592,6 +4617,14 @@ fn run_headless_vision(
 ) -> HeadlessVisionOutcome {
     let cancelled = || app.state::<VisionControl>().cancel.load(Ordering::SeqCst);
     app.state::<VisionControl>().hit_time_limit.store(false, Ordering::SeqCst);
+
+    // Before the gate, because the gate would otherwise spend up to four hours waiting for a
+    // card that is free — a held brake is not a busy GPU, and the wait would end in a load that
+    // is aborted anyway. Checked again between roots below: a nightly slice runs for a while,
+    // and the position is most likely taken during it rather than before it.
+    if let Some(brake) = llm_brake::held() {
+        return HeadlessVisionOutcome::SkippedBraked(brake);
+    }
 
     if settings.auto_refresh_gpu_wait.unwrap_or(true) {
         set_run_phase(shared, "gpu-wait", "Waiting for the GPU to be free");
@@ -4640,6 +4673,12 @@ fn run_headless_vision(
         }
         if cancelled() {
             return HeadlessVisionOutcome::Cancelled;
+        }
+        // Each `run_vision_analysis` opens with a full `scan_and_reconcile` of its root — minutes
+        // on the big libraries — so letting the per-root passes discover the brake one at a time
+        // would pay that scan for every root to learn the same thing.
+        if let Some(brake) = llm_brake::held() {
+            return HeadlessVisionOutcome::SkippedBraked(brake);
         }
         let control = app.state::<VisionControl>();
         control.running.store(true, Ordering::SeqCst);
@@ -5202,6 +5241,13 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             return Ok(("completed", Some(message)));
         }
 
+        // Asked before the warm-up, because the warm-up IS a load and a held brake would abort
+        // it a couple of seconds in — leaving the user with LM Studio's "Engine protocol
+        // startup was aborted", which describes the symptom and names nobody.
+        if let Some(brake) = llm_brake::held() {
+            return Ok(("cancelled", Some(format!("{} Nothing was described.", brake.message))));
+        }
+
         let agent = build_agent();
 
         // Actively load the chosen model before the first image. LM Studio JIT-loads a cold model on
@@ -5246,9 +5292,20 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let mut results: Vec<(String, u32)> = Vec::new();
 
         let mut abandoned: Option<String> = None;
+        // Set when the pass stood down because somebody is holding the brake, so the summary can
+        // say who stopped it instead of reporting a Stop nobody pressed.
+        let mut braked: Option<llm_brake::Held> = None;
 
         for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
             if is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            // Cached for a second, so this costs nothing against a generation that takes tens.
+            // Checked EVERY item, not once at the top: a brake pressed mid-pass is the case
+            // that used to grind through the whole remaining queue starting a load per image.
+            if let Some(brake) = llm_brake::held() {
+                braked = Some(brake);
                 cancelled = true;
                 break;
             }
@@ -5282,6 +5339,15 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
                     }
                 }
                 Interrupted::Done(Err(error)) => {
+                    // Ask WITHOUT the cache: a position taken while this very request was in
+                    // flight is the likeliest explanation for the failure, and a cached "no
+                    // brake" from a second ago is exactly the answer that sends the pass on to
+                    // the next image — i.e. straight into starting another load to be aborted.
+                    if let Some(brake) = llm_brake::held_now() {
+                        braked = Some(brake);
+                        cancelled = true;
+                        break;
+                    }
                     failures += 1;
                     endpoint_failures += 1;
                     eprintln!("Vision description failed for {path}: {error}");
@@ -5326,6 +5392,20 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
         commit_vision_results(root_buf, &mut results)?;
         write_vision_index(root_buf, &desc_dir)?;
+
+        // A brake is not a Stop and must not read as one: nobody pressed anything in this app,
+        // and "Described 412 of 7809 images." with no cause is how a held brake gets mistaken
+        // for a crash. Returned before the ordinary summary so the widget's sentence leads.
+        if let Some(brake) = braked {
+            let mut message = brake.pass_message(described_ok, "description");
+            if !brake.enforced {
+                message.push_str(
+                    " (Local LLM Control could not find lms.exe, so it is not actually \
+                     enforcing that position.)",
+                );
+            }
+            return Ok(("cancelled", Some(message)));
+        }
 
         // Counted, not derived from `total`: a stopped run never reaches most of its queue, and
         // `total - failures` would report the whole backlog as described.
@@ -5554,9 +5634,19 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
         // an abandoned batch was waiting on — so the "stopped" exit is a flag the loop breaks with
         // rather than two copies of the same save-and-return.
         let mut stopped = false;
+        // Set when the brake is what ended the run, so the summary names it rather than
+        // reporting a Stop nobody pressed.
+        let mut braked: Option<llm_brake::Held> = None;
 
         for chunk in pending.chunks(kinds::DEFAULT_BATCH_SIZE) {
             if is_cancelled() {
+                stopped = true;
+                break;
+            }
+            // One batch is one model call, and Classify never warms — so with a brake held,
+            // every remaining batch would start a load of its own to have it aborted.
+            if let Some(brake) = llm_brake::held() {
+                braked = Some(brake);
                 stopped = true;
                 break;
             }
@@ -5616,6 +5706,14 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
                     }
                 }
                 Err(error) => {
+                    // Uncached: a batch that just failed is most likely one whose load was
+                    // aborted, and the fail-fast below cannot catch it once anything has been
+                    // classified — the same hole Describe had.
+                    if let Some(brake) = llm_brake::held_now() {
+                        braked = Some(brake);
+                        stopped = true;
+                        break;
+                    }
                     failures += 1;
                     // A dead endpoint would otherwise burn through every batch failing identically.
                     if failures >= VISION_FAIL_FAST_ATTEMPTS && kinds_file.kinds.is_empty() {
@@ -5652,10 +5750,11 @@ fn run_kind_classification(app: &AppHandle, root: &Path, force: bool) {
             kinds_file.model = model.clone();
             kinds_file.note = kinds::KINDS_NOTE.to_string();
             kinds::save_kinds(root, &kinds_file)?;
-            return Ok((
-                "cancelled",
-                Some(format!("Stopped after {processed} of {total}.")),
-            ));
+            let message = match braked {
+                Some(brake) => brake.pass_message(kinds_file.kinds.len(), "label"),
+                None => format!("Stopped after {processed} of {total}."),
+            };
+            return Ok(("cancelled", Some(message)));
         }
 
         let filled = propagate_and_save_kinds(root, &mut kinds_file, &model)?;
