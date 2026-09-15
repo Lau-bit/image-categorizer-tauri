@@ -45,7 +45,7 @@ mod chunker;
 use chunker::{build_plan, clean_title, ChunkPlan};
 
 mod vision;
-use vision::{build_agent, describe_image, list_models, warm_model, DESCRIBE_PROMPT};
+use vision::{build_agent, list_models, warm_model, DESCRIBE_PROMPT};
 
 mod model_lease;
 
@@ -252,6 +252,12 @@ struct ImageRecord {
     // image as already described; the prose itself lives in the descriptions sidecar folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vision_desc_chars: Option<u32>,
+    // Vision pass: when this image was set aside for taking the model server down twice — once at
+    // the normal size and again at the reduced retry size. `pending_vision` leaves it out of every
+    // later pass (a forced re-describe still tries it), because an image that kills the server
+    // would otherwise do it again every night. Cleared when a description is finally saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vision_quarantined_at: Option<String>,
     // Size and mtime of the file at `last_known_path` when its hash was last computed. A scan
     // reuses the stored hash whenever both still match, so unchanged files are never re-read —
     // see `hash_index`. Absent on records written before this cache existed; those re-hash once.
@@ -454,6 +460,8 @@ struct PendingAnalysis {
     vision_skipped_explicit: usize,
     vision_skipped_video: usize,
     vision_skipped_category: usize,
+    /// Set aside for taking the model server down twice — see `ImageRecord::vision_quarantined_at`.
+    vision_skipped_quarantined: usize,
 }
 
 impl Default for PendingAnalysis {
@@ -466,6 +474,7 @@ impl Default for PendingAnalysis {
             vision_skipped_explicit: 0,
             vision_skipped_video: 0,
             vision_skipped_category: 0,
+            vision_skipped_quarantined: 0,
         }
     }
 }
@@ -1144,10 +1153,31 @@ fn commit_vision_results(root: &Path, results: &mut Vec<(String, u32)>) -> Resul
         for (hash, chars) in results.iter() {
             if let Some(record) = config.images.get_mut(hash) {
                 record.vision_desc_chars = Some(*chars);
+                // A forced re-describe that finally got through lifts the quarantine it overrode.
+                record.vision_quarantined_at = None;
             }
         }
     })?;
     results.clear();
+    Ok(())
+}
+
+/// Records images the Describe pass set aside for taking the model server down twice. Committed the
+/// moment it is decided, like a description, so a Stop straight afterwards cannot lose it and let the
+/// next night take the server down on the same picture again.
+fn commit_vision_quarantine(root: &Path, hashes: &mut Vec<String>) -> Result<(), String> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let at = now_iso();
+    commit_analysis(root, |config| {
+        for hash in hashes.iter() {
+            if let Some(record) = config.images.get_mut(hash) {
+                record.vision_quarantined_at = Some(at.clone());
+            }
+        }
+    })?;
+    hashes.clear();
     Ok(())
 }
 
@@ -1689,6 +1719,8 @@ struct VisionSkips {
     /// the Explicit pass unlocks rather than work that is done.
     unscored: usize,
     category: usize,
+    /// Set aside after taking the model server down at both sizes (`vision_quarantined_at`).
+    quarantined: usize,
 }
 
 /// Images the vision model still has to describe, plus the tally of what was skipped and why.
@@ -1749,6 +1781,20 @@ fn pending_vision<'a>(
             }
         })
         .filter(|image| {
+            // An image that took the model server down at both sizes is not offered again — least of
+            // all the next night, which is exactly when it would do it again. A forced re-describe
+            // still tries it: that is a person asking.
+            let quarantined = !force
+                && config
+                    .images
+                    .get(&image.hash)
+                    .is_some_and(|record| record.vision_quarantined_at.is_some());
+            if quarantined {
+                skips.quarantined += 1;
+            }
+            !quarantined
+        })
+        .filter(|image| {
             force
                 || config
                     .images
@@ -1800,6 +1846,7 @@ fn pending_analysis(view: &LibraryView, config: &LibraryConfig, plan: Option<&Ch
         vision_skipped_explicit: skips.explicit,
         vision_skipped_video: skips.video,
         vision_skipped_category: skips.category,
+        vision_skipped_quarantined: skips.quarantined,
     }
 }
 
@@ -4490,23 +4537,34 @@ fn run_headless_refresh(app: &AppHandle) {
         // already happened answers it for free.
         Some("Nothing to describe.".to_string())
     } else {
-        match run_headless_vision(app, &settings, &roots, &shared) {
-            HeadlessVisionOutcome::Ran => Some("Descriptions run.".to_string()),
+        let mut tally = VisionTally::default();
+        let outcome = run_headless_vision(app, &settings, &roots, &shared, &mut tally);
+        let skipped = matches!(
+            outcome,
+            HeadlessVisionOutcome::SkippedGpuBusy | HeadlessVisionOutcome::SkippedBraked(_)
+        );
+        let mut note = match outcome {
+            HeadlessVisionOutcome::Ran => "Descriptions run.".to_string(),
             HeadlessVisionOutcome::Cancelled => {
                 cancelled = true;
-                Some("Descriptions cancelled.".to_string())
+                "Descriptions cancelled.".to_string()
             }
-            HeadlessVisionOutcome::HitTimeLimit => Some(format!(
+            HeadlessVisionOutcome::HitTimeLimit => format!(
                 "Descriptions stopped at the {}-minute limit; the rest is left for the next run.",
                 vision_limit_minutes(&settings)
-            )),
-            HeadlessVisionOutcome::SkippedGpuBusy => {
-                Some("Descriptions skipped — the GPU stayed busy.".to_string())
-            }
-            HeadlessVisionOutcome::SkippedBraked(brake) => {
-                Some(format!("Descriptions skipped — {}", brake.message))
-            }
+            ),
+            HeadlessVisionOutcome::SkippedGpuBusy => "Descriptions skipped — the GPU stayed busy.".to_string(),
+            HeadlessVisionOutcome::SkippedBraked(brake) => format!("Descriptions skipped — {}", brake.message),
+        };
+        // How the pass ended is only half of it. A night that stopped at its limit after 40 crashes
+        // and a night that described 1,200 images cleanly both used to read "stopped at the
+        // 120-minute limit". A skip before anything ran has nothing to count, so it adds nothing;
+        // a brake between roots can come after real work, which it does report.
+        if !(skipped && tally.is_empty()) {
+            note.push(' ');
+            note.push_str(&tally.sentence());
         }
+        Some(note)
     };
 
     let no_work = !cancelled
@@ -4609,11 +4667,14 @@ fn vision_model_needs_loading(settings: &AppSettings) -> bool {
 /// Called only from the nightly job. The interactive Describe button has no gate on purpose: a user
 /// pressing it is asking for the GPU deliberately, and making them wait behind their own game would
 /// be absurd. It is the unattended run that has to be a good neighbour.
+///
+/// Every root's pass adds its counts to `tally`, whichever way the run then ends.
 fn run_headless_vision(
     app: &AppHandle,
     settings: &AppSettings,
     roots: &[String],
     shared: &Arc<Mutex<auto_run::RunState>>,
+    tally: &mut VisionTally,
 ) -> HeadlessVisionOutcome {
     let cancelled = || app.state::<VisionControl>().cancel.load(Ordering::SeqCst);
     app.state::<VisionControl>().hit_time_limit.store(false, Ordering::SeqCst);
@@ -4682,7 +4743,7 @@ fn run_headless_vision(
         }
         let control = app.state::<VisionControl>();
         control.running.store(true, Ordering::SeqCst);
-        run_vision_analysis(app, &PathBuf::from(root), false);
+        tally.add(run_vision_analysis(app, &PathBuf::from(root), false));
         if hit_limit() {
             return HeadlessVisionOutcome::HitTimeLimit;
         }
@@ -5148,7 +5209,9 @@ fn analyze_vision(
     };
     control.cancel.store(false, Ordering::SeqCst);
     let app_handle = app.clone();
-    std::thread::spawn(move || run_vision_analysis(&app_handle, &root_buf, force));
+    std::thread::spawn(move || {
+        run_vision_analysis(&app_handle, &root_buf, force);
+    });
     Ok(())
 }
 
@@ -5171,9 +5234,272 @@ fn cancel_vision_analysis(control: tauri::State<'_, VisionControl>) -> Result<()
 // minutes, so every long-running step here — the scan, the warm-up, each description — is
 // abandoned rather than waited out (`cancellable`). The abandoned image is written nowhere, which
 // is what makes it simply pending again next time.
-fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+/// How long the Describe pass waits for the model server to answer again after it went down under an
+/// image. LM Studio takes a few seconds to notice a llama.cpp abort and ~8 s to reload the 26B model,
+/// so a crash costs ~20 s here; three minutes is where it has stopped being a crash.
+const ENGINE_RECOVERY_LIMIT: Duration = Duration::from_secs(180);
+/// Pause before the first "are you back?" poke, doubling up to `ENGINE_RETRY_MAX_DELAY`.
+const ENGINE_RETRY_FIRST_DELAY: Duration = Duration::from_secs(2);
+const ENGINE_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
+/// Longest one poke may take, model load included. The poke runs on an abandonable worker and is
+/// given up on after this even if its socket never times out: on 2026-09-15 a request LM Studio
+/// accepted while the model was being unloaded under it was never answered at all, and the pass sat
+/// on it for over an hour.
+const ENGINE_PROBE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// What asking the model server "are you still there?" after a failed description found.
+enum EngineCheck {
+    /// It answered at once with the model resident: the failure belonged to the image, and there
+    /// is nothing to wait for.
+    Healthy,
+    /// It had gone down (or dropped the model) and is answering again now.
+    Recovered,
+    /// Still not answering after `ENGINE_RECOVERY_LIMIT`; carries the last thing it said.
+    Down(String),
+    Braked(llm_brake::Held),
+    Cancelled,
+}
+
+/// What became of one image once the retry rules had their say.
+enum DescribeOutcome {
+    Described { description: String, retried_smaller: bool },
+    /// Failed with the server still up — the image's own problem (unreadable file, empty reply) — or
+    /// had the model taken away from it more than `INTERRUPTED_RETRIES` times. Left for the next run,
+    /// as it always was.
+    Failed(String),
+    /// Took the server down at `vision::MAX_EDGE` and again at `vision::RETRY_MAX_EDGE`.
+    Quarantined(String),
+    /// The server went down and did not come back inside `ENGINE_RECOVERY_LIMIT`.
+    ServerDown(String),
+    Braked(llm_brake::Held),
+    Cancelled,
+    Lost,
+}
+
+/// What one Describe pass did, in numbers. The GUI reads the same facts in the pass's own message;
+/// this is what lets the nightly summary say them too — until 2026-09-15 it reported only how the
+/// pass ENDED ("stopped at the 120-minute limit"), never how many failed or were set aside.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct VisionTally {
+    described: usize,
+    /// Left for the next run: the image's own trouble, a save that failed, or interrupted twice.
+    failed: usize,
+    /// Set aside for taking the model server down at both sizes. Disjoint from `failed`.
+    set_aside: usize,
+    /// Described, but only at `vision::RETRY_MAX_EDGE`.
+    smaller: usize,
+    /// Times the model went away under an image and the pass waited for it to come back.
+    outages: usize,
+    /// The pass ended with an error — a server that never came back, a model that would not load.
+    ended_early: Option<String>,
+}
+
+impl VisionTally {
+    fn add(&mut self, other: VisionTally) {
+        self.described += other.described;
+        self.failed += other.failed;
+        self.set_aside += other.set_aside;
+        self.smaller += other.smaller;
+        self.outages += other.outages;
+        if other.ended_early.is_some() {
+            self.ended_early = other.ended_early;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == VisionTally::default()
+    }
+
+    /// "212 described, 3 failed, 1 set aside for crashing the model server; the model server went
+    /// down 4 times." — zeros left out, except the one number every summary owes.
+    fn sentence(&self) -> String {
+        let mut parts = vec![format!("{} described", self.described)];
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if self.set_aside > 0 {
+            parts.push(format!("{} set aside for crashing the model server", self.set_aside));
+        }
+        if self.smaller > 0 {
+            parts.push(format!("{} only at the smaller retry size", self.smaller));
+        }
+        let mut sentence = parts.join(", ");
+        if self.outages > 0 {
+            sentence.push_str(&format!(
+                "; the model server went down {} time{}",
+                self.outages,
+                if self.outages == 1 { "" } else { "s" }
+            ));
+        }
+        sentence.push('.');
+        if let Some(error) = &self.ended_early {
+            // The pass's own error runs to several sentences and repeats these counts; its first
+            // sentence is the part that says what happened.
+            let first = error.find(". ").map_or(error.as_str(), |end| &error[..=end]);
+            sentence.push_str(&format!(" Ended early — {first}"));
+        }
+        sentence
+    }
+}
+
+/// How many times one image is tried again, at the same size, after the model was taken away from
+/// it by something other than the image (`failure_is_not_the_images`). Once survives a stray unload;
+/// an image interrupted again is left for the next run like any ordinary failure — never set aside.
+const INTERRUPTED_RETRIES: usize = 1;
+
+/// Whether a failed description says, in its own words, that the image is not what went wrong.
+///
+/// What qualifies was measured, not guessed:
+/// - LM Studio's replies when the model is taken away (`lms unload`, an agent freeing the GPU,
+///   another app's eviction): "Model unloaded by user or API request." to a request in flight
+///   (server log 2026-09-02, `lms-cli` unloading mid-request), "Model is unloaded" to one behind it,
+///   and "Engine protocol startup was aborted" when the unload lands on a JIT load (2026-09-08).
+///   A llama.cpp abort answers "Channel Error" instead (4,092 of them 2026-09-13..15), or "fetch
+///   failed". The brake causes that last phrase too, but `describe_with_recovery` asks about the
+///   brake before it ever gets here.
+/// - Our own wall-clock deadline (`cancellable::NO_ANSWER`): a request nobody answered. An image
+///   that kills the engine is answered at once; silence is the server's state, not the picture's.
+///
+/// Without this, an unload during an image's smaller retry was booked as its second crash and set an
+/// innocent image aside for good. That is the 2026-09-15 06:30 shape: a real crash at 06:30:02, then
+/// the pdfreader TTS agent's `lms unload` at 06:30:16 while the model was reloading for the retry.
+fn failure_is_not_the_images(error: &str) -> bool {
+    const TAKEN_AWAY: [&str; 3] = [
+        "unloaded by user or api request",
+        "model is unloaded",
+        "engine protocol startup was aborted",
+    ];
+    let lower = error.to_ascii_lowercase();
+    TAKEN_AWAY.iter().any(|phrase| lower.contains(phrase)) || error.starts_with(cancellable::NO_ANSWER)
+}
+
+/// One image through the Describe rules, with the model calls passed in so the rules can be tested
+/// without a server.
+///
+/// A failure is followed by `check_engine` before anything else, because what to do next depends
+/// entirely on whether the server survived it. Until 2026-09-15 every failure moved straight on to the
+/// next image. When the failure was llama.cpp aborting on an oversized image, that fired the next ~36
+/// images into a dead server within two seconds, each failing instantly — on 2026-09-15 1,434 of the
+/// night's 1,744 requests went that way, across 40 aborts — and none of those images, the culprit
+/// included, was recorded, so the next night met the same culprits again. Now the pass waits for the
+/// server, retries the same image once at `vision::RETRY_MAX_EDGE`, and sets it aside if it takes the
+/// server down a second time.
+///
+/// Only an outage the image could have caused counts toward that. One whose own error says the model
+/// was taken away from it (`failure_is_not_the_images`) buys the image a retry at the SAME size and
+/// books nothing against it.
+fn describe_with_recovery(
+    mut describe: impl FnMut(u32) -> Interrupted<Result<String, String>>,
+    mut check_engine: impl FnMut() -> EngineCheck,
+    mut brake_now: impl FnMut() -> Option<llm_brake::Held>,
+) -> DescribeOutcome {
+    let mut retried_smaller = false;
+    let mut interrupted = 0;
+    loop {
+        let edge = if retried_smaller { vision::RETRY_MAX_EDGE } else { vision::MAX_EDGE };
+        let error = match describe(edge) {
+            Interrupted::Done(Ok(description)) => {
+                return DescribeOutcome::Described { description, retried_smaller };
+            }
+            Interrupted::Done(Err(error)) => error,
+            Interrupted::Cancelled => return DescribeOutcome::Cancelled,
+            Interrupted::Lost => return DescribeOutcome::Lost,
+        };
+        // Asked WITHOUT the cache, and before the server check: a position taken while this very
+        // request was in flight is the likeliest explanation for the failure, and waiting for a
+        // server that somebody deliberately stopped is the one wrong move available here.
+        if let Some(brake) = brake_now() {
+            return DescribeOutcome::Braked(brake);
+        }
+        let not_the_images = failure_is_not_the_images(&error);
+        match check_engine() {
+            // Taken away from it rather than brought down by it: the same image again, same size.
+            // `Healthy` qualifies too — whoever unloaded the model may have reloaded it already.
+            EngineCheck::Healthy | EngineCheck::Recovered
+                if not_the_images && interrupted < INTERRUPTED_RETRIES =>
+            {
+                interrupted += 1;
+            }
+            EngineCheck::Healthy => return DescribeOutcome::Failed(error),
+            // Interrupted yet again. Still not evidence against the picture, however often it
+            // happens, so it is left for the next run rather than set aside.
+            EngineCheck::Recovered if not_the_images => return DescribeOutcome::Failed(error),
+            EngineCheck::Recovered if !retried_smaller => retried_smaller = true,
+            EngineCheck::Recovered => return DescribeOutcome::Quarantined(error),
+            EngineCheck::Down(last) => return DescribeOutcome::ServerDown(last),
+            EngineCheck::Braked(brake) => return DescribeOutcome::Braked(brake),
+            EngineCheck::Cancelled => return DescribeOutcome::Cancelled,
+        }
+    }
+}
+
+/// Finds out whether the model server survived a failed description and, if it did not, waits for it
+/// to come back.
+///
+/// Residency alone cannot answer that. Right after llama.cpp aborts, LM Studio still lists the model
+/// as `loaded` for a few seconds while answering every request with "Channel Error"; once it has
+/// cleaned up, the model is just `not-loaded`, and nothing reloads it until somebody asks. So this
+/// asks: a 1-token completion, which fails fast on a dead engine and JIT-loads a missing model.
+/// `Healthy` needs both halves — the first poke answered AND the model was not missing before it —
+/// because a poke that had to load the model proves the server had lost it.
+fn check_model_server(
+    app: &AppHandle,
+    agent: &ureq::Agent,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+    rest_models_url: Option<&str>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> EngineCheck {
+    let resident = rest_models_url
+        .map(|url| vision::model_state(&vision::build_probe_agent(), url, model, api_key))
+        .unwrap_or(vision::ModelState::Unknown);
+    let started = std::time::Instant::now();
+    let mut delay = ENGINE_RETRY_FIRST_DELAY;
+    let mut first = true;
+    loop {
+        if let Some(brake) = llm_brake::held() {
+            return EngineCheck::Braked(brake);
+        }
+        let poked = {
+            let (app, agent, endpoint, model, api_key) =
+                (app.clone(), agent.clone(), endpoint.to_string(), model.to_string(), api_key.map(str::to_string));
+            cancellable::until_cancelled_or_deadline(is_cancelled, ENGINE_PROBE_DEADLINE, move || {
+                model_lease::with_claim(&app, &model, || warm_model(&agent, &endpoint, &model, api_key.as_deref()))
+            })
+        };
+        let last = match poked {
+            Interrupted::Done(Ok(())) => {
+                return if first && resident != vision::ModelState::NotLoaded {
+                    EngineCheck::Healthy
+                } else {
+                    EngineCheck::Recovered
+                };
+            }
+            Interrupted::Done(Err(error)) => error,
+            Interrupted::Cancelled => return EngineCheck::Cancelled,
+            Interrupted::Lost => "the probe worker ended without a result".to_string(),
+        };
+        first = false;
+        if started.elapsed() >= ENGINE_RECOVERY_LIMIT {
+            return EngineCheck::Down(last);
+        }
+        // Slept in slices, so a Stop or the nightly time limit is answered within a tenth of a second.
+        let wake = std::time::Instant::now() + delay;
+        while std::time::Instant::now() < wake {
+            if is_cancelled() {
+                return EngineCheck::Cancelled;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        delay = (delay * 2).min(ENGINE_RETRY_MAX_DELAY);
+    }
+}
+
+fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionTally {
     let control = app.state::<VisionControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
+    let mut tally = VisionTally::default();
 
     let result = (|| -> Result<(&'static str, Option<String>), String> {
         let settings = load_app_settings(app);
@@ -5196,6 +5522,7 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             explicit: skipped_explicit,
             unscored: skipped_unscored,
             category: skipped_category,
+            quarantined: skipped_quarantined,
         } = skips;
 
         let pending: Vec<(String, String, String, String, Option<String>)> = eligible
@@ -5233,6 +5560,9 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             if skipped_category > 0 {
                 notes.push(format!("{skipped_category} in omitted categories"));
             }
+            if skipped_quarantined > 0 {
+                notes.push(format!("{skipped_quarantined} set aside for crashing the model server"));
+            }
             let message = if notes.is_empty() {
                 "No images needed description.".to_string()
             } else {
@@ -5256,11 +5586,12 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         //
         // Abandonable like the descriptions themselves: loading a 26B model onto a cold card is
         // tens of seconds during which the pass has not reached its loop, and a Stop pressed there
-        // used to sit until the load finished.
+        // used to sit until the load finished. Bounded like every other model call here: a load LM
+        // Studio accepts and then drops is otherwise waited on for ever.
         let warmed = {
             let (agent, endpoint, model, api_key, app) =
                 (agent.clone(), endpoint.clone(), model.clone(), api_key.clone(), app.clone());
-            cancellable::until_cancelled(&is_cancelled, move || {
+            cancellable::until_cancelled_or_deadline(&is_cancelled, vision::REQUEST_DEADLINE, move || {
                 model_lease::with_claim(&app, &model, || {
                     warm_model(&agent, &endpoint, &model, api_key.as_deref())
                 })
@@ -5285,8 +5616,6 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         let mut cancelled = false;
-        let mut failures = 0usize;
-        let mut described_ok = 0usize;
         let mut endpoint_failures = 0usize;
         let mut last_endpoint_error: Option<String> = None;
         let mut results: Vec<(String, u32)> = Vec::new();
@@ -5295,6 +5624,13 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         // Set when the pass stood down because somebody is holding the brake, so the summary can
         // say who stopped it instead of reporting a Stop nobody pressed.
         let mut braked: Option<llm_brake::Held> = None;
+
+        // The model-server side of a failure (see `describe_with_recovery`). Outages, smaller
+        // retries and set-asides are counted in `tally`; these are the images still to be written
+        // as set aside, and the reason the pass stopped if the server never came back.
+        let rest_models_url = vision_rest_models_url(&settings);
+        let mut quarantined: Vec<String> = Vec::new();
+        let mut server_down: Option<String> = None;
 
         for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
             if is_cancelled() {
@@ -5313,53 +5649,99 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
             // generation. Nothing here is written until the worker comes back, so an abandoned
             // image has no description file and no `vision_desc_chars` — `pending_vision` offers it
             // again on the next run, from the top.
-            let described = {
-                let (agent, endpoint, model, api_key, path) = (
-                    agent.clone(),
-                    endpoint.clone(),
-                    model.clone(),
-                    api_key.clone(),
-                    path.clone(),
-                );
-                cancellable::until_cancelled(&is_cancelled, move || {
-                    describe_image(&agent, &endpoint, &model, api_key.as_deref(), DESCRIBE_PROMPT, Path::new(&path))
-                })
-            };
-            match described {
-                Interrupted::Done(Ok(description)) => {
+            let outcome = describe_with_recovery(
+                |edge| {
+                    let (agent, endpoint, model, api_key, path) =
+                        (agent.clone(), endpoint.clone(), model.clone(), api_key.clone(), path.clone());
+                    // Wall clock, not the socket: see `cancellable::until_cancelled_or_deadline`.
+                    let attempt = cancellable::until_cancelled_or_deadline(&is_cancelled, vision::REQUEST_DEADLINE, {
+                        let path = path.clone();
+                        move || {
+                            vision::describe_image(
+                                &agent,
+                                &endpoint,
+                                &model,
+                                api_key.as_deref(),
+                                DESCRIBE_PROMPT,
+                                Path::new(&path),
+                                edge,
+                            )
+                        }
+                    });
+                    // Every failed attempt, in the server's own words: the recovery rules decide on
+                    // that text, so the log is where a wrong decision can be traced.
+                    if let Interrupted::Done(Err(error)) = &attempt {
+                        eprintln!("Describe attempt for {path} at {edge} px failed: {error}");
+                    }
+                    attempt
+                },
+                || {
+                    let check = check_model_server(
+                        app,
+                        &agent,
+                        &endpoint,
+                        &model,
+                        api_key.as_deref(),
+                        rest_models_url.as_deref(),
+                        &is_cancelled,
+                    );
+                    if matches!(check, EngineCheck::Recovered) {
+                        tally.outages += 1;
+                        eprintln!("The model server went down while describing {path}; it is answering again.");
+                    }
+                    check
+                },
+                llm_brake::held_now,
+            );
+            match outcome {
+                DescribeOutcome::Described { description, retried_smaller: smaller } => {
+                    if smaller {
+                        tally.smaller += 1;
+                        eprintln!("Described {path} at {} px after the full-size attempt took the server down.", vision::RETRY_MAX_EDGE);
+                    }
                     match write_vision_description(&desc_dir, hash, relative_path, name, title.as_deref(), &description, &model) {
                         Ok(chars) => {
-                            described_ok += 1;
+                            tally.described += 1;
                             results.push((hash.clone(), chars));
                         }
                         Err(error) => {
-                            failures += 1;
+                            tally.failed += 1;
                             eprintln!("Failed to save description for {path}: {error}");
                         }
                     }
                 }
-                Interrupted::Done(Err(error)) => {
-                    // Ask WITHOUT the cache: a position taken while this very request was in
-                    // flight is the likeliest explanation for the failure, and a cached "no
-                    // brake" from a second ago is exactly the answer that sends the pass on to
-                    // the next image — i.e. straight into starting another load to be aborted.
-                    if let Some(brake) = llm_brake::held_now() {
-                        braked = Some(brake);
-                        cancelled = true;
-                        break;
-                    }
-                    failures += 1;
+                DescribeOutcome::Failed(error) => {
+                    tally.failed += 1;
                     endpoint_failures += 1;
                     eprintln!("Vision description failed for {path}: {error}");
                     last_endpoint_error = Some(error);
                 }
-                Interrupted::Cancelled => {
+                DescribeOutcome::Quarantined(error) => {
+                    tally.set_aside += 1;
+                    quarantined.push(hash.clone());
+                    eprintln!(
+                        "Set aside {path}: it took the model server down at {} px and again at {} px. Last error: {error}",
+                        vision::MAX_EDGE,
+                        vision::RETRY_MAX_EDGE
+                    );
+                }
+                DescribeOutcome::ServerDown(last) => {
+                    eprintln!("The model server went down while describing {path} and did not come back: {last}");
+                    server_down = Some(last);
+                    break;
+                }
+                DescribeOutcome::Braked(brake) => {
+                    braked = Some(brake);
+                    cancelled = true;
+                    break;
+                }
+                DescribeOutcome::Cancelled => {
                     cancelled = true;
                     abandoned = Some(name.clone());
                     break;
                 }
-                Interrupted::Lost => {
-                    failures += 1;
+                DescribeOutcome::Lost => {
+                    tally.failed += 1;
                     eprintln!("Vision worker for {path} ended without a result.");
                 }
             }
@@ -5369,13 +5751,14 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
             // Commit each result promptly so a stop resumes with at most the in-flight image redone.
             commit_vision_results(root_buf, &mut results)?;
+            commit_vision_quarantine(root_buf, &mut quarantined)?;
 
             // Fail fast: if the first few requests all bounce off the endpoint with nothing
             // described, the model is unloaded, the server is down, or the API token is wrong —
             // grinding through (and re-encoding) every remaining image would just fail identically.
             // Abort loudly with the server's own error so the user can fix it, instead of the old
             // behaviour of silent slow progress the run never recovers from.
-            if described_ok == 0 && endpoint_failures >= VISION_FAIL_FAST_ATTEMPTS {
+            if tally.described == 0 && endpoint_failures >= VISION_FAIL_FAST_ATTEMPTS {
                 let reason = last_endpoint_error.unwrap_or_else(|| "unknown error".to_string());
                 return Err(format!(
                     "Describe aborted: the vision endpoint failed on the first {endpoint_failures} \
@@ -5391,7 +5774,19 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         commit_vision_results(root_buf, &mut results)?;
+        commit_vision_quarantine(root_buf, &mut quarantined)?;
         write_vision_index(root_buf, &desc_dir)?;
+
+        let described_ok = tally.described;
+        if let Some(reason) = server_down {
+            return Err(format!(
+                "Describe stopped: the model server went down and was still not answering after {} \
+                 minutes. Described {described_ok} image{} before that; the rest is left for the next \
+                 run. Last error: {reason}",
+                ENGINE_RECOVERY_LIMIT.as_secs() / 60,
+                if described_ok == 1 { "" } else { "s" }
+            ));
+        }
 
         // A brake is not a Stop and must not read as one: nobody pressed anything in this app,
         // and "Described 412 of 7809 images." with no cause is how a held brake gets mistaken
@@ -5420,8 +5815,25 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         if let Some(name) = abandoned {
             message.push_str(&format!(" “{name}” was mid-description and was discarded — it will be redone next run."));
         }
-        if failures > 0 {
-            message.push_str(&format!(" {failures} failed (see logs; endpoint {endpoint})."));
+        if tally.failed > 0 {
+            message.push_str(&format!(" {} failed (see logs; endpoint {endpoint}).", tally.failed));
+        }
+        if tally.outages > 0 {
+            message.push_str(&format!(
+                " The model server went down {} time{} and was waited for each time.",
+                tally.outages,
+                if tally.outages == 1 { "" } else { "s" }
+            ));
+        }
+        if tally.smaller > 0 {
+            message.push_str(&format!(" {} described at the smaller retry size.", tally.smaller));
+        }
+        if tally.set_aside > 0 {
+            message.push_str(&format!(
+                " {} set aside for taking the server down twice — not offered again unless you force \
+                 a re-describe.",
+                tally.set_aside
+            ));
         }
         if skipped_category > 0 {
             message.push_str(&format!(" {skipped_category} omitted by category."));
@@ -5432,9 +5844,13 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
     control.running.store(false, Ordering::SeqCst);
     let (status, message) = match result {
         Ok((status, message)) => (status.to_string(), message),
-        Err(error) => ("error".to_string(), Some(error)),
+        Err(error) => {
+            tally.ended_early = Some(error.clone());
+            ("error".to_string(), Some(error))
+        }
     };
     let _ = app.emit("vision-analysis-finished", TextAnalysisFinished { status, message });
+    tally
 }
 
 // =================================================================================================
@@ -6362,6 +6778,32 @@ mod pending_selection_tests {
     }
 
     #[test]
+    fn describe_leaves_quarantined_images_out_unless_forced() {
+        let mut config = LibraryConfig::default();
+        config.images.insert("crasher".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            vision_quarantined_at: Some("2026-09-15T08:00:00Z".to_string()),
+            ..Default::default()
+        });
+        config.images.insert("fine".to_string(), ImageRecord {
+            nsfw_score: Some(0.0),
+            ..Default::default()
+        });
+        let view = library_view(
+            vec![image("crasher", "2026-01/a.png", "2026-01"), image("fine", "2026-01/b.png", "2026-01")],
+            &["2026-01"],
+        );
+
+        let (pending, skips) = pending_vision(&view, &config, None, false);
+        let hashes: Vec<&str> = pending.iter().map(|image| image.hash.as_str()).collect();
+        assert_eq!(hashes, vec!["fine"]);
+        assert_eq!(skips.quarantined, 1, "the skip has to be countable, like every other reason");
+
+        let (forced, _) = pending_vision(&view, &config, None, true);
+        assert_eq!(forced.len(), 2, "a forced re-describe is a person asking, so it tries the crasher too");
+    }
+
+    #[test]
     fn describe_reports_where_its_missing_images_went() {
         // The four reasons Describe's queue is shorter than the library, each of which has to be
         // countable — "3 to describe" out of thousands reads as a bug until the skips explain it.
@@ -6955,17 +7397,261 @@ Content-Length: 0
         let started = Instant::now();
         let outcome = cancellable::until_cancelled(&|| stop.load(Ordering::SeqCst), move || {
             let agent = build_agent();
-            describe_image(&agent, &endpoint, "stub-model", None, DESCRIBE_PROMPT, &path)
+            vision::describe_image(&agent, &endpoint, "stub-model", None, DESCRIBE_PROMPT, &path, vision::MAX_EDGE)
         });
         let elapsed = started.elapsed();
 
         assert!(matches!(outcome, Interrupted::Cancelled), "a stalled description must read as stopped");
         assert!(
             elapsed < Duration::from_secs(2),
-            "Stop must not wait out the request (took {elapsed:?}; the read timeout alone is 300s)"
+            "Stop must not wait out the request (took {elapsed:?}; the socket timeout alone is minutes)"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The 2026-09-15 06:30 shape: the endpoint takes the request and never answers, and nobody
+    /// presses Stop. The deadline has to end it — as a failure the recovery rules do not blame on the
+    /// image, never as a Stop nobody pressed.
+    #[test]
+    fn a_description_nobody_answers_ends_at_the_deadline_and_is_not_blamed_on_the_image() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub endpoint");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = stream.write_all(b"HTTP/1.1 500 Gone\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("icat-describe-deadline-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let image_path = dir.join("frame.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([4u8, 4, 4]))
+            .save(&image_path)
+            .expect("write test image");
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let path = image_path.clone();
+        let started = Instant::now();
+        let outcome = cancellable::until_cancelled_or_deadline(&|| false, Duration::from_millis(300), move || {
+            vision::describe_image(&build_agent(), &endpoint, "stub-model", None, DESCRIBE_PROMPT, &path, vision::MAX_EDGE)
+        });
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Interrupted::Done(Err(error)) => assert!(failure_is_not_the_images(&error), "{error}"),
+            _ => panic!("an unanswered description must come back as a failure, not as a Stop"),
+        }
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod describe_recovery_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Runs the rules against scripted answers: `replies` are what each describe attempt returns,
+    /// `checks` what the server check finds after each failure. Returns the outcome, the edge each
+    /// attempt was sent at, and how many server checks were made.
+    fn run(replies: Vec<Result<&str, &str>>, checks: Vec<EngineCheck>) -> (DescribeOutcome, Vec<u32>, usize) {
+        let replies = RefCell::new(replies.into_iter());
+        let checks = RefCell::new(checks.into_iter());
+        let edges = RefCell::new(Vec::new());
+        let mut checked = 0;
+        let outcome = describe_with_recovery(
+            |edge| {
+                edges.borrow_mut().push(edge);
+                match replies.borrow_mut().next().expect("an attempt nobody scripted") {
+                    Ok(text) => Interrupted::Done(Ok(text.to_string())),
+                    Err(error) => Interrupted::Done(Err(error.to_string())),
+                }
+            },
+            || {
+                checked += 1;
+                checks.borrow_mut().next().expect("a server check nobody scripted")
+            },
+            || None,
+        );
+        (outcome, edges.into_inner(), checked)
+    }
+
+    #[test]
+    fn a_description_that_works_is_sent_once_at_full_size() {
+        let (outcome, edges, checked) = run(vec![Ok("a desk")], vec![]);
+        assert!(matches!(outcome, DescribeOutcome::Described { retried_smaller: false, .. }));
+        assert_eq!(edges, vec![vision::MAX_EDGE]);
+        assert_eq!(checked, 0, "a success never asks after the server");
+    }
+
+    #[test]
+    fn a_failure_with_the_server_up_is_the_images_own_and_is_not_retried() {
+        let (outcome, edges, _) = run(vec![Err("empty reply")], vec![EngineCheck::Healthy]);
+        assert!(matches!(outcome, DescribeOutcome::Failed(_)));
+        assert_eq!(edges, vec![vision::MAX_EDGE]);
+    }
+
+    /// The case that burned ~36 images per crash: the server died under the image. The pass must
+    /// wait for it and try THIS image again, smaller — not move on to the next one.
+    #[test]
+    fn a_server_that_went_down_is_waited_for_and_the_same_image_retried_smaller() {
+        let (outcome, edges, _) = run(vec![Err("Channel Error"), Ok("a desk")], vec![EngineCheck::Recovered]);
+        assert!(matches!(outcome, DescribeOutcome::Described { retried_smaller: true, .. }));
+        assert_eq!(edges, vec![vision::MAX_EDGE, vision::RETRY_MAX_EDGE]);
+    }
+
+    #[test]
+    fn an_image_that_takes_the_server_down_at_both_sizes_is_set_aside() {
+        let (outcome, edges, checked) = run(
+            vec![Err("Channel Error"), Err("Channel Error")],
+            vec![EngineCheck::Recovered, EngineCheck::Recovered],
+        );
+        assert!(matches!(outcome, DescribeOutcome::Quarantined(_)));
+        assert_eq!(edges, vec![vision::MAX_EDGE, vision::RETRY_MAX_EDGE], "exactly one retry, never a third attempt");
+        assert_eq!(checked, 2);
+    }
+
+    /// Only a second CRASH sets an image aside. A retry that fails some other way with the server
+    /// up is an ordinary failure, left for the next run like any other.
+    #[test]
+    fn a_retry_that_fails_with_the_server_up_is_a_plain_failure_not_a_quarantine() {
+        let (outcome, _, _) = run(
+            vec![Err("Channel Error"), Err("empty reply")],
+            vec![EngineCheck::Recovered, EngineCheck::Healthy],
+        );
+        assert!(matches!(outcome, DescribeOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn a_server_that_never_comes_back_ends_the_image_as_server_down() {
+        let (outcome, edges, _) = run(vec![Err("Channel Error")], vec![EngineCheck::Down("refused".to_string())]);
+        assert!(matches!(outcome, DescribeOutcome::ServerDown(ref last) if last == "refused"));
+        assert_eq!(edges.len(), 1, "no retry is sent into a server that is not answering");
+    }
+
+    #[test]
+    fn a_brake_after_a_failure_stands_down_without_waiting_for_the_server() {
+        let outcome = describe_with_recovery(
+            |_| Interrupted::Done(Err("Engine protocol startup was aborted".to_string())),
+            || panic!("a held brake must not be waited out"),
+            || {
+                Some(llm_brake::Held {
+                    mode: "halt".to_string(),
+                    message: "Local LLM Control is holding local model work.".to_string(),
+                    enforced: true,
+                })
+            },
+        );
+        assert!(matches!(outcome, DescribeOutcome::Braked(_)));
+    }
+
+    #[test]
+    fn a_stop_during_the_wait_is_a_stop() {
+        let (outcome, _, _) = run(vec![Err("Channel Error")], vec![EngineCheck::Cancelled]);
+        assert!(matches!(outcome, DescribeOutcome::Cancelled));
+    }
+
+    /// LM Studio's own words for a request whose model was unloaded under it.
+    const UNLOADED: &str = "http://localhost:1234/v1/chat/completions returned HTTP 400: \
+                            {\"error\":\"Model unloaded by user or API request.\"}";
+
+    #[test]
+    fn only_words_that_say_the_model_was_taken_away_clear_the_image() {
+        assert!(failure_is_not_the_images(UNLOADED));
+        assert!(failure_is_not_the_images("… returned HTTP 400: Model is unloaded."));
+        assert!(failure_is_not_the_images(
+            "… returned HTTP 400: Failed to load model \"x\". Error: Engine protocol startup was aborted."
+        ));
+        assert!(failure_is_not_the_images(&format!("{} 300 s", cancellable::NO_ANSWER)));
+        // What a crash, and the image's own trouble, actually say.
+        assert!(!failure_is_not_the_images("… returned HTTP 500: {\"error\":\"Channel Error\"}"));
+        assert!(!failure_is_not_the_images("Engine protocol predict request failed: fetch failed"));
+        assert!(!failure_is_not_the_images("The model returned an empty description (finish_reason: stop)"));
+    }
+
+    /// The case that set innocent images aside: a real crash, then somebody unloads the model during
+    /// the smaller retry. That outage is not the image's, so it is tried again at the same smaller
+    /// size and never set aside.
+    #[test]
+    fn an_unload_during_the_smaller_retry_is_not_a_second_crash() {
+        let (outcome, edges, _) = run(
+            vec![Err("Channel Error"), Err(UNLOADED), Ok("a desk")],
+            vec![EngineCheck::Recovered, EngineCheck::Recovered],
+        );
+        assert!(matches!(outcome, DescribeOutcome::Described { retried_smaller: true, .. }));
+        assert_eq!(edges, vec![vision::MAX_EDGE, vision::RETRY_MAX_EDGE, vision::RETRY_MAX_EDGE]);
+    }
+
+    #[test]
+    fn an_unload_at_full_size_is_retried_at_full_size() {
+        let (outcome, edges, _) = run(vec![Err(UNLOADED), Ok("a desk")], vec![EngineCheck::Recovered]);
+        assert!(matches!(outcome, DescribeOutcome::Described { retried_smaller: false, .. }));
+        assert_eq!(edges, vec![vision::MAX_EDGE, vision::MAX_EDGE]);
+    }
+
+    #[test]
+    fn an_unload_after_the_free_retry_still_never_sets_the_image_aside() {
+        let (outcome, edges, _) = run(
+            vec![Err("Channel Error"), Err(UNLOADED), Err(UNLOADED)],
+            vec![EngineCheck::Recovered, EngineCheck::Recovered, EngineCheck::Recovered],
+        );
+        assert!(matches!(outcome, DescribeOutcome::Failed(_)));
+        assert_eq!(edges.len(), 3, "one free retry, not a loop against somebody unloading on repeat");
+    }
+
+    /// An unanswered request is retried even when the server looks fine by the time it is checked:
+    /// the image never got an answer either way, and a plain failure would drop it for nothing.
+    #[test]
+    fn a_request_nobody_answered_is_tried_once_more_even_with_the_server_up() {
+        let unanswered = format!("{} 300 s", cancellable::NO_ANSWER);
+        let (outcome, edges, _) = run(vec![Err(&unanswered), Ok("a desk")], vec![EngineCheck::Healthy]);
+        assert!(matches!(outcome, DescribeOutcome::Described { retried_smaller: false, .. }));
+        assert_eq!(edges, vec![vision::MAX_EDGE, vision::MAX_EDGE]);
+    }
+
+    #[test]
+    fn the_nightly_counts_say_what_failed_and_what_was_set_aside() {
+        let tally = VisionTally { described: 212, failed: 3, set_aside: 1, smaller: 2, outages: 4, ended_early: None };
+        assert_eq!(
+            tally.sentence(),
+            "212 described, 3 failed, 1 set aside for crashing the model server, 2 only at the smaller \
+             retry size; the model server went down 4 times."
+        );
+        assert_eq!(VisionTally { described: 5, ..Default::default() }.sentence(), "5 described.");
+    }
+
+    #[test]
+    fn a_pass_that_ended_early_says_why_in_one_sentence() {
+        let tally = VisionTally {
+            described: 7,
+            ended_early: Some(
+                "Describe stopped: the model server went down and was still not answering after 3 \
+                 minutes. Described 7 images before that; the rest is left for the next run. Last \
+                 error: refused"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            tally.sentence(),
+            "7 described. Ended early — Describe stopped: the model server went down and was still not \
+             answering after 3 minutes."
+        );
+    }
+
+    #[test]
+    fn tallies_from_several_folders_add_up() {
+        let mut total = VisionTally::default();
+        assert!(total.is_empty());
+        total.add(VisionTally { described: 10, failed: 1, outages: 2, ..Default::default() });
+        total.add(VisionTally { described: 5, set_aside: 1, ended_early: Some("x".to_string()), ..Default::default() });
+        assert_eq!(
+            total,
+            VisionTally { described: 15, failed: 1, set_aside: 1, smaller: 0, outages: 2, ended_early: Some("x".to_string()) }
+        );
     }
 }
 
@@ -7314,7 +8000,15 @@ mod e2e_tests {
             let my_desc = my_description_for(&image.name);
             fs::write(&resp_file, my_desc).unwrap();
 
-            let returned = describe_image(&agent, &endpoint, model, None, DESCRIBE_PROMPT, Path::new(&image.path))
+            let returned = vision::describe_image(
+                &agent,
+                &endpoint,
+                model,
+                None,
+                DESCRIBE_PROMPT,
+                Path::new(&image.path),
+                vision::MAX_EDGE,
+            )
                 .expect("describe_image should reach the stub");
             assert_eq!(returned.trim(), my_desc.trim(), "round-trip must return exactly what the model produced");
 

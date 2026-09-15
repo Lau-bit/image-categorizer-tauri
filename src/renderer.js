@@ -3431,7 +3431,8 @@ function renderAnalysisPending() {
       `Describe skips: ${formatCount(pending.visionSkippedUnscored)} not yet Explicit-analyzed, `
       + `${formatCount(pending.visionSkippedExplicit)} explicit, `
       + `${formatCount(pending.visionSkippedVideo)} deduped video frames, `
-      + `${formatCount(pending.visionSkippedCategory)} in omitted categories`,
+      + `${formatCount(pending.visionSkippedCategory)} in omitted categories, `
+      + `${formatCount(pending.visionSkippedQuarantined)} set aside for crashing the model server`,
     );
   }
   lines.push('Counted at the last scan — press Rescan to take in files added since.');
@@ -4772,14 +4773,17 @@ function renderDashboardCoverage(stats) {
   const skips = state.library?.pending;
   if (skips) {
     const skipped = (skips.visionSkippedVideo || 0) + (skips.visionSkippedExplicit || 0)
-      + (skips.visionSkippedCategory || 0) + (skips.visionSkippedUnscored || 0);
+      + (skips.visionSkippedCategory || 0) + (skips.visionSkippedUnscored || 0)
+      + (skips.visionSkippedQuarantined || 0);
     if (skipped > 0) {
       container.append(dashCaption(
         `Describe leaves ${formatCount(skipped)} images alone on purpose: `
         + `${formatCount(skips.visionSkippedVideo)} duplicate video frames, `
         + `${formatCount(skips.visionSkippedCategory)} in omitted categories, `
         + `${formatCount(skips.visionSkippedExplicit)} explicit, `
-        + `${formatCount(skips.visionSkippedUnscored)} not yet scored. They are not counted above.`));
+        + `${formatCount(skips.visionSkippedUnscored)} not yet scored, `
+        + `${formatCount(skips.visionSkippedQuarantined)} set aside for crashing the model server. `
+        + 'They are not counted above.'));
     }
   }
 }

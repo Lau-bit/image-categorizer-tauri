@@ -23,11 +23,15 @@
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the waiting side re-reads the cancel flag. Small enough that Stop feels immediate,
 /// large enough that waiting costs nothing while a pass grinds.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How every error from [`until_cancelled_or_deadline`] begins, so a caller can tell "nobody
+/// answered" apart from anything the server actually said.
+pub const NO_ANSWER: &str = "no answer within";
 
 /// What came back from [`until_cancelled`].
 pub enum Interrupted<T> {
@@ -87,6 +91,34 @@ where
     }
 }
 
+/// [`until_cancelled`] with a wall-clock ceiling: past `deadline` the work is abandoned exactly as a
+/// Stop would abandon it, but it comes back as `Done(Err(..))` naming the deadline, because nobody
+/// stopped anything — the other end just never answered.
+///
+/// Why a socket timeout is not enough: on 2026-09-15 LM Studio accepted a request while the model
+/// was being unloaded under it and then never answered it at all. ureq's read timeout never fired,
+/// and the nightly pass sat on that one request for 75 minutes. This bound does not depend on the
+/// socket doing anything.
+///
+/// A Stop that lands at the same moment as the deadline is still reported as `Cancelled`.
+pub fn until_cancelled_or_deadline<T, F>(
+    is_cancelled: &dyn Fn() -> bool,
+    deadline: Duration,
+    work: F,
+) -> Interrupted<Result<T, String>>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let started = Instant::now();
+    match until_cancelled(&|| is_cancelled() || started.elapsed() >= deadline, work) {
+        Interrupted::Cancelled if !is_cancelled() => {
+            Interrupted::Done(Err(format!("{NO_ANSWER} {} s", deadline.as_secs())))
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +169,32 @@ mod tests {
     fn a_panicking_worker_is_lost_not_cancelled() {
         let outcome = until_cancelled::<(), _>(&|| false, || panic!("worker died"));
         assert!(matches!(outcome, Interrupted::Lost));
+    }
+
+    #[test]
+    fn work_nobody_answers_ends_at_the_deadline_as_an_error_not_a_stop() {
+        let started = Instant::now();
+        let outcome = until_cancelled_or_deadline(&|| false, Duration::from_millis(150), || {
+            // Stands in for the request LM Studio accepted and never answered.
+            thread::sleep(Duration::from_secs(30));
+            Ok::<_, String>("described")
+        });
+        match outcome {
+            Interrupted::Done(Err(error)) => assert!(error.starts_with(NO_ANSWER), "{error}"),
+            _ => panic!("a deadline must read as a failure the caller can act on, never as a Stop"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn work_that_answers_in_time_is_untouched_by_the_deadline() {
+        let outcome = until_cancelled_or_deadline(&|| false, Duration::from_secs(30), || Ok::<_, String>(7u32));
+        assert!(matches!(outcome, Interrupted::Done(Ok(7))));
+    }
+
+    #[test]
+    fn a_stop_is_still_a_stop_when_a_deadline_is_set() {
+        let outcome = until_cancelled_or_deadline(&|| true, Duration::from_secs(30), || Ok::<_, String>(()));
+        assert!(matches!(outcome, Interrupted::Cancelled));
     }
 }

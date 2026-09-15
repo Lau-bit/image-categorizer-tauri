@@ -17,7 +17,18 @@ use image::ExtendedColorType;
 
 /// Longest edge (px) the image is downscaled to before sending. Big enough to keep a title bar and
 /// road signs legible to the model, small enough to keep the request light.
-const MAX_EDGE: u32 = 1280;
+pub const MAX_EDGE: u32 = 1280;
+
+/// Longest edge (px) for the single retry an image gets after the model server went down while it
+/// was being described.
+///
+/// Gemma 4's vision tower spends roughly one token per 48×48 px, and llama.cpp aborts the whole
+/// server when one image's tokens exceed the micro-batch (`n_ubatch`, LM Studio's default 512) —
+/// "non-causal attention requires n_ubatch >= n_tokens". A 1280×720 screenshot is ~380 tokens and
+/// fine; a near-square 1280×1024 region capture is ~570 and takes the server down. At 896 even a
+/// square image is ~350 tokens, under 512 with room to spare, so the retry survives on a server
+/// that was never reconfigured.
+pub const RETRY_MAX_EDGE: u32 = 896;
 const JPEG_QUALITY: u8 = 82;
 
 /// Completion-token ceiling per description. Deliberately generous: modern local vision models
@@ -106,12 +117,12 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Loads `path`, downscales it to fit `MAX_EDGE`, and returns a `data:image/jpeg;base64,...` URL.
-fn image_to_jpeg_data_url(path: &Path) -> Result<String, String> {
+/// Loads `path`, downscales it to fit `max_edge`, and returns a `data:image/jpeg;base64,...` URL.
+fn image_to_jpeg_data_url(path: &Path, max_edge: u32) -> Result<String, String> {
     let img = image::open(path).map_err(|e| format!("Cannot open image: {e}"))?;
     let (w, h) = (img.width(), img.height());
-    let img = if w.max(h) > MAX_EDGE {
-        let scale = MAX_EDGE as f32 / w.max(h) as f32;
+    let img = if w.max(h) > max_edge {
+        let scale = max_edge as f32 / w.max(h) as f32;
         let nw = ((w as f32 * scale) as u32).max(1);
         let nh = ((h as f32 * scale) as u32).max(1);
         img.resize(nw, nh, image::imageops::FilterType::Triangle)
@@ -132,13 +143,24 @@ fn image_to_jpeg_data_url(path: &Path) -> Result<String, String> {
     Ok(format!("data:image/jpeg;base64,{}", base64_encode(&buffer)))
 }
 
-/// A ureq agent with sane timeouts for a local model. Connection is quick; a big vision request can
-/// legitimately take a couple of minutes, so the read timeout is generous but bounded (a hung server
-/// must not wedge the pass forever).
+/// Longest one model request may take, end to end. A big vision request can legitimately take a
+/// couple of minutes; one that has not answered in five has not been answered at all.
+///
+/// The Describe pass enforces this itself, on the wall clock (`cancellable::until_cancelled_or_deadline`),
+/// because the socket cannot be trusted to: on 2026-09-15 a request LM Studio accepted during a model
+/// reload was never answered, and the old 300 s *read* timeout never fired.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(300);
+
+/// A ureq agent with sane timeouts for a local model. Connection is quick; the rest of the request
+/// gets an OVERALL ceiling rather than a per-read one — a per-read timeout bounds neither the upload
+/// of the image nor a server that trickles bytes, and `.timeout` covers writes too. It sits a little
+/// past [`REQUEST_DEADLINE`] on purpose: the wall-clock bound in the pass fires first and says what
+/// happened in its own words, and this one lets the abandoned worker thread end instead of holding
+/// its socket forever.
 pub fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(300))
+        .timeout(REQUEST_DEADLINE + Duration::from_secs(30))
         .build()
 }
 
@@ -157,6 +179,10 @@ pub fn build_probe_agent() -> ureq::Agent {
 /// `api_key`, when `Some`, is sent as an `Authorization: Bearer <key>` header — LM Studio rejects
 /// every request with `invalid_api_key` when its "Require API token" auth is on and no token is
 /// supplied, so this is what makes the pass work against a token-protected server.
+///
+/// `max_edge` is the longest edge the picture is downscaled to: [`MAX_EDGE`] normally,
+/// [`RETRY_MAX_EDGE`] for the Describe pass's one smaller retry after an image took the model
+/// server down.
 pub fn describe_image(
     agent: &ureq::Agent,
     endpoint: &str,
@@ -164,8 +190,9 @@ pub fn describe_image(
     api_key: Option<&str>,
     prompt: &str,
     path: &Path,
+    max_edge: u32,
 ) -> Result<String, String> {
-    let data_url = image_to_jpeg_data_url(path)?;
+    let data_url = image_to_jpeg_data_url(path, max_edge)?;
 
     let body = with_idle_ttl(serde_json::json!({
         "model": model,
@@ -416,7 +443,7 @@ mod tests {
         };
         let token = std::env::var("ICAT_LIVE_TOKEN").ok();
         let agent = build_agent();
-        let result = describe_image(&agent, &endpoint, &model, token.as_deref(), DESCRIBE_PROMPT, std::path::Path::new(&image));
+        let result = describe_image(&agent, &endpoint, &model, token.as_deref(), DESCRIBE_PROMPT, std::path::Path::new(&image), MAX_EDGE);
         match result {
             Ok(text) => {
                 eprintln!("LIVE DESCRIBE OK ({} chars):\n{text}", text.len());
@@ -484,6 +511,52 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
+    /// Decodes standard padded base64 — the inverse of `base64_encode`, for tests only.
+    fn base64_decode(text: &str) -> Vec<u8> {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let value = |c: u8| TABLE.iter().position(|&t| t == c).expect("base64 character") as u32;
+        let mut out = Vec::new();
+        for chunk in text.as_bytes().chunks(4) {
+            let pad = chunk.iter().filter(|&&c| c == b'=').count();
+            let n = chunk
+                .iter()
+                .take(4 - pad)
+                .enumerate()
+                .fold(0u32, |acc, (i, &c)| acc | (value(c) << (18 - 6 * i)));
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        out
+    }
+
+    /// The retry exists to put fewer image tokens in front of the model, so it has to actually send
+    /// a smaller picture — a square 1280 capture at the retry edge arrives as 896×896.
+    #[test]
+    fn the_retry_edge_really_sends_a_smaller_picture() {
+        let dir = std::env::temp_dir().join(format!("icat-retry-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("square.png");
+        image::RgbImage::from_pixel(1280, 1280, image::Rgb([40u8, 90, 160]))
+            .save(&path)
+            .expect("write test image");
+
+        let size_at = |edge| {
+            let url = image_to_jpeg_data_url(&path, edge).expect("encode");
+            let bytes = base64_decode(&url["data:image/jpeg;base64,".len()..]);
+            let decoded = image::load_from_memory(&bytes).expect("a JPEG the endpoint could read");
+            (decoded.width(), decoded.height())
+        };
+        assert_eq!(size_at(MAX_EDGE), (1280, 1280));
+        assert_eq!(size_at(RETRY_MAX_EDGE), (RETRY_MAX_EDGE, RETRY_MAX_EDGE));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Env-gated (needs ICAT_TEST_TITLE_IMAGE): proves the image actually re-encodes to a JPEG data
     // URL the endpoint would accept — everything up to the HTTP call.
     #[test]
@@ -492,7 +565,7 @@ mod tests {
             eprintln!("skipping jpeg data-url test: ICAT_TEST_TITLE_IMAGE not set");
             return;
         };
-        let url = image_to_jpeg_data_url(std::path::Path::new(&path)).expect("should encode a data URL");
+        let url = image_to_jpeg_data_url(std::path::Path::new(&path), MAX_EDGE).expect("should encode a data URL");
         assert!(url.starts_with("data:image/jpeg;base64,"), "wrong prefix: {}", &url[..40.min(url.len())]);
 
         let payload = &url["data:image/jpeg;base64,".len()..];
