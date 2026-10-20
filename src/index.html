@@ -91,6 +91,12 @@
           <span>Extracted Text</span>
           <span class="count-pill" id="text-count">0</span>
         </button>
+        <!-- What the analysis is made of, step by step: which steps are rules and which are models,
+             how much each has left, and how long that would take. No pill — like the Dashboard it
+             counts nothing of its own. -->
+        <button class="nav-item" id="analysis-tab" type="button">
+          <span>Analysis</span>
+        </button>
         <!-- The pill counts what the NEXT scheduled run would have to process, so the sidebar
              answers "is anything queued for tonight" without opening anything. -->
         <button class="nav-item" id="automation-tab" type="button">
@@ -490,6 +496,57 @@
           </div>
         </section>
 
+        <!-- Analysis. The passes the Analyze row runs, opened up: each step's method, whether it is a
+             rule, OCR, a trained classifier or a language model, how much of the chosen scope it
+             has done, and how long the rest — or a redo of all of it — would take at the speed this
+             machine actually ran it. Counted off the sidecar rather than the disk, so opening it
+             is instant; the Automation panel makes the same trade for the same reason.
+
+             The K-pop card is the category's own accounting: what put each frame there, and the
+             titles learned from frames sorted into it by hand. -->
+        <section class="pipe-view hidden" id="pipe-view">
+          <div class="pipe-toolbar">
+            <span class="pipe-label">Scope</span>
+            <select id="pipe-scope-kind" class="pipe-select" title="Which images the counts and the Run buttons cover">
+              <option value="all">Whole library</option>
+              <option value="category">One category…</option>
+              <option value="folder">One folder…</option>
+            </select>
+            <select id="pipe-scope-value" class="pipe-select hidden" title="Pick the category or folder"></select>
+            <button id="pipe-run-pending-button" class="button" type="button"
+                    title="Run every step that has something left in this scope, in pipeline order">Run everything pending</button>
+            <button id="pipe-refresh-button" class="button secondary" type="button"
+                    title="Re-count from the library's records">Refresh</button>
+            <span class="pipe-toolbar-spacer"></span>
+            <span class="pipe-asof" id="pipe-asof"></span>
+          </div>
+
+          <div class="pipe-legend" id="pipe-legend">
+            <span class="pipe-kind is-rule">Rule</span><span>deterministic, instant, re-applied on every save</span>
+            <span class="pipe-kind is-ocr">OCR</span><span>Windows' built-in text recognition — same input, same result</span>
+            <span class="pipe-kind is-classifier">Classifier</span><span>a trained model with a fixed output — AI, but repeatable</span>
+            <span class="pipe-kind is-llm">LLM</span><span>a language model on the GPU — AI, and its wording varies run to run</span>
+          </div>
+
+          <div class="pipe-steps" id="pipe-steps"></div>
+          <div class="pipe-totals" id="pipe-totals"></div>
+
+          <div class="pipe-cards">
+            <div class="pipe-card">
+              <h2>Classification rules</h2>
+              <div id="pipe-rules"></div>
+            </div>
+            <div class="pipe-card">
+              <h2>K-pop — what put frames there</h2>
+              <div id="pipe-kpop-reasons"></div>
+            </div>
+            <div class="pipe-card pipe-card-wide">
+              <h2>K-pop titles learned from your sorting</h2>
+              <div id="pipe-kpop-learned"></div>
+            </div>
+          </div>
+        </section>
+
         <!-- Automation. Same shape as the geo and text panels — its own scroll container, sticky
              toolbar bleeding into the gutters — so all three behave identically when they swap
              places with the grid.
@@ -592,6 +649,19 @@
                   </div>
                 </label>
 
+                <label class="settings-stack">
+                  <span class="settings-label">Stop reading titles after</span>
+                  <div class="auto-time-row">
+                    <input
+                      id="auto-refresh-titles-minutes-input"
+                      class="dialog-input auto-minutes-input"
+                      type="number" min="0" max="1440" step="5"
+                      title="How long one run may spend reading video titles. A larger backlog is left for the next run, which continues where this one stopped. 0 means no limit."
+                    >
+                    <span class="auto-inline-hint">minutes per run · <strong>0 = no limit</strong></span>
+                  </div>
+                </label>
+
                 <div class="settings-stack">
                   <span class="settings-label">Folders to refresh</span>
                   <div class="manual-folder-list" id="auto-refresh-root-list"></div>
@@ -607,6 +677,10 @@
                     <label class="check-row">
                       <input id="auto-refresh-text-analysis-input" type="checkbox">
                       <span>Text analysis (Low/High Text)</span>
+                    </label>
+                    <label class="check-row" title="Reads the window title band of each new screenshot (English, plus Korean when that Windows OCR language is installed). Groups video frames so Describe samples a few per video, and fills the K-pop category.">
+                      <input id="auto-refresh-titles-input" type="checkbox">
+                      <span>Video titles (grouping, K-pop)</span>
                     </label>
                     <label class="check-row">
                       <input id="auto-refresh-text-extraction-input" type="checkbox">

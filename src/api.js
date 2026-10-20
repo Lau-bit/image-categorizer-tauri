@@ -68,8 +68,13 @@ window.categorizerAPI = {
   // property of the machine, not of a folder.
   getCaptureActivity: days => invoke('get_capture_activity', { days }),
 
+  // `scope` on every analyze call below narrows a pass to one category or folder ({ category } /
+  // { folder }; a category of '' means unclassified). Omitted or null = the whole library, which is
+  // what the Analyze row always asks for. It never widens a pass: excluded folders and categories
+  // stay excluded.
+
   // Text (OCR) analysis
-  analyzeText: (root, force) => invoke('analyze_text', { root, force }),
+  analyzeText: (root, force, scope = null) => invoke('analyze_text', { root, force, scope }),
   cancelTextAnalysis: () => invoke('cancel_text_analysis'),
   setTextThresholds: (root, wordThreshold, areaThreshold) =>
     invoke('set_text_thresholds', { root, wordThreshold, areaThreshold }),
@@ -84,8 +89,8 @@ window.categorizerAPI = {
   // `indexedOnly` narrows a run to the categories the text index covers. The Analyze row passes
   // false (extract everything outstanding); the Extracted Text panel passes true, so the count it
   // offered is exactly the work that runs.
-  extractText: (root, force, indexedOnly = false) =>
-    invoke('extract_text', { root, force, indexedOnly }),
+  extractText: (root, force, indexedOnly = false, scope = null) =>
+    invoke('extract_text', { root, force, indexedOnly, scope }),
   cancelTextExtraction: () => invoke('cancel_text_extraction'),
   onTextExtractionProgress: callback => event.listen('text-extraction-progress', message => callback(message.payload)),
   onTextExtractionFinished: callback => event.listen('text-extraction-finished', message => callback(message.payload)),
@@ -110,7 +115,7 @@ window.categorizerAPI = {
   onTopicsFinished: callback => event.listen('topics-finished', message => callback(message.payload)),
 
   // NSFW (explicit content) analysis
-  analyzeNsfw: (root, force) => invoke('analyze_nsfw', { root, force }),
+  analyzeNsfw: (root, force, scope = null) => invoke('analyze_nsfw', { root, force, scope }),
   cancelNsfwAnalysis: () => invoke('cancel_nsfw_analysis'),
   setNsfwThreshold: (root, threshold) => invoke('set_nsfw_threshold', { root, threshold }),
   getNsfwModelInfo: () => invoke('get_nsfw_model_info'),
@@ -120,7 +125,7 @@ window.categorizerAPI = {
 
   // Video de-duplication: OCR the title bar, group frames by video, sample N. Produces a standalone
   // chunk plan file the vision pass then reads.
-  buildChunkPlan: (root, force) => invoke('build_chunk_plan', { root, force }),
+  buildChunkPlan: (root, force, scope = null) => invoke('build_chunk_plan', { root, force, scope }),
   cancelChunkScan: () => invoke('cancel_chunk_scan'),
   getChunkPlan: root => invoke('get_chunk_plan', { root }),
   regenerateChunkPlan: root => invoke('regenerate_chunk_plan', { root }),
@@ -129,7 +134,7 @@ window.categorizerAPI = {
   onChunkScanFinished: callback => event.listen('chunk-scan-finished', message => callback(message.payload)),
 
   // Vision descriptions (images → words) via a local OpenAI-compatible model.
-  analyzeVision: (root, force) => invoke('analyze_vision', { root, force }),
+  analyzeVision: (root, force, scope = null) => invoke('analyze_vision', { root, force, scope }),
   cancelVisionAnalysis: () => invoke('cancel_vision_analysis'),
   getVisionSettings: () => invoke('get_vision_settings'),
   setVisionSettings: (endpoint, model, apiKey, idleUnload, idleMinutes) =>
@@ -184,6 +189,19 @@ window.categorizerAPI = {
   // stay separate calls so the user sees them happen.
   reviewGeoSets: root => invoke('review_geo_sets', { root }),
   applyGeoReview: (root, fixes) => invoke('apply_geo_review', { root, fixes }),
+
+  // Analysis panel. Counted off the sidecar, never the disk, so it answers at once. `preview`
+  // re-applies the classification rules in memory; `apply` saves the result (what a scan ends with).
+  getPipelineOverview: (root, scope = null) => invoke('get_pipeline_overview', { root, scope }),
+  previewRules: root => invoke('preview_rules', { root }),
+  applyRulesNow: root => invoke('apply_rules_now', { root }),
+
+  // The K-pop category's accounting and its learned titles. Adding or removing one puts it into
+  // effect immediately (the rules are re-applied and saved) and returns the fresh overview.
+  getKpopOverview: root => invoke('get_kpop_overview', { root }),
+  addKpopTitle: (root, text) => invoke('add_kpop_title', { root, text }),
+  removeKpopTitle: (root, key) => invoke('remove_kpop_title', { root, key }),
+  openKpopTermsFile: root => invoke('open_kpop_terms_file', { root }),
 
   // Category management
   createCategory: (root, name) => invoke('create_category', { root, name }),

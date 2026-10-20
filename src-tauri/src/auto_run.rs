@@ -101,6 +101,13 @@ pub struct RunState {
     /// gate may have spent waiting for a free card.
     pub vision_deadline_ms: u64,
     pub vision_limit_minutes: u32,
+    /// The title pass's budget, armed when the first folder's title pass starts; 0 = no limit
+    /// applies (or the pass has not started).
+    pub title_deadline_ms: u64,
+    pub title_limit_minutes: u32,
+    /// The supervisor stopped the title pass at its budget. One budget per run, so once set no
+    /// later folder's title pass starts.
+    pub hit_title_limit: bool,
     /// The run has seen the cancel sentinel and is winding down. Purely so the banner can say
     /// "Stopping…" instead of looking like the Stop button did nothing — a pass only notices a
     /// cancel between images, which for a vision pass is several seconds.

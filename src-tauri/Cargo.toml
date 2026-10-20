@@ -4,6 +4,9 @@ version = "1.0.0"
 description = "Base app for virtually categorizing images by filename without moving them"
 authors = ["slaur"]
 edition = "2021"
+# Two binaries live here (the app and `icat`), so `cargo run` — which is what `tauri dev` runs —
+# has to be told which one is the app, or it refuses to start at all.
+default-run = "image-categorizer-tauri"
 
 [lib]
 name = "image_categorizer_tauri_lib"
@@ -19,7 +22,7 @@ tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 regex = "1"
-windows = { version = "0.62.2", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Storage", "Foundation", "Foundation_Collections", "Win32_System_WinRT", "Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+windows = { version = "0.62.2", features = ["Media_Ocr", "Globalization", "Graphics_Imaging", "Storage_Streams", "Storage", "Foundation", "Foundation_Collections", "Win32_System_WinRT", "Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation"] }
 windows-future = "0.3.2"
 windows-core = "0.62.2"
 rayon = "1.12.0"

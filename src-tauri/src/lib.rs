@@ -11,7 +11,7 @@ use cancellable::Interrupted;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, Read},
@@ -43,6 +43,18 @@ use thumbnails::{ensure_thumbnail, THUMBNAIL_DIR_NAME};
 
 mod chunker;
 use chunker::{build_plan, clean_title, ChunkPlan};
+
+mod kpop;
+
+// The window title as the vision model quoted it, lifted out of each saved description — a second
+// reading of the title band for the K-pop rule, at no model cost.
+mod desc_cues;
+
+// K-pop titles learned from frames the user sorted into K-pop by hand.
+mod kpop_learned;
+
+// How fast each pass runs on this machine, for the Analysis panel's time estimates.
+mod pass_timings;
 
 mod vision;
 use vision::{build_agent, list_models, warm_model, DESCRIBE_PROMPT};
@@ -152,6 +164,14 @@ const DEFAULT_AUTO_REFRESH_TIME: &str = "04:00";
 /// ever being the reason the machine is busy.
 const DEFAULT_VISION_LIMIT_MINUTES: u32 = 30;
 
+/// How long the nightly title pass may run before leaving the rest for the next night.
+///
+/// The backlog that motivated it was 22,571 frames, about 5 minutes of reading at the measured
+/// 14 ms a frame — but the pass opens with a full scan of the root and the run fires whenever the
+/// machine wakes after 04:00, i.e. often while someone is sitting at it. A bound keeps a backlog of
+/// any size (a new library, a re-read after an OCR change) from becoming an afternoon of load.
+const DEFAULT_TITLE_LIMIT_MINUTES: u32 = 30;
+
 /// Upper bound on the configured limit — a day. Past this the setting is indistinguishable from the
 /// unlimited option it already has (`0`), and a typo'd four-digit number should not silently mean
 /// "most of a week".
@@ -182,6 +202,13 @@ struct AppSettings {
     // is done. See `DEFAULT_VISION_LIMIT_MINUTES` for why this defaults to a limit rather than to
     // the old unbounded behaviour.
     auto_refresh_vision_minutes: Option<u32>,
+    // The title-band pass (video grouping + the K-pop category). `None` = on: it is CPU-only Windows
+    // OCR of a strip ~65 px tall, and until 2026-10 it never ran unattended at all — 22,571 frames
+    // had gone unread since August because nothing but a button started it.
+    auto_refresh_titles: Option<bool>,
+    // Its time budget per run, in minutes; `0` = until done. Same shape as the vision limit: a
+    // backlog is worked down a slice per night instead of in one sitting.
+    auto_refresh_titles_minutes: Option<u32>,
     auto_refresh_gpu_wait: Option<bool>,
     auto_refresh_low_priority: Option<bool>,
     auto_refresh_toast: Option<bool>,
@@ -248,6 +275,13 @@ struct ImageRecord {
     // "done but empty" convention `ocr_text_chars` uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_title: Option<String>,
+    // The same title band read by the KOREAN OCR engine, when that language pack is installed. Same
+    // `None` / `Some("")` / `Some(title)` convention as `video_title`. A separate field rather than a
+    // replacement: `video_title` is the chunk plan's grouping key, and the default engine reads
+    // Hangul as junk ("STAYC(4E/OlAl)") while the Korean one reads it ("STAYC(스테이씨)") — swapping
+    // the field would regroup every video already planned. Only `kpop` reads this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_title_ko: Option<String>,
     // Vision pass: character count of the saved description. `Some` (including `Some(0)`) marks the
     // image as already described; the prose itself lives in the descriptions sidecar folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +331,40 @@ struct LibraryConfig {
     // already in the library is indexed, and opting a folder out is the rare case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     text_index_excluded_folders: Vec<String>,
+    // Extra names for the K-pop rule, one per line in `KPOP_TERMS_FILE_NAME` beside the sidecar.
+    // Never serialized: a new debut group is something to type into a small text file, not into a
+    // 35 MB JSON document. Filled by `load_library_config`.
+    #[serde(skip)]
+    kpop_extra_terms: Vec<String>,
+    // Titles learned from frames sorted into K-pop by hand (`kpop_learned`). Its own small file for
+    // the same reason as the terms above; filled by `load_library_config`.
+    #[serde(skip)]
+    kpop_learned: Vec<kpop_learned::LearnedTitle>,
+    // The library this was loaded from — so the K-pop rule can reach the description cues, which
+    // are read only when a reclassify actually runs (a 10 MB cache has no business being parsed by
+    // every read-only command that loads the library). `None` for a config built in memory.
+    #[serde(skip)]
+    root: Option<PathBuf>,
+    // Description cues handed in directly, ahead of the ones `root` would load — for tests, and for
+    // a caller that has just refreshed them.
+    #[serde(skip)]
+    desc_cues: Option<Arc<desc_cues::CueMap>>,
+}
+
+/// Additions to the built-in K-pop name list (`kpop.rs`), one per line, `#` for comments. Read on
+/// every library load, so an edit applies at the next scan or pass with no rebuild.
+const KPOP_TERMS_FILE_NAME: &str = ".image-categorizer-kpop-terms.txt";
+
+fn load_kpop_terms(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(KPOP_TERMS_FILE_NAME))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize)]
@@ -339,6 +407,8 @@ struct AutoRefreshSettingsView {
     run_text_extraction: bool,
     run_vision: bool,
     vision_minutes: u32,
+    run_titles: bool,
+    titles_minutes: u32,
     gpu_wait: bool,
     low_priority: bool,
     toast: bool,
@@ -377,6 +447,36 @@ struct CategoryView {
 struct AssignResult {
     classified_by: Option<String>,
     classified_at: Option<String>,
+    /// Titles this assignment taught the K-pop rule (it put a frame in K-pop by hand whose title
+    /// the rules had missed). Empty for every other assignment.
+    learned_titles: Vec<String>,
+    /// Other images that followed into K-pop because of those titles — patched in place by the
+    /// frontend, like the assigned image itself.
+    joined_kpop: Vec<String>,
+}
+
+/// Puts what a hand assignment to K-pop just taught into effect: learns the titles, re-applies the
+/// rules, and reports which other images moved into K-pop. Nothing to do (and nothing re-applied)
+/// when the frame taught nothing new.
+fn learn_from_hand_sorting(root: &Path, config: &mut LibraryConfig) -> Result<(Vec<String>, Vec<String>), String> {
+    let added = learn_kpop_titles(root, config, true)?;
+    if added.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let before: HashSet<String> = config
+        .images
+        .iter()
+        .filter(|(_, record)| record.category.as_deref() == Some(kpop::KPOP_CATEGORY))
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    reclassify_text_categories(config);
+    let joined = config
+        .images
+        .iter()
+        .filter(|(hash, record)| record.category.as_deref() == Some(kpop::KPOP_CATEGORY) && !before.contains(*hash))
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    Ok((added.into_iter().map(|entry| entry.title).collect(), joined))
 }
 
 #[derive(Debug, Serialize)]
@@ -388,7 +488,7 @@ struct ImportReport {
     errors: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageView {
     hash: String,
@@ -518,6 +618,10 @@ struct OcrTextControl {
 struct ChunkControl {
     running: AtomicBool,
     cancel: AtomicBool,
+    /// The nightly supervisor stopped the pass at its time budget — through `cancel`, exactly as
+    /// `VisionControl::hit_time_limit` does — so the run can tell "left for tomorrow" from "Stop
+    /// pressed". Never set by the GUI's button, which runs to the end.
+    hit_time_limit: AtomicBool,
 }
 
 #[derive(Default)]
@@ -764,10 +868,30 @@ fn sidecar_path(root: &Path) -> PathBuf {
 }
 
 fn load_library_config(root: &Path) -> LibraryConfig {
-    fs::read_to_string(sidecar_path(root))
+    let mut config = fs::read_to_string(sidecar_path(root))
         .ok()
         .and_then(|data| serde_json::from_str::<LibraryConfig>(&data).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    config.kpop_extra_terms = load_kpop_terms(root);
+    config.kpop_learned = kpop_learned::load(root).titles;
+    config.root = Some(root.to_path_buf());
+    config
+}
+
+/// Every described image's `(hash, vision_desc_chars)` — what `desc_cues::refresh` checks its
+/// cache against.
+fn described_images(config: &LibraryConfig) -> impl Iterator<Item = (&str, u32)> {
+    config
+        .images
+        .iter()
+        .filter_map(|(hash, record)| record.vision_desc_chars.map(|chars| (hash.as_str(), chars)))
+}
+
+/// Reads any descriptions written since the cue cache was last brought up to date, and hands the
+/// result to the K-pop rule. `persist` as in `desc_cues::refresh`.
+fn refresh_desc_cues(root: &Path, config: &mut LibraryConfig, persist: bool) {
+    let cues = desc_cues::refresh(root, described_images(config), persist);
+    config.desc_cues = Some(cues);
 }
 
 fn save_library_config(root: &Path, config: &LibraryConfig) -> Result<(), String> {
@@ -1078,6 +1202,9 @@ where
     let _sidecar_lock = SidecarLock::acquire(root);
     let mut config = load_library_config(root);
     apply(&mut config);
+    // A Describe run commits after every image; picking up that image's description here is what
+    // lets it reach K-pop in the same save. In memory only — see `desc_cues::refresh`.
+    refresh_desc_cues(root, &mut config, false);
     reclassify_nsfw_categories(&mut config);
     reclassify_text_categories(&mut config);
     save_library_config(root, &config)
@@ -1130,14 +1257,27 @@ fn commit_extraction_results(root: &Path, results: &mut Vec<(String, u32)>) -> R
     Ok(())
 }
 
-fn commit_chunk_results(root: &Path, results: &mut Vec<(String, String)>) -> Result<(), String> {
+/// One frame's title-band readings from a title pass. `None` = not read this time (not owed, or
+/// the read failed), which leaves the stored field as it was.
+struct TitleReading {
+    hash: String,
+    english: Option<String>,
+    korean: Option<String>,
+}
+
+fn commit_chunk_results(root: &Path, results: &mut Vec<TitleReading>) -> Result<(), String> {
     if results.is_empty() {
         return Ok(());
     }
     commit_analysis(root, |config| {
-        for (hash, title) in results.iter() {
-            if let Some(record) = config.images.get_mut(hash) {
-                record.video_title = Some(title.clone());
+        for reading in results.iter() {
+            if let Some(record) = config.images.get_mut(&reading.hash) {
+                if let Some(title) = &reading.english {
+                    record.video_title = Some(title.clone());
+                }
+                if let Some(title) = &reading.korean {
+                    record.video_title_ko = Some(title.clone());
+                }
             }
         }
     })?;
@@ -1204,10 +1344,13 @@ fn ensure_analysis_categories(config: &mut LibraryConfig) {
     }
 }
 
-fn reclassify_text_categories(config: &mut LibraryConfig) {
+/// Re-applies the Explicit → K-pop → Low/High Text order to every record not sorted by hand, and
+/// returns why each K-pop frame is K-pop (the Analysis panel's breakdown; every other caller drops
+/// it).
+fn reclassify_text_categories(config: &mut LibraryConfig) -> HashMap<String, KpopReason> {
     let any_analyzed = config.images.values().any(|record| record.ocr_word_count.is_some());
     if !any_analyzed {
-        return;
+        return HashMap::new();
     }
 
     let nsfw_min = nsfw_threshold(config);
@@ -1215,7 +1358,12 @@ fn reclassify_text_categories(config: &mut LibraryConfig) {
     ensure_category(config, LOW_TEXT_CATEGORY);
     ensure_category(config, HIGH_TEXT_CATEGORY);
 
-    for record in config.images.values_mut() {
+    let kpop = kpop_frames(config, nsfw_min, word_threshold, area_threshold);
+    if !kpop.is_empty() {
+        ensure_category(config, kpop::KPOP_CATEGORY);
+    }
+
+    for (hash, record) in config.images.iter_mut() {
         if record.classified_by.as_deref() == Some("manual") {
             continue;
         }
@@ -1237,13 +1385,258 @@ fn reclassify_text_categories(config: &mut LibraryConfig) {
             continue;
         };
         let is_low_text = word_count <= word_threshold && area_ratio <= area_threshold;
-        let category = if is_low_text { LOW_TEXT_CATEGORY } else { HIGH_TEXT_CATEGORY };
+        // K-pop sits between Explicit and the text categories, and takes only what would otherwise
+        // be Low Text: a High Text frame under a K-pop title (lyrics, a scrolled comment section) is
+        // read for its text and stays High Text.
+        let (category, classified_by) = if !is_low_text {
+            (HIGH_TEXT_CATEGORY, "auto")
+        } else if kpop.contains_key(hash) {
+            (kpop::KPOP_CATEGORY, kpop::CLASSIFIED_BY_KPOP)
+        } else {
+            (LOW_TEXT_CATEGORY, "auto")
+        };
         if record.category.as_deref() != Some(category) {
             record.category = Some(category.to_string());
-            record.classified_by = Some("auto".to_string());
+            record.classified_by = Some(classified_by.to_string());
             record.classified_at = Some(now_iso());
         }
     }
+    kpop
+}
+
+/// Why a frame is K-pop. In precedence order: a frame several of these apply to is reported under
+/// the first, so the Analysis panel's breakdown adds up to the category's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum KpopReason {
+    /// The built-in rules, or the terms file, over the title band as OCR read it.
+    Title,
+    /// A title learned from a frame sorted into K-pop by hand — the index into `kpop_learned`.
+    Learned(usize),
+    /// The built-in rules over the vision model's quote of the title.
+    Described,
+    /// A tab strip naming K-pop, on a frame whose description says it shows a music video.
+    TabStrip,
+    /// The opening of the description names K-pop or a K-pop act.
+    Lead,
+    /// Not described itself, but the described frames of the same video (same OCR title) were
+    /// quoted with a K-pop title. Describe samples ~10 frames per video, so without this the rest
+    /// of a video the descriptions identified stayed Low Text.
+    SameVideo,
+    /// No title of its own, captured between two K-pop frames.
+    Neighbour,
+}
+
+/// The description cues the K-pop rule reads: the ones handed in, else this library's cache.
+fn kpop_cues(config: &LibraryConfig) -> Arc<desc_cues::CueMap> {
+    config
+        .desc_cues
+        .clone()
+        .or_else(|| config.root.as_deref().map(desc_cues::shared))
+        .unwrap_or_default()
+}
+
+/// The images that are K-pop and why: by their own title, by what their description says, by a
+/// learned title, or filled in from both neighbours (`kpop::fill_from_neighbours`).
+///
+/// Worked out as a map BEFORE any category is written, so a filled frame is assigned once. Applying
+/// the fill as a second write after the text categories would move it K-pop → Low Text → K-pop
+/// within one call — and `classified_at` is stamped on every change, so it would read as fresh
+/// activity on every single save (the dashboard's activity strip depends on it changing only when
+/// the category really does).
+///
+/// Derived from the titles every time, never stored as a decision: a name added to the terms file
+/// takes the old frames of that group at the next save, and one removed releases them.
+fn kpop_frames(
+    config: &LibraryConfig,
+    nsfw_min: f32,
+    word_threshold: u32,
+    area_threshold: f32,
+) -> HashMap<String, KpopReason> {
+    let matcher = kpop::Matcher::new(&config.kpop_extra_terms);
+    let learned = kpop_learned::LearnedMatcher::new(&config.kpop_learned);
+    let cues = kpop_cues(config);
+    // ~3,000 distinct OCR titles across ~40,000 titled frames, and this runs on every checkpoint
+    // save, so each title pair is judged once. Same for the descriptions' titles, which repeat per
+    // video too.
+    let mut ocr_verdicts: HashMap<(&str, &str), Option<KpopReason>> = HashMap::new();
+    let mut described_verdicts: HashMap<&str, Option<KpopReason>> = HashMap::new();
+    let learned_index = |reading: &str| {
+        if learned.is_empty() {
+            None
+        } else {
+            learned.find(&kpop_learned::normalize(reading)).map(KpopReason::Learned)
+        }
+    };
+    let mut matched: HashMap<String, KpopReason> = HashMap::new();
+    // What each frame said, kept for the second look below: (timestamp, hash, its video's key,
+    // titled, headed for Low Text, quoted with one title by its description).
+    let mut facts: Vec<(Option<i64>, &str, Option<String>, bool, bool, bool)> = Vec::new();
+    // Per video (normalized OCR title): how many of its frames the description quoted with a single
+    // title, and how many of those quotes were K-pop.
+    let mut video_votes: HashMap<String, (usize, usize)> = HashMap::new();
+
+    for (hash, record) in &config.images {
+        let english = record.video_title.as_deref().unwrap_or("");
+        let korean = record.video_title_ko.as_deref().unwrap_or("");
+        let titled = !english.is_empty() || !korean.is_empty();
+        let by_title = if titled {
+            *ocr_verdicts.entry((english, korean)).or_insert_with(|| {
+                if matcher.matches_any(&[english, korean]) {
+                    Some(KpopReason::Title)
+                } else {
+                    learned_index(english).or_else(|| learned_index(korean))
+                }
+            })
+        } else {
+            None
+        };
+
+        // Headed for Low Text — the only frames K-pop can take, and so the only ones whose
+        // description is worth reading here.
+        let low_text_candidate = record.classified_by.as_deref() != Some("manual")
+            && !record.nsfw_score.is_some_and(|score| score >= nsfw_min)
+            && record
+                .ocr_word_count
+                .zip(record.ocr_text_area_ratio)
+                .is_some_and(|(words, area)| words <= word_threshold && area <= area_threshold);
+        let cue = if low_text_candidate { cues.get(hash.as_str()) } else { None };
+        let reason = by_title.or_else(|| {
+            let cue = cue?;
+            if !cue.title.is_empty() {
+                let by_described = *described_verdicts.entry(cue.title.as_str()).or_insert_with(|| {
+                    // Of a tab strip, only the tabs that could be on screen — not an audio
+                    // player's, which names the soundtrack (`desc_cues::visible_tabs`).
+                    let visible = if cue.tab_strip { desc_cues::visible_tabs(&cue.title) } else { cue.title.clone() };
+                    if matcher.matches_any(&[&visible]) {
+                        Some(KpopReason::Described)
+                    } else {
+                        learned_index(&visible)
+                    }
+                });
+                // An ambiguous name in a quoted title, confirmed by the description calling the
+                // picture a music video — not memoized: the lead is the frame's own.
+                let by_described = by_described.or_else(|| {
+                    (!cue.tab_strip && matcher.ambiguous_confirmed_by(&cue.title, &cue.lead)).then_some(KpopReason::Described)
+                });
+                if let Some(found) = by_described {
+                    if !cue.tab_strip {
+                        return Some(found);
+                    }
+                    // A tab strip says what was OPEN. It counts only when the picture itself is
+                    // described as a music video.
+                    if kpop::describes_music_video(&cue.lead) {
+                        return Some(KpopReason::TabStrip);
+                    }
+                }
+            }
+            matcher.describes_kpop(&cue.lead).then_some(KpopReason::Lead)
+        });
+        if let Some(reason) = reason {
+            matched.insert(hash.clone(), reason);
+        }
+
+        let described_single = cue.is_some_and(|cue| !cue.title.is_empty() && !cue.tab_strip);
+        // Only titles long enough to stand for one video group frames into a video: OCR junk like
+        // "I" or "MV" is shared by unrelated videos.
+        let video = (titled && low_text_candidate && by_title.is_none())
+            .then(|| kpop_learned::normalize(if english.is_empty() { korean } else { english }))
+            .filter(|key| kpop_learned::learnable(key));
+        if let Some(video) = &video {
+            if described_single {
+                let votes = video_votes.entry(video.clone()).or_default();
+                votes.0 += 1;
+                if reason == Some(KpopReason::Described) {
+                    votes.1 += 1;
+                }
+            }
+        }
+        let name = record.last_known_path.rsplit('/').next().unwrap_or(&record.last_known_path);
+        let ts = text_index::timestamp_from_name(name);
+        facts.push((ts, hash.as_str(), video, titled, low_text_candidate, described_single));
+    }
+
+    // A video takes the K-pop verdict when at least half of its described frames were quoted with a
+    // K-pop title — one stray quote among ten does not decide a video.
+    let mut frames: Vec<(i64, kpop::Evidence, &str)> = Vec::new();
+    for (ts, hash, video, titled, low_text_candidate, described_single) in facts {
+        if !matched.contains_key(hash) {
+            let voted = video
+                .as_ref()
+                .and_then(|video| video_votes.get(video))
+                .is_some_and(|(described, kpop)| *kpop > 0 && kpop * 2 >= *described);
+            if voted {
+                matched.insert(hash.to_string(), KpopReason::SameVideo);
+            }
+        }
+        let Some(ts) = ts else { continue };
+        let evidence = if matched.contains_key(hash) {
+            kpop::Evidence::Kpop
+        } else if titled || (low_text_candidate && described_single) {
+            // Any titled frame says what the session was showing, whatever its own category — and
+            // so does one the description quotes a single other title for.
+            kpop::Evidence::Other
+        } else if config.images[hash].video_title.is_some() && low_text_candidate {
+            // Scanned and untitled (not merely not-yet-scanned), and headed for Low Text.
+            kpop::Evidence::Candidate
+        } else {
+            continue;
+        };
+        frames.push((ts, evidence, hash));
+    }
+
+    for hash in kpop::fill_from_neighbours(frames, kpop::NEIGHBOUR_WINDOW_SECS) {
+        matched.insert(hash.to_string(), KpopReason::Neighbour);
+    }
+    matched
+}
+
+/// Teaches the learned-titles list from every frame in K-pop by hand, and returns what it added.
+/// Writes the list only when something was added, and only when `persist` (a preview learns in
+/// memory). Readings the rules already accept are skipped (`kpop_learned::learn`), as are tab
+/// strips: a line of five tab names does not stand for a video.
+fn learn_kpop_titles(
+    root: &Path,
+    config: &mut LibraryConfig,
+    persist: bool,
+) -> Result<Vec<kpop_learned::LearnedTitle>, String> {
+    let hand_sorted: Vec<&str> = config
+        .images
+        .iter()
+        .filter(|(_, record)| {
+            record.category.as_deref() == Some(kpop::KPOP_CATEGORY) && record.classified_by.as_deref() == Some("manual")
+        })
+        .map(|(hash, _)| hash.as_str())
+        .collect();
+    if hand_sorted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let matcher = kpop::Matcher::new(&config.kpop_extra_terms);
+    let cues = kpop_cues(config);
+    let mut file = kpop_learned::load(root);
+    let frames = hand_sorted.iter().filter_map(|hash| {
+        let record = config.images.get(*hash)?;
+        let described = cues
+            .get(*hash)
+            .filter(|cue| !cue.tab_strip)
+            .map_or("", |cue| cue.title.as_str());
+        Some(kpop_learned::HandSorted {
+            hash: *hash,
+            path: record.last_known_path.as_str(),
+            ocr: [
+                record.video_title.as_deref().unwrap_or(""),
+                record.video_title_ko.as_deref().unwrap_or(""),
+            ],
+            described,
+        })
+    });
+    let added = kpop_learned::learn(&mut file, frames, |reading| matcher.matches_any(&[reading]), &now_iso());
+    if !added.is_empty() {
+        if persist {
+            kpop_learned::save(root, &file)?;
+        }
+        config.kpop_learned = file.titles;
+    }
+    Ok(added)
 }
 
 fn scan_and_reconcile(root: &Path) -> Result<LibraryView, String> {
@@ -1342,6 +1735,12 @@ fn scan_and_reconcile_cancellable(
         }
         !scanned_folders.contains(record_source_folder(&record.last_known_path))
     });
+
+    // Both before the reclassify they feed: descriptions written since the last scan (another
+    // process's nightly Describe run included), and titles taught by frames hand-sorted into K-pop
+    // somewhere this app did not see it happen — Super Image Viewer and `icat` write the same sidecar.
+    refresh_desc_cues(root, &mut config, true);
+    let _ = learn_kpop_titles(root, &mut config, true);
 
     reclassify_nsfw_categories(&mut config);
     reclassify_text_categories(&mut config);
@@ -1609,6 +2008,31 @@ impl AnalysisScope {
     }
 }
 
+/// A part of the library a pass can be pointed at from the Analysis panel. It only ever NARROWS a
+/// pass's own selection: an image the pass would skip anyway (an excluded folder, an omitted
+/// category, an explicit image for Describe) stays skipped, so the count the panel shows for a
+/// scope is exactly the work a scoped run does.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunScope {
+    /// A category name; `""` means images with no category.
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+impl RunScope {
+    fn includes(&self, image: &ImageView) -> bool {
+        let category_ok = match self.category.as_deref() {
+            None => true,
+            Some("") => image.category.is_none(),
+            Some(name) => image.category.as_deref() == Some(name),
+        };
+        category_ok && self.folder.as_deref().map_or(true, |folder| image.source_folder == folder)
+    }
+}
+
 /// False only when the library has source folders and every one of them is switched off. Worth
 /// saying out loud, because otherwise a fully excluded library is indistinguishable from a fully
 /// analyzed one: both report zero pending.
@@ -1692,8 +2116,16 @@ fn pending_nsfw<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool) 
 
 /// Images whose title strip has not been OCR'd yet. A frame that was scanned and turned out not to
 /// be a video carries `Some("")`, so it is not pending either — only a missing field is.
+///
+/// With the Korean OCR pack installed, a TITLED frame also still owes its Korean reading
+/// (`video_title_ko`), so frames titled before the pack existed are backfilled by the same pass
+/// rather than by a second one. Only titled frames: the site marker (" - YouTube") is Latin text
+/// the default engine reads fine, so a frame where it found none has no title for the Korean
+/// engine to improve — that rule cuts the backfill from ~63,000 frames to ~21,000. Without the
+/// pack nothing changes.
 fn pending_chunk<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool) -> Vec<&'a ImageView> {
     let scope = AnalysisScope::new(config);
+    let korean = ocr::korean_ocr_available();
     view.images
         .iter()
         .filter(|image| scope.includes(config, image))
@@ -1702,10 +2134,17 @@ fn pending_chunk<'a>(view: &'a LibraryView, config: &LibraryConfig, force: bool)
                 || config
                     .images
                     .get(&image.hash)
-                    .map(|record| record.video_title.is_none())
+                    .map(|record| title_reading_pending(record, korean))
                     .unwrap_or(true)
         })
         .collect()
+}
+
+fn title_reading_pending(record: &ImageRecord, korean: bool) -> bool {
+    match record.video_title.as_deref() {
+        None => true,
+        Some(title) => korean && !title.is_empty() && record.video_title_ko.is_none(),
+    }
 }
 
 /// Why Describe's queue is so much shorter than the others — reported rather than inferred, because
@@ -1851,7 +2290,13 @@ fn pending_analysis(view: &LibraryView, config: &LibraryConfig, plan: Option<&Ch
 }
 
 #[tauri::command]
-fn analyze_text(app: AppHandle, control: tauri::State<'_, AnalysisControl>, root: String, force: bool) -> Result<(), String> {
+fn analyze_text(
+    app: AppHandle,
+    control: tauri::State<'_, AnalysisControl>,
+    root: String,
+    force: bool,
+    scope: Option<RunScope>,
+) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("Text analysis is already running.".to_string());
     }
@@ -1866,8 +2311,9 @@ fn analyze_text(app: AppHandle, control: tauri::State<'_, AnalysisControl>, root
     control.cancel.store(false, Ordering::SeqCst);
 
     let app_handle = app.clone();
+    let scope = scope.unwrap_or_default();
     std::thread::spawn(move || {
-        run_text_analysis(&app_handle, &root_buf, force);
+        run_text_analysis(&app_handle, &root_buf, force, &scope);
     });
 
     Ok(())
@@ -1885,7 +2331,7 @@ fn cancel_text_analysis(control: tauri::State<'_, AnalysisControl>) -> Result<()
 // Runs on a detached background thread so `analyze_text` returns immediately and the UI stays
 // responsive. Only the images present at scan time are ever touched: anything added to the
 // library mid-run is picked up by the next scan, never by this one.
-fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunScope) {
     let control = app.state::<AnalysisControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
@@ -1901,6 +2347,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
         let pending: Vec<(String, String, String)> = pending_text(&view, &config, force)
             .into_iter()
+            .filter(|image| scope.includes(image))
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -1908,12 +2355,15 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let total = pending.len();
         let mut cancelled = false;
         let mut results: Vec<(String, u32, f32)> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if is_cancelled() {
                 cancelled = true;
                 break;
             }
+            done += 1;
 
             match analyze_image_text(Path::new(path)) {
                 Ok(stats) => results.push((hash.clone(), stats.word_count, stats.text_area_ratio)),
@@ -1939,6 +2389,7 @@ fn run_text_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         commit_text_results(root_buf, &mut results)?;
+        pass_timings::record(app, "text", done, started.elapsed());
 
         let message = if total == 0 { Some("No images needed analysis.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))
@@ -1974,6 +2425,7 @@ fn extract_text(
     root: String,
     force: bool,
     indexed_only: bool,
+    scope: Option<RunScope>,
 ) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("Text extraction is already running.".to_string());
@@ -1989,8 +2441,9 @@ fn extract_text(
     control.cancel.store(false, Ordering::SeqCst);
 
     let app_handle = app.clone();
+    let scope = scope.unwrap_or_default();
     std::thread::spawn(move || {
-        run_text_extraction(&app_handle, &root_buf, force, indexed_only);
+        run_text_extraction(&app_handle, &root_buf, force, indexed_only, &scope);
     });
 
     Ok(())
@@ -2014,7 +2467,7 @@ fn cancel_text_extraction(control: tauri::State<'_, OcrTextControl>) -> Result<(
 // false — it means "extract everything outstanding" and always has. The Extracted Text panel passes
 // true, because the number it offers to act on is a High Text number: running the other 783 images
 // as well would do work the panel never mentioned and finish reporting a count nobody asked about.
-fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_only: bool) {
+fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_only: bool, scope: &RunScope) {
     let control = app.state::<OcrTextControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
@@ -2043,6 +2496,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_on
                         .map(|category| categories.contains(category))
                         .unwrap_or(false)
             })
+            .filter(|image| scope.includes(image))
             .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
             .collect();
         drop(config);
@@ -2050,12 +2504,15 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_on
         let total = pending.len();
         let mut cancelled = false;
         let mut results: Vec<(String, u32)> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if is_cancelled() {
                 cancelled = true;
                 break;
             }
+            done += 1;
 
             match extract_image_text(Path::new(path)) {
                 Ok(text) => {
@@ -2085,6 +2542,7 @@ fn run_text_extraction(app: &AppHandle, root_buf: &Path, force: bool, indexed_on
         }
 
         commit_extraction_results(root_buf, &mut results)?;
+        pass_timings::record(app, "ocr", done, started.elapsed());
 
         let message = if total == 0 { Some("No images needed text extraction.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))
@@ -2884,6 +3342,9 @@ fn categorize_images(root: String, hashes: Vec<String>, category: String) -> Res
             changed += 1;
         }
     }
+    if category == kpop::KPOP_CATEGORY {
+        learn_from_hand_sorting(&root, &mut config)?;
+    }
     save_library_config(&root, &config)?;
     Ok(changed)
 }
@@ -3049,6 +3510,7 @@ fn assign_category(root: String, hash: String, category: Option<String>) -> Resu
     }
 
     let assigned = category.is_some();
+    let to_kpop = category.as_deref() == Some(kpop::KPOP_CATEGORY);
     let classified_at = assigned.then(now_iso);
     let record = config.images.entry(hash).or_default();
     if assigned {
@@ -3061,10 +3523,532 @@ fn assign_category(root: String, hash: String, category: Option<String>) -> Resu
         record.classified_at = None;
     }
 
+    // Sorting a frame into K-pop by hand says the rules missed its title — teach it, so the rest of
+    // that video follows without being sorted one by one.
+    let (learned_titles, joined_kpop) = if to_kpop {
+        learn_from_hand_sorting(&root, &mut config)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     save_library_config(&root, &config)?;
     Ok(AssignResult {
         classified_by: assigned.then(|| "manual".to_string()),
         classified_at,
+        learned_titles,
+        joined_kpop,
+    })
+}
+
+// =================================================================================================
+// Analysis panel
+//
+// What the passes are, which of them are rules and which are models, how much each still has to do
+// and how long that would take — for the whole library or a part of it. Counted off the sidecar
+// (`library_view_from_records`), not the disk: a scan of 63,000 files takes long enough that a
+// screen which waits on one is a screen nobody opens.
+// =================================================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategoryMove {
+    from: Option<String>,
+    to: Option<String>,
+    count: usize,
+}
+
+/// What re-applying every classification rule would change (or did change), and how long that took.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RulesDiff {
+    moves: Vec<CategoryMove>,
+    changed: usize,
+    records: usize,
+    millis: u64,
+}
+
+/// Re-applies the Explicit, K-pop and Low/High Text rules to `config` in place, and says what moved.
+fn apply_rules(config: &mut LibraryConfig) -> (RulesDiff, HashMap<String, KpopReason>) {
+    let started = std::time::Instant::now();
+    let before: HashMap<String, Option<String>> =
+        config.images.iter().map(|(hash, record)| (hash.clone(), record.category.clone())).collect();
+    reclassify_nsfw_categories(config);
+    let reasons = reclassify_text_categories(config);
+    let millis = started.elapsed().as_millis() as u64;
+
+    let mut moves: BTreeMap<(Option<String>, Option<String>), usize> = BTreeMap::new();
+    for (hash, record) in &config.images {
+        let old = before.get(hash).cloned().flatten();
+        if old != record.category {
+            *moves.entry((old, record.category.clone())).or_insert(0) += 1;
+        }
+    }
+    let mut moves: Vec<CategoryMove> =
+        moves.into_iter().map(|((from, to), count)| CategoryMove { from, to, count }).collect();
+    moves.sort_by(|a, b| b.count.cmp(&a.count));
+    let diff = RulesDiff {
+        changed: moves.iter().map(|change| change.count).sum(),
+        moves,
+        records: config.images.len(),
+        millis,
+    };
+    (diff, reasons)
+}
+
+/// What re-applying the rules right now would change, without saving anything — the answer to
+/// "what will the next scan move" after the rules themselves changed (a new build, an edited terms
+/// file, a learned title).
+// `async` on every heavy command here: a sync command runs on the main thread and holds up every
+// other invoke behind it — a Stop pressed while the panel counts would wait for the count.
+#[tauri::command(async)]
+fn preview_rules(root: String) -> Result<RulesDiff, String> {
+    let root = root_path(&root)?;
+    let mut config = load_library_config(&root);
+    refresh_desc_cues(&root, &mut config, false);
+    learn_kpop_titles(&root, &mut config, false)?;
+    Ok(apply_rules(&mut config).0)
+}
+
+/// Re-applies the rules and saves — exactly what every scan ends with, minus the walk of the disk.
+/// The frontend rescans afterwards to repaint the grid.
+#[tauri::command(async)]
+fn apply_rules_now(root: String) -> Result<RulesDiff, String> {
+    let root = root_path(&root)?;
+    let _sidecar_lock = SidecarLock::acquire(&root);
+    let mut config = load_library_config(&root);
+    refresh_desc_cues(&root, &mut config, true);
+    learn_kpop_titles(&root, &mut config, true)?;
+    let (diff, _) = apply_rules(&mut config);
+    ensure_analysis_categories(&mut config);
+    save_library_config(&root, &config)?;
+    Ok(diff)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnedTitleView {
+    #[serde(flatten)]
+    entry: kpop_learned::LearnedTitle,
+    /// K-pop frames this entry decided — those no earlier rule had already taken.
+    frames: usize,
+}
+
+/// The K-pop category's own accounting: what put each frame there, and the learned list.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KpopOverview {
+    total: usize,
+    hand_sorted: usize,
+    by_title: usize,
+    by_learned: usize,
+    by_described: usize,
+    by_tab_strip: usize,
+    by_lead: usize,
+    by_same_video: usize,
+    by_neighbour: usize,
+    /// Frames with a K-pop reading that stay High Text on purpose: lyrics, comment sections.
+    high_text_with_kpop_reading: usize,
+    /// Hand-sorted K-pop frames with no title at all to learn from — the band read nothing and the
+    /// description quoted none.
+    hand_sorted_untitled: usize,
+    learned: Vec<LearnedTitleView>,
+    dismissed: usize,
+    extra_terms: Vec<String>,
+    terms_file: String,
+    learned_file: String,
+    descriptions_read: usize,
+    /// Frames whose K-pop membership on disk differs from what the rules say now — what the next
+    /// scan, or Apply, would move in or out.
+    pending_change: usize,
+}
+
+/// Builds the overview from a freshly loaded config: learns from hand-sorted frames (saving any new
+/// title — the list is meant to fill itself), then re-applies the rules in memory to count.
+fn build_kpop_overview(root: &Path, config: &mut LibraryConfig) -> Result<KpopOverview, String> {
+    refresh_desc_cues(root, config, false);
+    learn_kpop_titles(root, config, true)?;
+    let on_disk: HashSet<String> = config
+        .images
+        .iter()
+        .filter(|(_, record)| record.category.as_deref() == Some(kpop::KPOP_CATEGORY))
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    let reasons = reclassify_text_categories(config);
+    let cues = kpop_cues(config);
+
+    let mut overview = KpopOverview {
+        extra_terms: config.kpop_extra_terms.clone(),
+        terms_file: root.join(KPOP_TERMS_FILE_NAME).to_string_lossy().to_string(),
+        learned_file: kpop_learned::learned_path(root).to_string_lossy().to_string(),
+        descriptions_read: cues.len(),
+        dismissed: kpop_learned::load(root).dismissed.len(),
+        ..KpopOverview::default()
+    };
+    let mut learned_frames = vec![0usize; config.kpop_learned.len()];
+    for (hash, record) in &config.images {
+        let in_kpop = record.category.as_deref() == Some(kpop::KPOP_CATEGORY);
+        if in_kpop != on_disk.contains(hash) {
+            overview.pending_change += 1;
+        }
+        if !in_kpop {
+            if record.category.as_deref() == Some(HIGH_TEXT_CATEGORY) && reasons.contains_key(hash) {
+                overview.high_text_with_kpop_reading += 1;
+            }
+            continue;
+        }
+        overview.total += 1;
+        if record.classified_by.as_deref() == Some("manual") {
+            overview.hand_sorted += 1;
+            let has_title = record.video_title.as_deref().is_some_and(|title| !title.is_empty())
+                || record.video_title_ko.as_deref().is_some_and(|title| !title.is_empty())
+                || cues.get(hash).is_some_and(|cue| !cue.title.is_empty() && !cue.tab_strip);
+            if !has_title {
+                overview.hand_sorted_untitled += 1;
+            }
+            continue;
+        }
+        match reasons.get(hash) {
+            Some(KpopReason::Title) => overview.by_title += 1,
+            Some(KpopReason::Learned(index)) => {
+                overview.by_learned += 1;
+                if let Some(count) = learned_frames.get_mut(*index) {
+                    *count += 1;
+                }
+            }
+            Some(KpopReason::Described) => overview.by_described += 1,
+            Some(KpopReason::TabStrip) => overview.by_tab_strip += 1,
+            Some(KpopReason::Lead) => overview.by_lead += 1,
+            Some(KpopReason::SameVideo) => overview.by_same_video += 1,
+            Some(KpopReason::Neighbour) => overview.by_neighbour += 1,
+            None => {}
+        }
+    }
+    overview.learned = config
+        .kpop_learned
+        .iter()
+        .cloned()
+        .zip(learned_frames)
+        .map(|(entry, frames)| LearnedTitleView { entry, frames })
+        .collect();
+    // Newest first: the one just learned is the one being looked for.
+    overview.learned.reverse();
+    Ok(overview)
+}
+
+#[tauri::command(async)]
+fn get_kpop_overview(root: String) -> Result<KpopOverview, String> {
+    let root = root_path(&root)?;
+    let mut config = load_library_config(&root);
+    build_kpop_overview(&root, &mut config)
+}
+
+/// Writes a change to the learned list and puts it into effect at once: the rules are re-applied
+/// and saved, so the frames it takes (or releases) move now rather than at the next scan.
+fn change_kpop_learned(
+    root: &Path,
+    change: impl FnOnce(&mut kpop_learned::LearnedFile) -> Result<(), String>,
+) -> Result<KpopOverview, String> {
+    let _sidecar_lock = SidecarLock::acquire(root);
+    let mut file = kpop_learned::load(root);
+    change(&mut file)?;
+    kpop_learned::save(root, &file)?;
+    let mut config = load_library_config(root);
+    refresh_desc_cues(root, &mut config, false);
+    reclassify_text_categories(&mut config);
+    save_library_config(root, &config)?;
+    build_kpop_overview(root, &mut config)
+}
+
+/// Adds a name or title typed on the panel. Matches any title containing it, like a line in the
+/// terms file — but listed and counted where the learned titles are.
+#[tauri::command(async)]
+fn add_kpop_title(root: String, text: String) -> Result<KpopOverview, String> {
+    let root = root_path(&root)?;
+    change_kpop_learned(&root, |file| kpop_learned::add_typed(file, &text, &now_iso()).map(|_| ()))
+}
+
+/// Removes a learned or typed entry. A learned one is remembered as dismissed, so the hand-sorted
+/// frame that taught it does not teach it again at the next scan.
+#[tauri::command(async)]
+fn remove_kpop_title(root: String, key: String) -> Result<KpopOverview, String> {
+    let root = root_path(&root)?;
+    change_kpop_learned(&root, |file| {
+        kpop_learned::remove(file, &key)
+            .map(|_| ())
+            .ok_or_else(|| "That title is no longer on the list.".to_string())
+    })
+}
+
+/// Opens the K-pop terms file in the default editor, writing it with its explanatory header first
+/// if it does not exist yet.
+#[tauri::command]
+fn open_kpop_terms_file(root: String) -> Result<(), String> {
+    let root = root_path(&root)?;
+    let path = root.join(KPOP_TERMS_FILE_NAME);
+    if !path.exists() {
+        fs::write(&path, KPOP_TERMS_TEMPLATE).map_err(|error| format!("Failed to create the terms file: {error}"))?;
+    }
+    open_image(path.to_string_lossy().to_string())
+}
+
+const KPOP_TERMS_TEMPLATE: &str = "# Extra names for Image Categorizer's K-pop category — one per line.\n\
+#\n\
+# Matched case-insensitively against each screenshot's window title (the OCR reading, and the\n\
+# vision description's quote of it). Hangul works too. Takes effect at the next scan.\n";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineStep {
+    key: &'static str,
+    label: &'static str,
+    /// What does the work, in words.
+    method: String,
+    /// "rule" · "ocr" · "classifier" · "llm".
+    kind: &'static str,
+    /// A trained model decides the result.
+    ai: bool,
+    /// The same input always gives the same result. False only for the LLM, whose wording varies
+    /// run to run.
+    repeatable: bool,
+    hardware: &'static str,
+    writes: &'static str,
+    feeds: &'static str,
+    /// What a re-run of this step over the scope would process.
+    in_scope: usize,
+    /// What it has not done yet.
+    pending: usize,
+    secs_per_item: f64,
+    rate_measured: bool,
+    rate_runs: usize,
+    rate_last_at: Option<String>,
+    pending_secs: f64,
+    all_secs: f64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeOption {
+    name: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineOverview {
+    scope: RunScope,
+    scope_images: usize,
+    library_images: usize,
+    steps: Vec<PipelineStep>,
+    rules: RulesDiff,
+    categories: Vec<ScopeOption>,
+    folders: Vec<ScopeOption>,
+    /// Switched off for analysis in the sidebar — every step skips these, so it is said once.
+    excluded_categories: Vec<String>,
+    excluded_folders: Vec<String>,
+    /// When the sidecar these counts come from was written.
+    counted_at_ms: Option<u64>,
+    vision_model: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pipeline_step(
+    app: &AppHandle,
+    key: &'static str,
+    label: &'static str,
+    method: String,
+    kind: &'static str,
+    hardware: &'static str,
+    writes: &'static str,
+    feeds: &'static str,
+    (pending, in_scope): (usize, usize),
+    notes: Vec<String>,
+) -> PipelineStep {
+    let rate = pass_timings::rate(app, key);
+    PipelineStep {
+        key,
+        label,
+        method,
+        kind,
+        ai: matches!(kind, "classifier" | "llm"),
+        repeatable: kind != "llm",
+        hardware,
+        writes,
+        feeds,
+        in_scope,
+        pending,
+        secs_per_item: rate.secs_per_item,
+        rate_measured: rate.measured,
+        rate_runs: rate.runs,
+        rate_last_at: rate.last_at,
+        pending_secs: pending as f64 * rate.secs_per_item,
+        all_secs: in_scope as f64 * rate.secs_per_item,
+        notes,
+    }
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{} {}", count, if count == 1 { one } else { many })
+}
+
+#[tauri::command(async)]
+fn get_pipeline_overview(app: AppHandle, root: String, scope: Option<RunScope>) -> Result<PipelineOverview, String> {
+    let root_buf = root_path(&root)?;
+    let scope = scope.unwrap_or_default();
+    let mut config = load_library_config(&root_buf);
+    refresh_desc_cues(&root_buf, &mut config, false);
+    let view = library_view_from_records(&root_buf, &config);
+    let plan = load_chunk_plan(&root_buf);
+
+    // The same selectors the passes use, run over the scope's images only — so each figure is the
+    // work a scoped run of that pass would really do.
+    let scoped = LibraryView {
+        root: view.root.clone(),
+        source_pattern_preset: None,
+        source_pattern_regex: None,
+        ocr_word_threshold: view.ocr_word_threshold,
+        ocr_area_threshold: view.ocr_area_threshold,
+        nsfw_score_threshold: view.nsfw_score_threshold,
+        source_folders: Vec::new(),
+        categories: Vec::new(),
+        unclassified_count: 0,
+        images: view.images.iter().filter(|image| scope.includes(image)).cloned().collect(),
+        pending: PendingAnalysis::default(),
+    };
+    let counts = |pending: fn(&LibraryView, &LibraryConfig, bool) -> usize| {
+        (pending(&scoped, &config, false), pending(&scoped, &config, true))
+    };
+    let nsfw = counts(|view, config, force| pending_nsfw(view, config, force).len());
+    let titles = counts(|view, config, force| pending_chunk(view, config, force).len());
+    let text = counts(|view, config, force| pending_text(view, config, force).len());
+    let extract = counts(|view, config, force| pending_text_extraction(view, config, force).len());
+    let (vision_pending, skips) = pending_vision(&scoped, &config, plan.as_ref(), false);
+    let vision = (vision_pending.len(), pending_vision(&scoped, &config, plan.as_ref(), true).0.len());
+
+    let mut excluded_categories: Vec<String> = excluded_analysis_categories(&config).into_iter().collect();
+    excluded_categories.sort();
+    let mut excluded_folders = config.excluded_analysis_folders.clone();
+    excluded_folders.sort();
+
+    let mut vision_notes = Vec::new();
+    if skips.unscored > 0 {
+        vision_notes.push(format!("{} wait for Explicit to score them first.", plural(skips.unscored, "image", "images")));
+    }
+    if skips.video > 0 {
+        vision_notes.push(format!(
+            "{} not sampled — Video titles keeps about 10 frames per video for description.",
+            plural(skips.video, "video frame", "video frames")
+        ));
+    }
+    if skips.explicit > 0 {
+        vision_notes.push(format!("{} never described.", plural(skips.explicit, "explicit image", "explicit images")));
+    }
+    if skips.quarantined > 0 {
+        vision_notes.push(format!(
+            "{} set aside for crashing the model server; only Redo all tries them.",
+            plural(skips.quarantined, "image", "images")
+        ));
+    }
+    let korean = ocr::korean_ocr_available();
+    let settings = load_app_settings(&app);
+    let model = vision_model(&settings);
+
+    let steps = vec![
+        pipeline_step(
+            &app,
+            "nsfw",
+            "Explicit",
+            "NudeNet image classifier (ONNX, on the CPU) scores each image".to_string(),
+            "classifier",
+            "CPU",
+            "an explicit-content score per image",
+            "the Explicit category, at the threshold in Settings",
+            nsfw,
+            Vec::new(),
+        ),
+        pipeline_step(
+            &app,
+            "chunk",
+            "Video titles",
+            format!(
+                "Windows OCR reads the title band ({}), then frames are grouped per video",
+                if korean { "English + Korean" } else { "English; Korean once that OCR language is installed" }
+            ),
+            "ocr",
+            "CPU",
+            "the window title of each frame, and the video plan",
+            "K-pop by title, and which frames Describe samples",
+            titles,
+            Vec::new(),
+        ),
+        pipeline_step(
+            &app,
+            "text",
+            "Text amount",
+            "Windows OCR counts the words and the area text covers".to_string(),
+            "ocr",
+            "CPU",
+            "a word count and a text-area ratio per image",
+            "the Low Text / High Text split, at the thresholds in Settings",
+            text,
+            vec!["Explicit images are skipped: their score already decides them.".to_string()],
+        ),
+        pipeline_step(
+            &app,
+            "ocr",
+            "Extract text",
+            "Windows OCR writes out all the text it reads".to_string(),
+            "ocr",
+            "CPU",
+            "one text file per image",
+            "the Extracted Text search index",
+            extract,
+            Vec::new(),
+        ),
+        pipeline_step(
+            &app,
+            "vision",
+            "Describe",
+            format!("Local vision model “{model}” through LM Studio writes a description"),
+            "llm",
+            "GPU",
+            "a description per image",
+            "K-pop by the description's title and opening, Geo, scene kinds",
+            vision,
+            vision_notes,
+        ),
+    ];
+
+    // The rules are re-applied in memory to measure them — learning nothing, saving nothing.
+    learn_kpop_titles(&root_buf, &mut config, false)?;
+    let (rules, _) = apply_rules(&mut config);
+
+    let mut categories: BTreeMap<String, usize> = BTreeMap::new();
+    let mut folders: BTreeMap<String, usize> = BTreeMap::new();
+    for image in &view.images {
+        *categories.entry(image.category.clone().unwrap_or_default()).or_insert(0) += 1;
+        *folders.entry(image.source_folder.clone()).or_insert(0) += 1;
+    }
+    let to_options = |map: BTreeMap<String, usize>| -> Vec<ScopeOption> {
+        map.into_iter().map(|(name, count)| ScopeOption { name, count }).collect()
+    };
+
+    Ok(PipelineOverview {
+        scope_images: scoped.images.len(),
+        library_images: view.images.len(),
+        scope,
+        steps,
+        rules,
+        categories: to_options(categories),
+        folders: to_options(folders),
+        excluded_categories,
+        excluded_folders,
+        counted_at_ms: fs::metadata(sidecar_path(&root_buf))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as u64),
+        vision_model: model,
     })
 }
 
@@ -3513,7 +4497,7 @@ fn reclassify_nsfw_categories(config: &mut LibraryConfig) {
     }
 }
 
-fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
+fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunScope) {
     let control = app.state::<NsfwControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
@@ -3537,6 +4521,7 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 
         let pending: Vec<(String, String, String)> = pending_nsfw(&view, &config, force)
             .into_iter()
+            .filter(|img| scope.includes(img))
             .map(|img| (img.hash.clone(), img.path.clone(), img.name.clone()))
             .collect();
         drop(config);
@@ -3544,12 +4529,15 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         let total = pending.len();
         let mut cancelled = false;
         let mut results: Vec<(String, f32, Vec<String>)> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
 
         for (index, (hash, path, name)) in pending.iter().enumerate() {
             if is_cancelled() {
                 cancelled = true;
                 break;
             }
+            done += 1;
             // Not abandoned mid-item like the model calls are: one ONNX score is ~100 ms, so the
             // between-items check already answers a Stop faster than a user can notice, and the
             // `Session` would have to be moved in and out of a worker thread for every image.
@@ -3576,6 +4564,7 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         commit_nsfw_results(root_buf, &mut results)?;
+        pass_timings::record(app, "nsfw", done, started.elapsed());
 
         let message = if total == 0 { Some("No images needed NSFW analysis.".to_string()) } else { None };
         Ok((if cancelled { "cancelled" } else { "completed" }, message))
@@ -3591,7 +4580,13 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool) {
 }
 
 #[tauri::command]
-fn analyze_nsfw(app: AppHandle, control: tauri::State<'_, NsfwControl>, root: String, force: bool) -> Result<(), String> {
+fn analyze_nsfw(
+    app: AppHandle,
+    control: tauri::State<'_, NsfwControl>,
+    root: String,
+    force: bool,
+    scope: Option<RunScope>,
+) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("NSFW analysis is already running.".to_string());
     }
@@ -3604,7 +4599,8 @@ fn analyze_nsfw(app: AppHandle, control: tauri::State<'_, NsfwControl>, root: St
     };
     control.cancel.store(false, Ordering::SeqCst);
     let app_handle = app.clone();
-    std::thread::spawn(move || run_nsfw_analysis(&app_handle, &root_buf, force));
+    let scope = scope.unwrap_or_default();
+    std::thread::spawn(move || run_nsfw_analysis(&app_handle, &root_buf, force, &scope));
     Ok(())
 }
 
@@ -3878,6 +4874,7 @@ fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
     let settings = load_app_settings(app);
     // Read before the struct literal moves `auto_refresh_roots` out of `settings`.
     let vision_minutes = vision_limit_minutes(&settings);
+    let titles_minutes = title_limit_minutes(&settings);
     let task = scheduled_task_state();
     AutoRefreshSettingsView {
         enabled: settings.auto_refresh_enabled,
@@ -3888,6 +4885,8 @@ fn auto_refresh_settings_view(app: &AppHandle) -> AutoRefreshSettingsView {
         run_text_extraction: settings.auto_refresh_text_extraction.unwrap_or(false),
         run_vision: settings.auto_refresh_vision.unwrap_or(false),
         vision_minutes,
+        run_titles: settings.auto_refresh_titles.unwrap_or(true),
+        titles_minutes,
         gpu_wait: settings.auto_refresh_gpu_wait.unwrap_or(true),
         low_priority: settings.auto_refresh_low_priority.unwrap_or(true),
         toast: settings.auto_refresh_toast.unwrap_or(true),
@@ -3913,6 +4912,14 @@ fn vision_limit_minutes(settings: &AppSettings) -> u32 {
     settings
         .auto_refresh_vision_minutes
         .unwrap_or(DEFAULT_VISION_LIMIT_MINUTES)
+        .min(MAX_VISION_LIMIT_MINUTES)
+}
+
+/// The nightly title pass's budget, in minutes. `0` means "read the backlog down".
+fn title_limit_minutes(settings: &AppSettings) -> u32 {
+    settings
+        .auto_refresh_titles_minutes
+        .unwrap_or(DEFAULT_TITLE_LIMIT_MINUTES)
         .min(MAX_VISION_LIMIT_MINUTES)
 }
 
@@ -3945,6 +4952,8 @@ fn set_auto_refresh_settings(
     run_text_extraction: bool,
     run_vision: bool,
     vision_minutes: u32,
+    run_titles: bool,
+    titles_minutes: u32,
     gpu_wait: bool,
     low_priority: bool,
     toast: bool,
@@ -3953,6 +4962,11 @@ fn set_auto_refresh_settings(
     if vision_minutes > MAX_VISION_LIMIT_MINUTES {
         return Err(format!(
             "The description time limit must be {MAX_VISION_LIMIT_MINUTES} minutes or less (0 = no limit)."
+        ));
+    }
+    if titles_minutes > MAX_VISION_LIMIT_MINUTES {
+        return Err(format!(
+            "The title-reading time limit must be {MAX_VISION_LIMIT_MINUTES} minutes or less (0 = no limit)."
         ));
     }
     let mut settings = load_app_settings(&app);
@@ -3964,6 +4978,8 @@ fn set_auto_refresh_settings(
     settings.auto_refresh_text_extraction = Some(run_text_extraction);
     settings.auto_refresh_vision = Some(run_vision);
     settings.auto_refresh_vision_minutes = Some(vision_minutes);
+    settings.auto_refresh_titles = Some(run_titles);
+    settings.auto_refresh_titles_minutes = Some(titles_minutes);
     settings.auto_refresh_gpu_wait = Some(gpu_wait);
     settings.auto_refresh_low_priority = Some(low_priority);
     settings.auto_refresh_toast = Some(toast);
@@ -4080,12 +5096,19 @@ fn pending_for_passes(pending: &PendingAnalysis, bits: usize) -> usize {
 
 /// The passes a scheduled run is currently configured to perform, as a `PASS_BIT_*` mask.
 ///
-/// Video Dedup is deliberately absent: the nightly job has never run it, and the chunk plan it
-/// builds is an interactive decision about which frames are worth describing.
+/// Video Dedup (the title pass) was left out of the nightly job until 2026-10, on the grounds that
+/// the chunk plan is an interactive decision about which frames are worth describing. What that
+/// cost: nothing read a title unattended, so 22,571 frames went unread from mid-August and every
+/// one of them was offered to the description pass as if it were a lone image. The plan rebuild a
+/// pass ends with is NOT forced — frozen selections carry over and only new groups are sampled —
+/// so running it nightly adds groups without reshuffling any reviewed one.
 fn scheduled_pass_bits(settings: &AppSettings) -> usize {
     let mut bits = 0;
     if settings.auto_refresh_nsfw.unwrap_or(true) {
         bits |= PASS_BIT_NSFW;
+    }
+    if settings.auto_refresh_titles.unwrap_or(true) {
+        bits |= PASS_BIT_CHUNK;
     }
     if settings.auto_refresh_text_analysis.unwrap_or(true) {
         bits |= PASS_BIT_TEXT;
@@ -4105,6 +5128,7 @@ fn pass_keys(bits: usize) -> Vec<String> {
     [
         (PASS_BIT_NSFW, "nsfw"),
         (PASS_BIT_TEXT, "text"),
+        (PASS_BIT_CHUNK, "chunk"),
         (PASS_BIT_OCR, "ocr"),
         (PASS_BIT_VISION, "vision"),
     ]
@@ -4270,6 +5294,20 @@ fn spawn_run_supervisor(app: &AppHandle, shared: &Arc<Mutex<auto_run::RunState>>
                 cancel_all_passes(&app);
             }
 
+            // The title pass's budget — same mechanism as the GPU one below. Fired whatever phase
+            // the run is in: a deadline that passes during another folder's Text pass is still
+            // spent, and `title_budget_spent` keeps the next folder's title pass from starting.
+            let deadline = state.title_deadline_ms;
+            if deadline > 0 && !state.hit_title_limit && auto_run::now_ms() >= deadline {
+                state.hit_title_limit = true;
+                let control = app.state::<ChunkControl>();
+                control.hit_time_limit.store(true, Ordering::SeqCst);
+                control.cancel.store(true, Ordering::SeqCst);
+                if state.phase == "titles" {
+                    state.label = "Stopping titles — reached the time limit".to_string();
+                }
+            }
+
             // The GPU budget. `vision_deadline_ms` is only set once descriptions are actually
             // flowing, so the hours the GPU gate may spend waiting for a free card are not charged
             // against it.
@@ -4326,11 +5364,51 @@ fn set_run_phase(shared: &Arc<Mutex<auto_run::RunState>>, phase: &str, label: &s
     state.current_name = None;
 }
 
+/// Starts the title pass's clock, once per run — the first folder's pass arms it and later
+/// folders' passes draw down the same budget. `0` minutes = no limit, nothing armed.
+fn arm_title_deadline(shared: &Arc<Mutex<auto_run::RunState>>, minutes: u32) {
+    let Ok(mut state) = shared.lock() else { return };
+    if minutes > 0 && state.title_deadline_ms == 0 {
+        state.title_deadline_ms = auto_run::now_ms() + u64::from(minutes) * 60_000;
+        state.title_limit_minutes = minutes;
+    }
+}
+
+fn title_budget_spent(shared: &Arc<Mutex<auto_run::RunState>>) -> bool {
+    shared
+        .lock()
+        .map(|state| state.hit_title_limit || (state.title_deadline_ms > 0 && auto_run::now_ms() >= state.title_deadline_ms))
+        .unwrap_or(false)
+}
+
 fn set_run_root(shared: &Arc<Mutex<auto_run::RunState>>, root: &str, index: usize, total: usize) {
     let Ok(mut state) = shared.lock() else { return };
     state.root = Some(root.to_string());
     state.root_index = index;
     state.root_total = total;
+}
+
+/// Which passes a scheduled run is set to perform. A struct rather than five positional bools: two
+/// adjacent `bool` arguments swapped at a call site compile fine and silently skip a pass.
+#[derive(Debug, Clone, Copy, Default)]
+struct ScheduledPasses {
+    nsfw: bool,
+    text: bool,
+    titles: bool,
+    ocr: bool,
+    vision: bool,
+}
+
+impl ScheduledPasses {
+    fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            nsfw: settings.auto_refresh_nsfw.unwrap_or(true),
+            text: settings.auto_refresh_text_analysis.unwrap_or(true),
+            titles: settings.auto_refresh_titles.unwrap_or(true),
+            ocr: settings.auto_refresh_text_extraction.unwrap_or(false),
+            vision: settings.auto_refresh_vision.unwrap_or(false),
+        }
+    }
 }
 
 /// A run's outstanding work per pass, accumulated one folder at a time off the scan each folder
@@ -4342,6 +5420,7 @@ struct PassQueue {
     eligible: usize,
     nsfw: usize,
     text: usize,
+    titles: usize,
     ocr: usize,
     vision: usize,
     /// Descriptions this run's own Explicit pass would unlock. Vision refuses to look at an
@@ -4356,6 +5435,7 @@ impl PassQueue {
         self.eligible += pending.eligible_images;
         self.nsfw += pending_for_passes(pending, PASS_BIT_NSFW);
         self.text += pending_for_passes(pending, PASS_BIT_TEXT);
+        self.titles += pending_for_passes(pending, PASS_BIT_CHUNK);
         self.ocr += pending_for_passes(pending, PASS_BIT_OCR);
         self.vision += pending_for_passes(pending, PASS_BIT_VISION);
         self.vision_unlockable += pending.vision_skipped_unscored;
@@ -4364,11 +5444,12 @@ impl PassQueue {
     /// Whether this run has anything at all to do. A plain sum rather than a union of the mask
     /// table, because the only question ever asked of it is whether it is zero — and for that the
     /// two agree exactly.
-    fn has_work(&self, run_nsfw: bool, run_text: bool, run_ocr: bool, run_vision: bool) -> bool {
-        (run_nsfw && self.nsfw > 0)
-            || (run_text && self.text > 0)
-            || (run_ocr && self.ocr > 0)
-            || (run_vision && self.has_vision_work(run_nsfw))
+    fn has_work(&self, passes: ScheduledPasses) -> bool {
+        (passes.nsfw && self.nsfw > 0)
+            || (passes.text && self.text > 0)
+            || (passes.titles && self.titles > 0)
+            || (passes.ocr && self.ocr > 0)
+            || (passes.vision && self.has_vision_work(passes.nsfw))
     }
 
     /// Whether the description pass would find anything, counted before the Explicit pass ran.
@@ -4438,10 +5519,16 @@ fn run_headless_refresh(app: &AppHandle) {
             .show();
     }
 
-    let run_nsfw = settings.auto_refresh_nsfw.unwrap_or(true);
-    let run_text_analysis_pass = settings.auto_refresh_text_analysis.unwrap_or(true);
-    let run_text_extraction_pass = settings.auto_refresh_text_extraction.unwrap_or(false);
-    let run_vision_pass = settings.auto_refresh_vision.unwrap_or(false);
+    let passes = ScheduledPasses::from_settings(&settings);
+    let run_nsfw = passes.nsfw;
+    let run_text_analysis_pass = passes.text;
+    let run_title_pass = passes.titles;
+    let run_text_extraction_pass = passes.ocr;
+    let run_vision_pass = passes.vision;
+    let titles_minutes = title_limit_minutes(&settings);
+    // Set once the title budget ran out, by the supervisor mid-pass or found spent before a later
+    // folder's pass: what is left is the next night's, and the summary says so.
+    let mut titles_stopped_at_limit = false;
 
     let total_roots = roots.len();
     let mut folders_done = 0usize;
@@ -4483,7 +5570,7 @@ fn run_headless_refresh(app: &AppHandle) {
             let control = app.state::<NsfwControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
-            run_nsfw_analysis(app, &root_buf, false);
+            run_nsfw_analysis(app, &root_buf, false, &RunScope::default());
             if app.state::<NsfwControl>().cancel.load(Ordering::SeqCst) {
                 cancelled = true;
             }
@@ -4496,9 +5583,35 @@ fn run_headless_refresh(app: &AppHandle) {
             let control = app.state::<AnalysisControl>();
             control.running.store(true, Ordering::SeqCst);
             control.cancel.store(false, Ordering::SeqCst);
-            run_text_analysis(app, &root_buf, false);
+            run_text_analysis(app, &root_buf, false, &RunScope::default());
             if app.state::<AnalysisControl>().cancel.load(Ordering::SeqCst) {
                 cancelled = true;
+            }
+        }
+        // After Text, because the K-pop category only ever takes what would be Low Text, so a frame
+        // needs its word count before its title can move it. One budget for the whole run, armed
+        // when the first folder's pass starts; a later folder whose turn comes after it ran out
+        // is left for the next night rather than started and stopped at once.
+        if run_title_pass
+            && !cancelled
+            && !titles_stopped_at_limit
+            && pending_for_passes(&view.pending, PASS_BIT_CHUNK) > 0
+        {
+            if title_budget_spent(&shared) {
+                titles_stopped_at_limit = true;
+            } else {
+                arm_title_deadline(&shared, titles_minutes);
+                set_run_phase(&shared, "titles", "Reading video titles");
+                let control = app.state::<ChunkControl>();
+                control.running.store(true, Ordering::SeqCst);
+                control.cancel.store(false, Ordering::SeqCst);
+                run_chunk_scan(app, &root_buf, false, &RunScope::default());
+                let control = app.state::<ChunkControl>();
+                if control.hit_time_limit.load(Ordering::SeqCst) {
+                    titles_stopped_at_limit = true;
+                } else if control.cancel.load(Ordering::SeqCst) {
+                    cancelled = true;
+                }
             }
         }
         if run_text_extraction_pass && !cancelled && pending_for_passes(&view.pending, PASS_BIT_OCR) > 0 {
@@ -4508,7 +5621,7 @@ fn run_headless_refresh(app: &AppHandle) {
             control.cancel.store(false, Ordering::SeqCst);
             // Unscoped, as the nightly job always has been: it is the "keep everything current"
             // pass, not the search index's own top-up.
-            run_text_extraction(app, &root_buf, false, false);
+            run_text_extraction(app, &root_buf, false, false, &RunScope::default());
             if app.state::<OcrTextControl>().cancel.load(Ordering::SeqCst) {
                 cancelled = true;
             }
@@ -4567,8 +5680,7 @@ fn run_headless_refresh(app: &AppHandle) {
         Some(note)
     };
 
-    let no_work = !cancelled
-        && !queued.has_work(run_nsfw, run_text_analysis_pass, run_text_extraction_pass, run_vision_pass);
+    let no_work = !cancelled && !queued.has_work(passes);
 
     let mut summary = if cancelled {
         format!(
@@ -4589,6 +5701,11 @@ fn run_headless_refresh(app: &AppHandle) {
     } else {
         format!("Completed {folders_done} folder{}.", if folders_done == 1 { "" } else { "s" })
     };
+    if titles_stopped_at_limit && !cancelled {
+        summary.push_str(&format!(
+            " Video titles stopped at the {titles_minutes}-minute limit; the rest is left for the next run."
+        ));
+    }
     // Redundant next to the sentence above, which already covers every pass including this one.
     if let Some(note) = vision_note.filter(|_| !no_work) {
         summary.push(' ');
@@ -4743,7 +5860,7 @@ fn run_headless_vision(
         }
         let control = app.state::<VisionControl>();
         control.running.store(true, Ordering::SeqCst);
-        tally.add(run_vision_analysis(app, &PathBuf::from(root), false));
+        tally.add(run_vision_analysis(app, &PathBuf::from(root), false, &RunScope::default()));
         if hit_limit() {
             return HeadlessVisionOutcome::HitTimeLimit;
         }
@@ -4867,6 +5984,7 @@ fn build_chunk_plan(
     control: tauri::State<'_, ChunkControl>,
     root: String,
     force: bool,
+    scope: Option<RunScope>,
 ) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("Video chunk scan is already running.".to_string());
@@ -4880,7 +5998,8 @@ fn build_chunk_plan(
     };
     control.cancel.store(false, Ordering::SeqCst);
     let app_handle = app.clone();
-    std::thread::spawn(move || run_chunk_scan(&app_handle, &root_buf, force));
+    let scope = scope.unwrap_or_default();
+    std::thread::spawn(move || run_chunk_scan(&app_handle, &root_buf, force, &scope));
     Ok(())
 }
 
@@ -4895,7 +6014,7 @@ fn cancel_chunk_scan(control: tauri::State<'_, ChunkControl>) -> Result<(), Stri
 
 // OCRs the title strip of every not-yet-scanned image (resumable via `video_title`), then rebuilds
 // the chunk plan (preserving frozen selections unless `force`). Mirrors the other passes' skeleton.
-fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
+fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunScope) {
     let control = app.state::<ChunkControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
 
@@ -4904,26 +6023,62 @@ fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
             return Ok(("cancelled", Some(STOPPED_DURING_SCAN.to_string())));
         };
         let config = load_library_config(root_buf);
+        let korean_engine = ocr::korean_engine();
 
-        let pending: Vec<(String, String, String)> = pending_chunk(&view, &config, force)
+        // Which of the two readings each frame still owes. A frame titled before the Korean pack was
+        // installed needs only the Korean one; reading the English again would cost the same again
+        // and could only move a grouping key. A frame whose English reading is still to come gets
+        // its Korean one only if that English reading finds a title (see `pending_chunk`).
+        let pending: Vec<(String, String, String, bool, bool)> = pending_chunk(&view, &config, force)
             .into_iter()
-            .map(|image| (image.hash.clone(), image.path.clone(), image.name.clone()))
+            .filter(|image| scope.includes(image))
+            .map(|image| {
+                let record = config.images.get(&image.hash);
+                let stored_english = record.and_then(|record| record.video_title.as_deref());
+                let needs_english = force || stored_english.is_none();
+                let needs_korean = korean_engine.is_some()
+                    && (needs_english
+                        || (stored_english.is_some_and(|title| !title.is_empty())
+                            && record.is_some_and(|record| record.video_title_ko.is_none())));
+                (image.hash.clone(), image.path.clone(), image.name.clone(), needs_english, needs_korean)
+            })
             .collect();
         drop(config);
 
+        // Created once for the pass rather than per frame. Both are used only on this thread.
+        let english_engine = ocr::default_engine()?;
+
         let total = pending.len();
         let mut cancelled = false;
-        let mut results: Vec<(String, String)> = Vec::new();
+        let mut results: Vec<TitleReading> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
 
-        for (index, (hash, path, name)) in pending.iter().enumerate() {
+        for (index, (hash, path, name, needs_english, needs_korean)) in pending.iter().enumerate() {
             if is_cancelled() {
                 cancelled = true;
                 break;
             }
-            match ocr::extract_title_strip(Path::new(path), TITLE_STRIP_TOP_FRACTION) {
-                // `Some(title)` for a video; `""` means "scanned, no video marker found".
-                Ok(strip) => results.push((hash.clone(), clean_title(&strip).unwrap_or_default())),
-                Err(error) => eprintln!("Title-strip OCR failed for {path}: {error}"),
+            done += 1;
+            // `Some(title)` for a video; `""` means "scanned, no video marker found".
+            let read = |engine: &windows::Media::Ocr::OcrEngine| {
+                match ocr::extract_title_band_with(engine, Path::new(path), TITLE_STRIP_TOP_FRACTION) {
+                    Ok(strip) => Some(clean_title(&strip).unwrap_or_default()),
+                    Err(error) => {
+                        eprintln!("Title-strip OCR failed for {path}: {error}");
+                        None
+                    }
+                }
+            };
+            let english = if *needs_english { read(&english_engine) } else { None };
+            // Freshly read with no title found: nothing for the Korean engine to improve.
+            let untitled = english.as_deref().is_some_and(str::is_empty);
+            let korean = match (&korean_engine, *needs_korean && !untitled) {
+                (Some(engine), true) => read(engine),
+                _ => None,
+            };
+            if english.is_some() || korean.is_some() {
+                results.push(TitleReading { hash: hash.clone(), english, korean });
             }
 
             if results.len() >= ANALYSIS_CHECKPOINT_EVERY {
@@ -4937,6 +6092,7 @@ fn run_chunk_scan(app: &AppHandle, root_buf: &Path, force: bool) {
         }
 
         commit_chunk_results(root_buf, &mut results)?;
+        pass_timings::record(app, "chunk", done, started.elapsed());
 
         let summary = rebuild_and_save_plan(root_buf, force)?;
         let message = Some(format!(
@@ -5196,6 +6352,7 @@ fn analyze_vision(
     control: tauri::State<'_, VisionControl>,
     root: String,
     force: bool,
+    scope: Option<RunScope>,
 ) -> Result<(), String> {
     if control.running.swap(true, Ordering::SeqCst) {
         return Err("Vision description is already running.".to_string());
@@ -5209,8 +6366,9 @@ fn analyze_vision(
     };
     control.cancel.store(false, Ordering::SeqCst);
     let app_handle = app.clone();
+    let scope = scope.unwrap_or_default();
     std::thread::spawn(move || {
-        run_vision_analysis(&app_handle, &root_buf, force);
+        run_vision_analysis(&app_handle, &root_buf, force, &scope);
     });
     Ok(())
 }
@@ -5496,7 +6654,7 @@ fn check_model_server(
     }
 }
 
-fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionTally {
+fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunScope) -> VisionTally {
     let control = app.state::<VisionControl>();
     let is_cancelled = || control.cancel.load(Ordering::SeqCst);
     let mut tally = VisionTally::default();
@@ -5527,6 +6685,7 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionT
 
         let pending: Vec<(String, String, String, String, Option<String>)> = eligible
             .into_iter()
+            .filter(|image| scope.includes(image))
             .map(|image| {
                 let title = config
                     .images
@@ -5631,6 +6790,10 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionT
         let rest_models_url = vision_rest_models_url(&settings);
         let mut quarantined: Vec<String> = Vec::new();
         let mut server_down: Option<String> = None;
+        // Timed from after the warm-up: loading the model is once per run, and the Analysis panel's
+        // estimate is a per-image figure.
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
 
         for (index, (hash, path, name, relative_path, title)) in pending.iter().enumerate() {
             if is_cancelled() {
@@ -5745,6 +6908,7 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionT
                     eprintln!("Vision worker for {path} ended without a result.");
                 }
             }
+            done += 1;
             // Each request re-armed the endpoint's idle countdown, so the keep-alive has nothing to
             // do while a pass is grinding.
             app.state::<ModelLease>().note_request();
@@ -5776,6 +6940,7 @@ fn run_vision_analysis(app: &AppHandle, root_buf: &Path, force: bool) -> VisionT
         commit_vision_results(root_buf, &mut results)?;
         commit_vision_quarantine(root_buf, &mut quarantined)?;
         write_vision_index(root_buf, &desc_dir)?;
+        pass_timings::record(app, "vision", done, started.elapsed());
 
         let described_ok = tally.described;
         if let Some(reason) = server_down {
@@ -6736,7 +7901,12 @@ mod pending_selection_tests {
             &["2026-01"],
         );
 
-        assert_eq!(hashes(&pending_chunk(&view, &config, false)), vec!["fresh"]);
+        // With the Korean OCR pack installed, a TITLED frame still owes its Korean reading
+        // (`title_reading_pending`) — the untitled one never does, which is the point here.
+        let mut pending = hashes(&pending_chunk(&view, &config, false));
+        pending.sort();
+        let expected = if ocr::korean_ocr_available() { vec!["fresh", "titled"] } else { vec!["fresh"] };
+        assert_eq!(pending, expected);
         assert_eq!(pending_chunk(&view, &config, true).len(), 3, "force takes everything");
     }
 
@@ -7008,6 +8178,336 @@ mod pending_selection_tests {
     }
 }
 
+// Where the K-pop category sits in `reclassify_text_categories`: below a hand sort and Explicit,
+// above Low Text, never over High Text — and assigned once, so `classified_at` stays put.
+#[cfg(test)]
+mod kpop_classification_tests {
+    use super::*;
+
+    /// A screenshot captured at `secs` past 12:00:00 on 2026-10-18, with its OCR stats and titles.
+    fn frame(secs: u32, low_text: bool, english: Option<&str>) -> ImageRecord {
+        ImageRecord {
+            last_known_path: format!("Screenshots 10-2026/screenshot_20261018_12{:02}{:02}_000_window.png", secs / 60, secs % 60),
+            ocr_word_count: Some(if low_text { 5 } else { 500 }),
+            ocr_text_area_ratio: Some(if low_text { 0.01 } else { 0.4 }),
+            nsfw_score: Some(0.0),
+            video_title: english.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn category(config: &LibraryConfig, hash: &str) -> (Option<String>, Option<String>) {
+        let record = &config.images[hash];
+        (record.category.clone(), record.classified_by.clone())
+    }
+
+    #[test]
+    fn kpop_takes_low_text_only_and_yields_to_manual_and_explicit() {
+        let mv = Some("(1) aespa 'LEMONADE MV");
+        let mut config = LibraryConfig::default();
+        config.images.insert("low".into(), frame(0, true, mv));
+        config.images.insert("high".into(), frame(1, false, mv));
+        let mut explicit = frame(2, true, mv);
+        explicit.nsfw_score = Some(0.99);
+        config.images.insert("explicit".into(), explicit);
+        let mut manual = frame(3, true, mv);
+        manual.category = Some("Previously pinned".into());
+        manual.classified_by = Some("manual".into());
+        config.images.insert("manual".into(), manual);
+        config.images.insert("drive".into(), frame(4, true, Some("Driving in Bulgaria BG 4K")));
+
+        reclassify_text_categories(&mut config);
+
+        assert_eq!(category(&config, "low"), (Some("K-pop".into()), Some("auto-kpop".into())));
+        assert_eq!(category(&config, "high").0.as_deref(), Some(HIGH_TEXT_CATEGORY), "High Text stays High Text");
+        assert_eq!(category(&config, "explicit").0.as_deref(), Some(EXPLICIT_CATEGORY));
+        assert_eq!(category(&config, "manual").0.as_deref(), Some("Previously pinned"));
+        assert_eq!(category(&config, "drive").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert!(config.categories.iter().any(|name| name == "K-pop"));
+    }
+
+    #[test]
+    fn untitled_frames_between_kpop_frames_are_filled_once() {
+        let mv = Some("IVE 'XOXZ' MV");
+        let mut config = LibraryConfig::default();
+        config.images.insert("a".into(), frame(0, true, mv));
+        config.images.insert("gap".into(), frame(5, true, Some(""))); // scanned, no title
+        config.images.insert("unread".into(), frame(6, true, None)); // not scanned yet: not evidence
+        config.images.insert("b".into(), frame(10, true, mv));
+        config.images.insert("after".into(), frame(20, true, Some(""))); // nothing K-pop after it
+
+        reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "gap").0.as_deref(), Some("K-pop"));
+        assert_eq!(category(&config, "unread").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert_eq!(category(&config, "after").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+
+        // A second save must not touch the stamp: the dashboard reads `classified_at` as "changed".
+        let stamped = config.images["gap"].classified_at.clone();
+        config.images.get_mut("gap").unwrap().classified_at = Some("sentinel".into());
+        reclassify_text_categories(&mut config);
+        assert_eq!(config.images["gap"].classified_at.as_deref(), Some("sentinel"));
+        assert!(stamped.is_some());
+    }
+
+    #[test]
+    fn the_korean_reading_counts_and_a_removed_name_releases_its_frames() {
+        let mut config = LibraryConfig::default();
+        let mut everland = frame(0, true, Some("IVE ForEVER I with EVERLAND"));
+        everland.video_title_ko = Some("IVE와 함께 ForEVER | with EVERLAND".into());
+        config.images.insert("everland".into(), everland);
+        config.images.insert("newgroup".into(), frame(500, true, Some("Some Rookies Live Stage")));
+        config.kpop_extra_terms = vec!["Some Rookies".into()];
+
+        reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "everland").0.as_deref(), Some("K-pop"));
+        assert_eq!(category(&config, "newgroup").0.as_deref(), Some("K-pop"));
+
+        config.kpop_extra_terms.clear();
+        reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "newgroup"), (Some(LOW_TEXT_CATEGORY.into()), Some("auto".into())));
+    }
+
+    fn cues(entries: &[(&str, &str)]) -> Arc<desc_cues::CueMap> {
+        Arc::new(entries.iter().map(|(hash, text)| (hash.to_string(), desc_cues::parse(text))).collect())
+    }
+
+    #[test]
+    fn the_description_reads_the_title_the_band_garbled() {
+        let mut config = LibraryConfig::default();
+        // OCR kept only the tail; the vision model quoted the whole title.
+        config.images.insert("nmixx".into(), frame(0, true, Some("e e e (See that?)\" M/V x")));
+        config.images.insert("crayon".into(), frame(500, true, Some("")));
+        config.images.insert("drive".into(), frame(1000, true, Some("")));
+        config.desc_cues = Some(cues(&[
+            ("nmixx", "\"NMIXX(엔믹스) '별별별 (See that?)' M/V - YouTube\"\n\nThis is a video still from a music video."),
+            ("crayon", "This is an album cover photo for the K-pop group Crayon Pop. Five women pose."),
+            // The song plays in another tab; the picture is a motorcycle video.
+            ("drive", "\"FM - Crayon Pop - Deezer\", \"YouTube\", \"The Consumerism Slop Epic...\"\n\nThis is a screenshot of a YouTube video showing a motorcycle dashboard."),
+        ]));
+        let reasons = reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "nmixx").0.as_deref(), Some("K-pop"));
+        assert_eq!(category(&config, "crayon").0.as_deref(), Some("K-pop"));
+        assert_eq!(reasons.get("crayon"), Some(&KpopReason::Lead));
+        assert_eq!(category(&config, "drive").0.as_deref(), Some(LOW_TEXT_CATEGORY), "a soundtrack tab is not the picture");
+    }
+
+    #[test]
+    fn a_video_the_descriptions_identify_takes_its_undescribed_frames() {
+        let title = Some("(2) cLce,qæAl) - 'HELICOPTER' Official Music Video");
+        let mut config = LibraryConfig::default();
+        for (index, hash) in ["d1", "d2", "u1", "u2"].iter().enumerate() {
+            config.images.insert(hash.to_string(), frame(index as u32 * 1000, true, title));
+        }
+        let described = "\"(2) CLC(씨엘씨) - 'HELICOPTER' Official Music Video - YouTube\"\n\nThis is a video still from a music video.";
+        config.desc_cues = Some(cues(&[("d1", described), ("d2", described)]));
+        let reasons = reclassify_text_categories(&mut config);
+        for hash in ["d1", "d2", "u1", "u2"] {
+            assert_eq!(category(&config, hash).0.as_deref(), Some("K-pop"), "{hash}");
+        }
+        assert_eq!(reasons.get("u1"), Some(&KpopReason::SameVideo));
+    }
+
+    #[test]
+    fn a_frame_sorted_into_kpop_by_hand_teaches_its_title() {
+        let root = std::env::temp_dir().join(format!("icat-learn-{}", std::process::id()));
+        let _ = fs::create_dir_all(&root);
+        let mut config = LibraryConfig { root: Some(root.clone()), desc_cues: Some(cues(&[])), ..LibraryConfig::default() };
+        let title = Some("Official Dance (We So Alive Ver.)");
+        let mut sorted = frame(0, true, title);
+        sorted.category = Some("K-pop".into());
+        sorted.classified_by = Some("manual".into());
+        config.images.insert("sorted".into(), sorted);
+        config.images.insert("same".into(), frame(1500, true, title));
+        config.images.insert("other".into(), frame(3000, true, Some("Driving in Davao City 4K")));
+
+        let (learned, joined) = learn_from_hand_sorting(&root, &mut config).unwrap();
+        assert_eq!(learned, vec!["Official Dance (We So Alive Ver.)".to_string()]);
+        assert_eq!(joined, vec!["same".to_string()]);
+        assert_eq!(category(&config, "other").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert_eq!(kpop_learned::load(&root).titles.len(), 1, "the list is written beside the sidecar");
+
+        // Taught once: a second hand-sort of the same title adds nothing.
+        assert!(learn_from_hand_sorting(&root, &mut config).unwrap().0.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_titled_frames_owe_a_korean_reading() {
+        let with = |english: Option<&str>, korean: Option<&str>| ImageRecord {
+            video_title: english.map(str::to_string),
+            video_title_ko: korean.map(str::to_string),
+            ..Default::default()
+        };
+        // Without the pack, only the English reading is ever owed — the behaviour before it existed.
+        assert!(title_reading_pending(&with(None, None), false));
+        assert!(!title_reading_pending(&with(Some("aespa 'LEMONADE MV"), None), false));
+        // With it: titled frames backfill, untitled ones (no site marker) are done.
+        assert!(title_reading_pending(&with(Some("aespa 'LEMONADE MV"), None), true));
+        assert!(!title_reading_pending(&with(Some(""), None), true));
+        assert!(!title_reading_pending(&with(Some("aespa 'LEMONADE MV"), Some("aespa 'LEMONADE' MV")), true));
+    }
+
+    /// Diagnostic (env-gated, READ-ONLY): runs the classification over a real library in memory and
+    /// prints what would move — never saves. `ICAT_TEST_LIBRARY=<root> cargo test --lib
+    /// kpop_dry_run -- --nocapture`.
+    #[test]
+    fn kpop_dry_run_on_a_real_library() {
+        let Ok(root) = std::env::var("ICAT_TEST_LIBRARY") else {
+            eprintln!("skipping kpop dry run: ICAT_TEST_LIBRARY not set");
+            return;
+        };
+        let root = Path::new(&root);
+        let mut config = load_library_config(root);
+        let started = std::time::Instant::now();
+        // In memory only: no cue cache written, no learned titles saved.
+        refresh_desc_cues(root, &mut config, false);
+        eprintln!("description cues: {} in {:?}", config.desc_cues.as_ref().map_or(0, |cues| cues.len()), started.elapsed());
+        {
+            let matcher = kpop::Matcher::new(&config.kpop_extra_terms);
+            let cues = kpop_cues(&config);
+            let mut file = kpop_learned::load(root);
+            let hand_sorted: Vec<(String, String, [String; 2], String)> = config
+                .images
+                .iter()
+                .filter(|(_, r)| r.category.as_deref() == Some(kpop::KPOP_CATEGORY) && r.classified_by.as_deref() == Some("manual"))
+                .map(|(hash, r)| {
+                    let described = cues.get(hash).filter(|c| !c.tab_strip).map_or(String::new(), |c| c.title.clone());
+                    (
+                        hash.clone(),
+                        r.last_known_path.clone(),
+                        [r.video_title.clone().unwrap_or_default(), r.video_title_ko.clone().unwrap_or_default()],
+                        described,
+                    )
+                })
+                .collect();
+            let added = kpop_learned::learn(
+                &mut file,
+                hand_sorted.iter().map(|(hash, path, ocr, described)| kpop_learned::HandSorted {
+                    hash,
+                    path,
+                    ocr: [&ocr[0], &ocr[1]],
+                    described,
+                }),
+                |reading| matcher.matches_any(&[reading]),
+                "dry-run",
+            );
+            for entry in &added {
+                eprintln!("would learn ({}): {:?}  ← {:?}", entry.source, entry.title, entry.from_path);
+            }
+            config.kpop_learned = file.titles;
+        }
+        let before: HashMap<String, Option<String>> =
+            config.images.iter().map(|(hash, record)| (hash.clone(), record.category.clone())).collect();
+        let started = std::time::Instant::now();
+        reclassify_text_categories(&mut config);
+        eprintln!("reclassify over {} records: {:?}", config.images.len(), started.elapsed());
+
+        // What each reason newly took, with the readings behind it — the list to read for false
+        // positives before trusting a rule change.
+        let (nsfw_min, (words, area)) = (nsfw_threshold(&config), ocr_thresholds(&config));
+        let reasons = kpop_frames(&config, nsfw_min, words, area);
+        let cues = kpop_cues(&config);
+        let mut joined: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+        for (hash, record) in &config.images {
+            if record.category.as_deref() != Some(kpop::KPOP_CATEGORY) || before[hash].as_deref() == Some(kpop::KPOP_CATEGORY) {
+                continue;
+            }
+            let reason = reasons.get(hash).map_or("?".to_string(), |reason| format!("{reason:?}"));
+            let cue = cues.get(hash);
+            let shown = match record.video_title.as_deref().filter(|title| !title.is_empty()) {
+                Some(title) => format!("ocr: {title}"),
+                None => match cue {
+                    Some(cue) if !cue.title.is_empty() => format!("desc{}: {} ¦ {}", if cue.tab_strip { "[tabs]" } else { "" }, cue.title, cue.lead.chars().take(90).collect::<String>()),
+                    Some(cue) => format!("lead: {}", cue.lead.chars().take(140).collect::<String>()),
+                    None => "(nothing)".to_string(),
+                },
+            };
+            *joined.entry(reason).or_default().entry(shown).or_insert(0) += 1;
+        }
+        for (reason, shown) in &joined {
+            eprintln!("== joined K-pop by {reason}: {} frames", shown.values().sum::<usize>());
+            let mut sorted: Vec<_> = shown.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            for (line, count) in sorted.iter().take(60) {
+                eprintln!("{count:>5}  {line}");
+            }
+        }
+        // Near misses: still Low Text, but something in a reading looks K-pop. Read these for rules
+        // worth adding (or for the soundtrack-tab cases that are Low Text on purpose).
+        let suspicious = Regex::new(r"(?i)\bive\b|triple|crayon|k-?pop|idol|girl group|music video|m/v|\bmv\b|아이브|트리플").unwrap();
+        let mut near: BTreeMap<String, usize> = BTreeMap::new();
+        for (hash, record) in &config.images {
+            if record.category.as_deref() != Some(LOW_TEXT_CATEGORY) {
+                continue;
+            }
+            let ocr = record.video_title.as_deref().unwrap_or("");
+            let cue = cues.get(hash);
+            let text = format!("{ocr} {} {}", cue.map_or("", |c| c.title.as_str()), cue.map_or("", |c| c.lead.as_str()));
+            if suspicious.is_match(&text) {
+                let shown = format!(
+                    "ocr {ocr:?} · desc{} {:?} ¦ {}",
+                    if cue.is_some_and(|c| c.tab_strip) { "[tabs]" } else { "" },
+                    cue.map_or(String::new(), |c| c.title.chars().take(90).collect()),
+                    cue.map_or(String::new(), |c| c.lead.chars().take(80).collect())
+                );
+                *near.entry(shown).or_insert(0) += 1;
+            }
+        }
+        let mut near: Vec<_> = near.into_iter().collect();
+        near.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("== near misses (still Low Text): {} frames", near.iter().map(|(_, n)| n).sum::<usize>());
+        for (line, count) in near.iter().take(70) {
+            eprintln!("{count:>5}  {line}");
+        }
+        eprintln!("== left K-pop:");
+        for (hash, record) in &config.images {
+            if before[hash].as_deref() == Some(kpop::KPOP_CATEGORY) && record.category.as_deref() != Some(kpop::KPOP_CATEGORY) {
+                let cue = cues.get(hash);
+                eprintln!(
+                    "  {} → {:?} · ocr {:?} · desc{} {:?}",
+                    record.last_known_path,
+                    record.category,
+                    record.video_title,
+                    if cue.is_some_and(|cue| cue.tab_strip) { "[tabs]" } else { "" },
+                    cue.map(|cue| cue.title.chars().take(100).collect::<String>())
+                );
+            }
+        }
+
+        let mut moved: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut by_title: BTreeMap<String, usize> = BTreeMap::new();
+        let mut filled = 0usize;
+        for (hash, record) in &config.images {
+            let old = before[hash].clone().unwrap_or_else(|| "none".into());
+            let new = record.category.clone().unwrap_or_else(|| "none".into());
+            if old != new {
+                *moved.entry((old, new.clone())).or_insert(0) += 1;
+            }
+            if new == kpop::KPOP_CATEGORY {
+                match record.video_title.as_deref().filter(|title| !title.is_empty()) {
+                    Some(title) => *by_title.entry(title.to_string()).or_insert(0) += 1,
+                    None => filled += 1,
+                }
+            }
+        }
+        eprintln!("moves: {moved:?}");
+        eprintln!("K-pop with an OCR title: {} titles / {} frames · without one: {filled}",
+            by_title.len(), by_title.values().sum::<usize>());
+        let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+        for (hash, record) in &config.images {
+            if record.category.as_deref() == Some(kpop::KPOP_CATEGORY) {
+                let reason = match reasons.get(hash) {
+                    Some(KpopReason::Learned(_)) => "Learned".to_string(),
+                    Some(reason) => format!("{reason:?}"),
+                    None => "hand-sorted".to_string(),
+                };
+                *tally.entry(reason).or_insert(0) += 1;
+            }
+        }
+        eprintln!("K-pop by reason: {tally:?}");
+    }
+}
+
 // The Automation panel's queue readout, and the decisions a scheduled run makes from the same
 // counts. What is pinned here is the one thing that would be expensive to get wrong: a run that
 // calls itself empty and skips work, or a gate taken for a pass that had nothing to do.
@@ -7092,10 +8592,11 @@ mod scheduled_queue_tests {
     }
 
     #[test]
-    fn scheduled_bits_follow_the_toggles_and_never_include_video_dedup() {
+    fn scheduled_bits_follow_the_toggles() {
         let settings = AppSettings {
             auto_refresh_nsfw: Some(true),
             auto_refresh_text_analysis: Some(false),
+            auto_refresh_titles: Some(false),
             auto_refresh_text_extraction: Some(true),
             auto_refresh_vision: Some(true),
             ..Default::default()
@@ -7103,8 +8604,12 @@ mod scheduled_queue_tests {
         let bits = scheduled_pass_bits(&settings);
 
         assert_eq!(bits, PASS_BIT_NSFW | PASS_BIT_OCR | PASS_BIT_VISION);
-        assert_eq!(bits & PASS_BIT_CHUNK, 0, "the nightly job has never run Video Dedup");
         assert_eq!(pass_keys(bits), vec!["nsfw", "ocr", "vision"]);
+
+        let with_titles = AppSettings { auto_refresh_titles: Some(true), ..settings };
+        let bits = scheduled_pass_bits(&with_titles);
+        assert_eq!(bits & PASS_BIT_CHUNK, PASS_BIT_CHUNK);
+        assert_eq!(pass_keys(bits), vec!["nsfw", "chunk", "ocr", "vision"], "queue order: titles after Text");
     }
 
     /// Unset must read as the documented defaults, not as "off": every install that predates a
@@ -7114,9 +8619,10 @@ mod scheduled_queue_tests {
     fn unset_toggles_read_as_the_defaults_the_run_uses() {
         assert_eq!(
             scheduled_pass_bits(&AppSettings::default()),
-            PASS_BIT_NSFW | PASS_BIT_TEXT,
-            "Explicit and Text default on; OCR extraction and Describe default off"
+            PASS_BIT_NSFW | PASS_BIT_TEXT | PASS_BIT_CHUNK,
+            "Explicit, Text and video titles default on; OCR extraction and Describe default off"
         );
+        assert_eq!(title_limit_minutes(&AppSettings::default()), DEFAULT_TITLE_LIMIT_MINUTES, "unset is a limit, not unlimited");
     }
 
     /// The gate skip. Descriptions that Explicit would unlock are invisible to the vision count at
@@ -7132,13 +8638,18 @@ mod scheduled_queue_tests {
 
     #[test]
     fn a_run_with_every_queue_empty_has_no_work() {
+        let all = ScheduledPasses { nsfw: true, text: true, titles: true, ocr: true, vision: true };
         let empty = PassQueue { eligible: 500, ..PassQueue::default() };
-        assert!(!empty.has_work(true, true, true, true));
+        assert!(!empty.has_work(all));
 
         let one_pass = PassQueue { ocr: 1, ..PassQueue::default() };
-        assert!(one_pass.has_work(false, false, true, false));
+        assert!(one_pass.has_work(ScheduledPasses { ocr: true, ..ScheduledPasses::default() }));
         // Work for a pass this run is not configured to perform is not this run's work.
-        assert!(!one_pass.has_work(true, true, false, true));
+        assert!(!one_pass.has_work(ScheduledPasses { ocr: false, ..all }));
+
+        let titles = PassQueue { titles: 7, ..PassQueue::default() };
+        assert!(titles.has_work(ScheduledPasses { titles: true, ..ScheduledPasses::default() }));
+        assert!(!titles.has_work(ScheduledPasses { titles: false, ..all }));
     }
 
     #[test]
@@ -7812,7 +9323,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            add_kpop_title,
             add_manual_source_folder,
+            apply_rules_now,
+            get_kpop_overview,
+            get_pipeline_overview,
+            open_kpop_terms_file,
+            preview_rules,
+            remove_kpop_title,
             analyze_nsfw,
             apply_geo_review,
             analyze_text,
@@ -7951,10 +9469,14 @@ mod e2e_tests {
 
         // 3. Real Video Dedup: OCR each title strip, resolve the video title, then build the plan
         //    with samples_per_group = 2 to show de-duplication on the Pyrenees group.
-        let mut chunk_results: Vec<(String, String)> = Vec::new();
+        let mut chunk_results: Vec<TitleReading> = Vec::new();
         for image in &view.images {
             let strip = ocr::extract_title_strip(Path::new(&image.path), TITLE_STRIP_TOP_FRACTION).unwrap_or_default();
-            chunk_results.push((image.hash.clone(), clean_title(&strip).unwrap_or_default()));
+            chunk_results.push(TitleReading {
+                hash: image.hash.clone(),
+                english: Some(clean_title(&strip).unwrap_or_default()),
+                korean: None,
+            });
         }
         commit_chunk_results(root, &mut chunk_results).unwrap();
 

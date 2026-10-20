@@ -38,6 +38,15 @@ const state = {
   // polled: it is a statement about the last scan of each folder, and nothing between two opens of
   // this tab can change it except a run, which reloads it on the way out.
   autoQueue: null,
+  // Analysis panel. `pipeScope` is what the toolbar's pickers say; the overview is re-read for it
+  // on every change. `kpop` is the K-pop category's accounting and learned-titles list.
+  pipeline: null,
+  pipeScope: { kind: 'all', value: '' },
+  pipeLoading: false,
+  pipeError: null,
+  kpop: null,
+  kpopBusy: false,
+  rulesBusy: false,
   chunkPlan: null,
   // Geo layer (own sidecars, independent of categories). `geoSetImages` holds the resolved images
   // of an opened country set — an explicit ordered member list, not a filter over the library.
@@ -134,6 +143,18 @@ const els = {
   textCount: document.getElementById('text-count'),
   automationTab: document.getElementById('automation-tab'),
   automationCount: document.getElementById('automation-count'),
+  analysisTab: document.getElementById('analysis-tab'),
+  pipeView: document.getElementById('pipe-view'),
+  pipeScopeKind: document.getElementById('pipe-scope-kind'),
+  pipeScopeValue: document.getElementById('pipe-scope-value'),
+  pipeRunPendingButton: document.getElementById('pipe-run-pending-button'),
+  pipeRefreshButton: document.getElementById('pipe-refresh-button'),
+  pipeAsOf: document.getElementById('pipe-asof'),
+  pipeSteps: document.getElementById('pipe-steps'),
+  pipeTotals: document.getElementById('pipe-totals'),
+  pipeRules: document.getElementById('pipe-rules'),
+  pipeKpopReasons: document.getElementById('pipe-kpop-reasons'),
+  pipeKpopLearned: document.getElementById('pipe-kpop-learned'),
   autoView: document.getElementById('auto-view'),
   autoStateChip: document.getElementById('auto-state-chip'),
   autoRunNowButton: document.getElementById('auto-run-now-button'),
@@ -288,6 +309,8 @@ const els = {
   autoRefreshTextExtractionInput: document.getElementById('auto-refresh-text-extraction-input'),
   autoRefreshVisionInput: document.getElementById('auto-refresh-vision-input'),
   autoRefreshVisionMinutesInput: document.getElementById('auto-refresh-vision-minutes-input'),
+  autoRefreshTitlesInput: document.getElementById('auto-refresh-titles-input'),
+  autoRefreshTitlesMinutesInput: document.getElementById('auto-refresh-titles-minutes-input'),
   autoRefreshGpuWaitInput: document.getElementById('auto-refresh-gpu-wait-input'),
   autoRefreshLowPriorityInput: document.getElementById('auto-refresh-low-priority-input'),
   autoRefreshToastInput: document.getElementById('auto-refresh-toast-input'),
@@ -750,6 +773,8 @@ function syncAutoRefreshControls() {
   els.autoRefreshTextExtractionInput.checked = autoRefresh.runTextExtraction;
   els.autoRefreshVisionInput.checked = autoRefresh.runVision;
   els.autoRefreshVisionMinutesInput.value = String(autoRefresh.visionMinutes ?? 30);
+  els.autoRefreshTitlesInput.checked = autoRefresh.runTitles;
+  els.autoRefreshTitlesMinutesInput.value = String(autoRefresh.titlesMinutes ?? 30);
   els.autoRefreshGpuWaitInput.checked = autoRefresh.gpuWait;
   els.autoRefreshLowPriorityInput.checked = autoRefresh.lowPriority;
   els.autoRefreshToastInput.checked = autoRefresh.toast;
@@ -777,9 +802,13 @@ const VISION_MINUTES_MAX = 1440;
 // Falls back to whatever the backend last reported rather than to a constant, so a half-typed or
 // cleared box can never silently rewrite the limit — least of all to 0, which means "no limit".
 function normalizeVisionMinutes(raw) {
+  return normalizeLimitMinutes(raw, state.autoRefresh?.visionMinutes ?? 30);
+}
+
+function normalizeLimitMinutes(raw, fallback) {
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    return state.autoRefresh?.visionMinutes ?? 30;
+    return fallback;
   }
   return Math.min(parsed, VISION_MINUTES_MAX);
 }
@@ -796,6 +825,8 @@ async function saveAutoRefreshSettings() {
     // An empty or non-numeric box means "leave it as it was", not 0 — 0 is the explicit
     // no-limit value and must only ever come from someone actually typing it.
     visionMinutes: normalizeVisionMinutes(els.autoRefreshVisionMinutesInput.value),
+    runTitles: els.autoRefreshTitlesInput.checked,
+    titlesMinutes: normalizeLimitMinutes(els.autoRefreshTitlesMinutesInput.value, state.autoRefresh?.titlesMinutes ?? 30),
     gpuWait: els.autoRefreshGpuWaitInput.checked,
     lowPriority: els.autoRefreshLowPriorityInput.checked,
     toast: els.autoRefreshToastInput.checked,
@@ -972,6 +1003,7 @@ function renderSidebar() {
   els.textTab.classList.toggle('active', state.currentView === 'text');
   setCountPill(els.textCount, state.textStatus?.docs || 0);
   els.automationTab.classList.toggle('active', state.currentView === 'automation');
+  els.analysisTab.classList.toggle('active', state.currentView === 'analysis');
   // The pill is what the next scheduled run would process, so a schedule with nothing to do reads
   // as a calm 0 rather than as an unknown. `is-clear` is what stops that 0 looking like a fault.
   setCountPill(els.automationCount, state.autoQueue?.scheduledPending || 0);
@@ -1103,6 +1135,8 @@ function renderHeader() {
     els.viewTitle.textContent = 'Extracted Text';
   } else if (state.currentView === 'automation') {
     els.viewTitle.textContent = 'Automation';
+  } else if (state.currentView === 'analysis') {
+    els.viewTitle.textContent = 'Analysis';
   } else if (state.currentView === 'geoSet') {
     els.viewTitle.textContent = state.geoSetTitle || 'Country Set';
   } else {
@@ -1206,7 +1240,7 @@ function buildImageCard(image) {
   const folderText = image.sourceFolder ? ` · ${image.sourceFolder}` : '';
   const classifiedBy = image.classifiedBy;
   const badge = classifiedBy === 'manual' ? ' · manual'
-    : (classifiedBy === 'auto' || classifiedBy === 'auto-nsfw') ? ' · auto'
+    : (classifiedBy === 'auto' || classifiedBy === 'auto-nsfw' || classifiedBy === 'auto-kpop') ? ' · auto'
     : '';
   const nsfwBadge = image.nsfwScore != null
     ? ` · ${Math.round(image.nsfwScore * 100)}% explicit`
@@ -1339,11 +1373,13 @@ function render() {
   const textActive = state.currentView === 'text';
   const autoActive = state.currentView === 'automation';
   const dashActive = state.currentView === 'dashboard';
-  els.mainDropTarget.classList.toggle('hidden', geoActive || textActive || autoActive || dashActive);
+  const pipeActive = state.currentView === 'analysis';
+  els.mainDropTarget.classList.toggle('hidden', geoActive || textActive || autoActive || dashActive || pipeActive);
   els.geoView.classList.toggle('hidden', !geoActive);
   els.textView.classList.toggle('hidden', !textActive);
   els.autoView.classList.toggle('hidden', !autoActive);
   els.dashView.classList.toggle('hidden', !dashActive);
+  els.pipeView.classList.toggle('hidden', !pipeActive);
   // Lets the stylesheet compact the header for this view: the search box and the sort order act on
   // the image grid, which is exactly what this view replaces, so they are inert here and the panel
   // gets their rows back. The text panel has its own query box for the same reason.
@@ -1351,10 +1387,12 @@ function render() {
   document.body.classList.toggle('view-text', textActive);
   document.body.classList.toggle('view-automation', autoActive);
   document.body.classList.toggle('view-dashboard', dashActive);
+  document.body.classList.toggle('view-analysis', pipeActive);
   if (geoActive) renderGeo();
   else if (textActive) renderText();
   else if (autoActive) renderAutoPanel();
   else if (dashActive) renderDashboard();
+  else if (pipeActive) renderPipeline();
   else renderImages();
 }
 
@@ -1493,6 +1531,7 @@ function navEntryLabel(entry) {
   if (entry.view === 'text') return 'Extracted Text';
   if (entry.view === 'automation') return 'Automation';
   if (entry.view === 'dashboard') return 'Dashboard';
+  if (entry.view === 'analysis') return 'Analysis';
   if (entry.view === 'geoSet') return entry.geoSetTitle || 'country set';
   return entry.category || 'category';
 }
@@ -1508,8 +1547,9 @@ function captureNavScroll() {
   const textActive = state.currentView === 'text';
   const autoActive = state.currentView === 'automation';
   const dashActive = state.currentView === 'dashboard';
+  const pipeActive = state.currentView === 'analysis';
   entry.scroll = {
-    main: geoActive || textActive || autoActive || dashActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
+    main: geoActive || textActive || autoActive || dashActive || pipeActive ? entry.scroll.main : els.mainDropTarget.scrollTop,
     geo: geoActive ? els.geoView.scrollTop : entry.scroll.geo,
     geoSets: geoActive ? els.geoSets.scrollTop : entry.scroll.geoSets,
   };
@@ -1633,6 +1673,7 @@ async function applyNavEntry(entry) {
     }
     render();
     restoreNavScroll(entry);
+    if (entry.view === 'analysis') void loadPipeline();
     if (entry.view === 'geo') {
       // The panel paints from cache first and again when the sidecars land — the second paint
       // rebuilds the set list from scratch, taking its scroll offset back to 0 with it.
@@ -2870,8 +2911,29 @@ async function assignCategory(hash, category) {
       image.classifiedBy = result?.classifiedBy ?? null;
       image.classifiedAt = result?.classifiedAt ?? null;
     }
+    // A frame sorted into K-pop by hand teaches its title, and the rest of that video follows —
+    // patched in place like the image itself, so the grid shows it without a rescan.
+    const learned = result?.learnedTitles || [];
+    const joined = new Set(result?.joinedKpop || []);
+    if (joined.size) {
+      for (const image of state.library.images || []) {
+        if (!joined.has(image.hash)) continue;
+        image.category = 'K-pop';
+        image.classifiedBy = 'auto-kpop';
+      }
+    }
     render();
-    showToast(category ? `Assigned to ${category}` : 'Marked unclassified');
+    if (learned.length) {
+      const titles = learned.map(title => `“${title}”`).join(', ');
+      showToast(
+        `Assigned to ${category}. Learned ${titles} — ${formatCount(joined.size)} more `
+          + `${joined.size === 1 ? 'frame' : 'frames'} moved to K-pop. The list is on the Analysis tab.`,
+        { sticky: true },
+      );
+      if (state.currentView === 'analysis') void loadKpopOverview();
+    } else {
+      showToast(category ? `Assigned to ${category}` : 'Marked unclassified');
+    }
   } catch (error) {
     showToast(errorText(error));
   }
@@ -3302,6 +3364,8 @@ async function runNextInQueue() {
           await rebuildTextIndex();
           await loadTextStatus();
         }
+        // The run changed what is left and how fast it went — the panel's two numbers.
+        if (state.currentView === 'analysis') void loadPipeline();
       } catch (error) {
         setLoading(false);
         setStatus('');
@@ -3311,24 +3375,26 @@ async function runNextInQueue() {
     return;
   }
 
-  const { type, force, indexedOnly } = state.analysisQueue.shift();
+  // `scope` comes only from the Analysis panel; the Analyze row always runs over the whole library.
+  const { type, force, indexedOnly, scope = null } = state.analysisQueue.shift();
   state.analysisRan = state.analysisRan || new Set();
   state.analysisRan.add(type);
   state.analysisRunning = type;
   const verb = force ? 'Re-analyzing' : 'Analyzing';
-  setStatus(`${verb} (${analysisTypeLabel(type)})…`);
+  const scopeNote = scope ? ` — ${scopeLabel(scope)}` : '';
+  setStatus(`${verb} (${analysisTypeLabel(type)})${scopeNote}…`);
 
   try {
     if (type === 'text') {
-      await window.categorizerAPI.analyzeText(state.library.root, force);
+      await window.categorizerAPI.analyzeText(state.library.root, force, scope);
     } else if (type === 'ocr') {
-      await window.categorizerAPI.extractText(state.library.root, force, !!indexedOnly);
+      await window.categorizerAPI.extractText(state.library.root, force, !!indexedOnly, scope);
     } else if (type === 'chunk') {
-      await window.categorizerAPI.buildChunkPlan(state.library.root, force);
+      await window.categorizerAPI.buildChunkPlan(state.library.root, force, scope);
     } else if (type === 'vision') {
-      await window.categorizerAPI.analyzeVision(state.library.root, force);
+      await window.categorizerAPI.analyzeVision(state.library.root, force, scope);
     } else {
-      await window.categorizerAPI.analyzeNsfw(state.library.root, force);
+      await window.categorizerAPI.analyzeNsfw(state.library.root, force, scope);
     }
   } catch (error) {
     showToast(errorText(error));
@@ -3939,6 +4005,7 @@ function installEvents() {
   els.geoTab.addEventListener('click', selectGeo);
   els.textTab.addEventListener('click', selectText);
   installAutomationPanel();
+  installAnalysisPanel();
   wireTextPanel();
   els.geoRunButton.addEventListener('click', () => void runSelectedGeoPipeline());
   els.geoStopButton.addEventListener('click', () => void stopGeoPipeline());
@@ -4090,6 +4157,8 @@ function installEvents() {
   // `change`, not `input`: a number box fires `input` on every keystroke, so saving on that would
   // write (and reinstall the scheduled task) for "3" on the way to typing "30".
   els.autoRefreshVisionMinutesInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshTitlesInput.addEventListener('change', saveAutoRefreshSettings);
+  els.autoRefreshTitlesMinutesInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshGpuWaitInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshLowPriorityInput.addEventListener('change', saveAutoRefreshSettings);
   els.autoRefreshToastInput.addEventListener('change', saveAutoRefreshSettings);
@@ -4199,14 +4268,7 @@ function renderAutoRun(run) {
     els.autoRunFill.style.width = `${percent}%`;
   }
 
-  // Only the GPU pass is time-limited, and only once it is actually describing — before that the
-  // deadline is 0 and there is nothing honest to count down.
-  if (run.visionDeadlineMs > 0) {
-    const remainingSeconds = (run.visionDeadlineMs - Date.now()) / 1000;
-    els.autoRunLimit.textContent = `${formatAutoRunClock(remainingSeconds)} left of ${run.visionLimitMinutes} min`;
-  } else {
-    els.autoRunLimit.textContent = '';
-  }
+  els.autoRunLimit.textContent = autoRunLimitText(run);
 
   // A pass only notices a stop between images, which for a description is several seconds. Saying
   // so is what keeps the button from looking broken in the gap.
@@ -4285,19 +4347,20 @@ function installAutoRunBanner() {
 //     same rule the Extracted Text panel's strip follows, for the same reason.
 // =================================================================================================
 
-// The three the app creates and maintains itself (`ensure_analysis_categories` in lib.rs). Every
-// other category in the library is one the user typed, which is the whole distinction the
-// "Categories you made yourself" card exists to draw.
-const BUILT_IN_CATEGORIES = new Set(['Explicit', 'Low Text', 'High Text']);
+// The ones the app creates and maintains itself (`ensure_analysis_categories` in lib.rs, and K-pop
+// from the title rule in `kpop.rs`). Every other category in the library is one the user typed,
+// which is the whole distinction the "Categories you made yourself" card exists to draw.
+const BUILT_IN_CATEGORIES = new Set(['Explicit', 'Low Text', 'High Text', 'K-pop']);
 
-// `classified_by` as the backend stamps it. `auto` is the text pass, `auto-nsfw` the explicit one;
-// `manual` is only ever written by an assignment the user made, and the auto passes are forbidden
-// from overwriting it — which is what makes it a durable record of hand-sorting rather than a
-// snapshot of the last scan.
+// `classified_by` as the backend stamps it. `auto` is the text pass, `auto-nsfw` the explicit one,
+// `auto-kpop` the video-title rule; `manual` is only ever written by an assignment the user made,
+// and the auto passes are forbidden from overwriting it — which is what makes it a durable record of
+// hand-sorting rather than a snapshot of the last scan.
 const CLASSIFIER_LABELS = {
   manual: 'By hand',
   auto: 'Text pass',
   'auto-nsfw': 'Explicit pass',
+  'auto-kpop': 'K-pop title rule',
   none: 'Not categorized',
 };
 
@@ -4330,7 +4393,7 @@ function computeDashboardStats() {
   const stats = {
     total: images.length,
     bytes: 0,
-    byClassifier: { manual: 0, auto: 0, 'auto-nsfw': 0, none: 0 },
+    byClassifier: { manual: 0, auto: 0, 'auto-nsfw': 0, 'auto-kpop': 0, none: 0 },
     categories: new Map(),
     unclassified: 0,
     done: { nsfw: 0, words: 0, extract: 0, described: 0 },
@@ -5052,8 +5115,566 @@ function installDashboard() {
 // panel says so in as many words, and nothing pretends a count of an unscanned folder is zero.
 // =================================================================================================
 
-const AUTO_PASS_LABEL = { nsfw: 'Explicit', text: 'Text', ocr: 'Extract Text', vision: 'Describe' };
-const AUTO_PASS_BIT = { nsfw: 1, text: 4, ocr: 8, vision: 16 };
+const AUTO_PASS_LABEL = { nsfw: 'Explicit', text: 'Text', chunk: 'Video titles', ocr: 'Extract Text', vision: 'Describe' };
+const AUTO_PASS_BIT = { nsfw: 1, chunk: 2, text: 4, ocr: 8, vision: 16 };
+
+// Whichever time budget is counting down: the title pass's while it reads titles, the GPU pass's
+// once descriptions flow. Before a pass starts its deadline is 0 and there is nothing honest to
+// count down.
+function autoRunLimitText(run) {
+  if (run.phase === 'titles' && run.titleDeadlineMs > 0) {
+    return `${formatAutoRunClock((run.titleDeadlineMs - Date.now()) / 1000)} left of ${run.titleLimitMinutes} min`;
+  }
+  if (run.visionDeadlineMs > 0) {
+    return `${formatAutoRunClock((run.visionDeadlineMs - Date.now()) / 1000)} left of ${run.visionLimitMinutes} min`;
+  }
+  return '';
+}
+
+// ==============================
+// Analysis panel
+//
+// The passes the Analyze row runs, opened up one at a time: what does the work (a rule, Windows
+// OCR, a trained classifier, the local LLM), how much of the chosen scope each has done, and how
+// long the rest — or a redo of all of it — would take at the rate this machine actually ran it.
+// Counted off the sidecar by the backend (`get_pipeline_overview`), with the same selectors the
+// passes use, so a number here is the work a run would really do.
+// ==============================
+
+const PIPE_KIND_LABEL = { rule: 'Rule', ocr: 'OCR', classifier: 'Classifier', llm: 'LLM' };
+// Past this a run is worth a confirmation that says how long it will take.
+const PIPE_CONFIRM_SECS = 5 * 60;
+
+function selectAnalysisPanel() {
+  cancelPointerDrag();
+  pushNavEntry(navEntry('analysis'));
+  state.currentView = 'analysis';
+  state.currentCategory = null;
+  render();
+  void loadPipeline();
+}
+
+function currentPipeScope() {
+  const { kind, value } = state.pipeScope;
+  if (kind === 'category') return { category: value };
+  if (kind === 'folder') return { folder: value };
+  return null;
+}
+
+function scopeLabel(scope) {
+  if (!scope) return 'the whole library';
+  if (scope.folder != null) return `folder “${scope.folder}”`;
+  if (scope.category === '') return 'unclassified images';
+  return `category “${scope.category}”`;
+}
+
+function formatDuration(secs) {
+  const total = Math.max(0, Number(secs) || 0);
+  if (total < 1) return 'under a second';
+  if (total < 90) return `${Math.round(total)} s`;
+  const minutes = Math.round(total / 60);
+  if (minutes < 90) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ${minutes % 60} min`;
+  return `${Math.floor(hours / 24)} days ${hours % 24} h`;
+}
+
+function formatRate(secsPerItem) {
+  if (secsPerItem >= 1) return `${secsPerItem.toFixed(1)} s per image`;
+  return `${Math.round(1 / Math.max(secsPerItem, 1e-6))} images/s`;
+}
+
+// Both reads load the library's records, so they run side by side; a token keeps a slow answer for
+// a scope picked a moment ago from overwriting the one picked since.
+async function loadPipeline() {
+  const root = state.library?.root;
+  if (!root) return;
+  const token = (state.pipeToken = (state.pipeToken || 0) + 1);
+  state.pipeLoading = true;
+  state.pipeError = null;
+  renderPipeline();
+  try {
+    const [pipeline, kpop] = await Promise.all([
+      window.categorizerAPI.getPipelineOverview(root, currentPipeScope()),
+      window.categorizerAPI.getKpopOverview(root),
+    ]);
+    if (token !== state.pipeToken) return;
+    state.pipeline = pipeline;
+    state.kpop = kpop;
+  } catch (error) {
+    if (token !== state.pipeToken) return;
+    state.pipeError = errorText(error);
+  }
+  state.pipeLoading = false;
+  if (state.currentView === 'analysis') renderPipeline();
+}
+
+async function loadKpopOverview() {
+  const root = state.library?.root;
+  if (!root) return;
+  try {
+    state.kpop = await window.categorizerAPI.getKpopOverview(root);
+  } catch (error) {
+    showToast(errorText(error));
+    return;
+  }
+  if (state.currentView === 'analysis') renderPipeline();
+}
+
+function pipeElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
+}
+
+function renderPipeScopePickers() {
+  const pipeline = state.pipeline;
+  els.pipeScopeKind.value = state.pipeScope.kind;
+  const picking = state.pipeScope.kind !== 'all';
+  els.pipeScopeValue.classList.toggle('hidden', !picking);
+  if (!picking || !pipeline) return;
+  const source = state.pipeScope.kind === 'category' ? pipeline.categories : pipeline.folders;
+  const options = (source || []).map(option => {
+    const name = option.name === '' && state.pipeScope.kind === 'category' ? 'Unclassified' : option.name;
+    return new Option(`${name} (${formatCount(option.count)})`, option.name, false, option.name === state.pipeScope.value);
+  });
+  els.pipeScopeValue.replaceChildren(...options);
+}
+
+function renderPipeline() {
+  const pipeline = state.pipeline;
+  renderPipeScopePickers();
+  els.pipeRunPendingButton.disabled = state.analyzing || state.pipeLoading || !pipeline;
+  els.pipeRefreshButton.disabled = state.pipeLoading;
+
+  if (state.pipeError) {
+    els.pipeAsOf.textContent = '';
+    els.pipeSteps.replaceChildren(pipeElement('p', 'pipe-note is-warn', `Could not count: ${state.pipeError}`));
+    els.pipeTotals.replaceChildren();
+    return;
+  }
+  if (!pipeline) {
+    els.pipeAsOf.textContent = state.pipeLoading ? 'Counting…' : '';
+    els.pipeSteps.replaceChildren(pipeElement('p', 'pipe-note', state.library ? 'Counting…' : 'Choose a root folder first.'));
+    els.pipeTotals.replaceChildren();
+    els.pipeRules.replaceChildren();
+    els.pipeKpopReasons.replaceChildren();
+    els.pipeKpopLearned.replaceChildren();
+    return;
+  }
+
+  const counted = pipeline.countedAtMs ? new Date(pipeline.countedAtMs).toLocaleString() : 'unknown';
+  els.pipeAsOf.textContent = state.pipeLoading
+    ? 'Counting…'
+    : `${formatCount(pipeline.scopeImages)} of ${formatCount(pipeline.libraryImages)} images in scope · records as of ${counted}`;
+  els.pipeAsOf.title = 'Counted from the library\'s records, not the disk: files added since the last scan are not in it yet. Rescan to take them in.';
+
+  els.pipeSteps.replaceChildren(...pipeline.steps.map(renderPipeStep), renderRulesStep(pipeline.rules));
+  renderPipeTotals(pipeline);
+  renderPipeRules(pipeline.rules);
+  renderKpopReasons(state.kpop);
+  renderKpopLearned(state.kpop);
+}
+
+function pipeFigure(value, label, sub, subTitle) {
+  const figure = pipeElement('div', 'pipe-figure');
+  figure.append(pipeElement('span', 'pipe-figure-value', value), pipeElement('span', 'pipe-figure-label', label));
+  if (sub) {
+    const subElement = pipeElement('span', 'pipe-figure-sub', sub);
+    if (subTitle) subElement.title = subTitle;
+    figure.append(subElement);
+  }
+  return figure;
+}
+
+function renderPipeStep(step) {
+  const row = pipeElement('div', `pipe-step is-${step.kind}`);
+  const main = pipeElement('div', 'pipe-step-main');
+  const head = pipeElement('div', 'pipe-step-head');
+  const kind = pipeElement('span', `pipe-kind is-${step.kind}`, PIPE_KIND_LABEL[step.kind] || step.kind);
+  kind.title = step.ai
+    ? (step.repeatable ? 'AI: a trained model decides, with the same result every run.' : 'AI: a language model writes the result; its wording differs run to run.')
+    : 'Not AI: the same input always gives the same result.';
+  head.append(kind, pipeElement('span', 'pipe-step-label', step.label), pipeElement('span', 'pipe-step-hw', step.hardware));
+  main.append(
+    head,
+    pipeElement('div', 'pipe-step-method', step.method),
+    pipeElement('div', 'pipe-step-flow', `Writes ${step.writes} · feeds ${step.feeds}`),
+  );
+  if (step.notes?.length) {
+    const notes = pipeElement('ul', 'pipe-step-notes');
+    for (const note of step.notes) notes.append(pipeElement('li', null, note));
+    main.append(notes);
+  }
+
+  const rateText = step.rateMeasured
+    ? `${formatRate(step.secsPerItem)} · measured over ${step.rateRuns} run${step.rateRuns === 1 ? '' : 's'}`
+    : `${formatRate(step.secsPerItem)} · estimated, no run timed yet`;
+  const done = Math.max(0, step.inScope - step.pending);
+  const figures = pipeElement('div', 'pipe-step-figures');
+  figures.append(
+    pipeFigure(formatCount(step.pending), 'to do', step.pending ? `≈ ${formatDuration(step.pendingSecs)}` : 'nothing left', rateText),
+    pipeFigure(formatCount(step.inScope), 'redo all', step.inScope ? `≈ ${formatDuration(step.allSecs)}` : '', rateText),
+  );
+  const progress = pipeElement('div', 'pipe-progress');
+  progress.title = `${formatCount(done)} of ${formatCount(step.inScope)} done`;
+  const fill = pipeElement('div', 'pipe-progress-fill');
+  // Held below 100 while anything is left — "100%" beside a non-zero to-do reads as a contradiction.
+  const percent = step.inScope ? (done / step.inScope) * 100 : 100;
+  fill.style.width = `${step.pending > 0 ? Math.min(percent, 99) : percent}%`;
+  progress.append(fill);
+  figures.append(progress, pipeElement('span', 'pipe-rate', rateText));
+
+  const actions = pipeElement('div', 'pipe-step-actions');
+  const run = pipeElement('button', 'button compact', step.pending ? `Run ${formatCount(step.pending)}` : 'Run');
+  run.type = 'button';
+  run.disabled = state.analyzing || !step.pending;
+  run.title = `Run ${step.label} on the ${formatCount(step.pending)} images in scope it has not done yet`;
+  run.addEventListener('click', () => void runPipeStep(step, false));
+  const redo = pipeElement('button', 'button compact secondary', 'Redo all…');
+  redo.type = 'button';
+  redo.disabled = state.analyzing || !step.inScope;
+  redo.title = `Run ${step.label} again on all ${formatCount(step.inScope)} images in scope, replacing what it found before`;
+  redo.addEventListener('click', () => void runPipeStep(step, true));
+  actions.append(run, redo);
+
+  row.append(main, figures, actions);
+  return row;
+}
+
+// The rules are a step too — the one that is instant. Shown in the same table so "how long would
+// re-classifying take" has its answer beside the passes that are slow.
+function renderRulesStep(rules) {
+  const row = pipeElement('div', 'pipe-step is-rule');
+  const main = pipeElement('div', 'pipe-step-main');
+  const head = pipeElement('div', 'pipe-step-head');
+  const kind = pipeElement('span', 'pipe-kind is-rule', 'Rule');
+  kind.title = 'Not AI: the same records always give the same categories.';
+  head.append(kind, pipeElement('span', 'pipe-step-label', 'Classification'), pipeElement('span', 'pipe-step-hw', 'CPU'));
+  main.append(
+    head,
+    pipeElement('div', 'pipe-step-method', 'Rules over what the steps above stored: thresholds, K-pop titles and descriptions, learned titles'),
+    pipeElement('div', 'pipe-step-flow', 'Writes the category of every image not sorted by hand · runs by itself on every save and scan'),
+  );
+  const figures = pipeElement('div', 'pipe-step-figures');
+  figures.append(
+    pipeFigure(formatCount(rules.changed), 'would move', rules.changed ? 'apply to save' : 'all in place'),
+    pipeFigure(formatCount(rules.records), 'redo all', formatDuration(rules.millis / 1000)),
+  );
+  const actions = pipeElement('div', 'pipe-step-actions');
+  const apply = pipeElement('button', 'button compact', 'Apply now');
+  apply.type = 'button';
+  apply.disabled = state.analyzing || state.rulesBusy || !rules.changed;
+  apply.title = 'Re-apply the rules and save — what every scan ends with, without the walk of the disk';
+  apply.addEventListener('click', () => void applyRulesNow());
+  actions.append(apply);
+  row.append(main, figures, actions);
+  return row;
+}
+
+function renderPipeTotals(pipeline) {
+  const byKind = {};
+  let pendingSecs = 0;
+  let allSecs = 0;
+  for (const step of pipeline.steps) {
+    pendingSecs += step.pendingSecs;
+    allSecs += step.allSecs;
+    byKind[step.kind] = (byKind[step.kind] || 0) + step.pendingSecs;
+  }
+  const split = ['llm', 'classifier', 'ocr']
+    .filter(kind => byKind[kind] > 0)
+    .map(kind => `${PIPE_KIND_LABEL[kind]} ${formatDuration(byKind[kind])}`)
+    .join(' · ');
+  const line = pipeElement('p', 'pipe-note');
+  line.textContent = pendingSecs > 0
+    ? `Everything pending in ${scopeLabel(pipeline.scope.category != null || pipeline.scope.folder != null ? pipeline.scope : null)}: ≈ ${formatDuration(pendingSecs)} (${split}). Redoing every step: ≈ ${formatDuration(allSecs)}. Each step also starts with a library scan.`
+    : `Nothing pending in ${scopeLabel(pipeline.scope.category != null || pipeline.scope.folder != null ? pipeline.scope : null)}. Redoing every step would take ≈ ${formatDuration(allSecs)}.`;
+  const parts = [line];
+  // Said once for every step: the sidebar's include ticks narrow all of them alike.
+  const skipped = [
+    ...(pipeline.excludedCategories || []).map(name => `category “${name}”`),
+    ...(pipeline.excludedFolders || []).map(name => `folder “${name}”`),
+  ];
+  if (skipped.length) {
+    parts.push(pipeElement('p', 'pipe-note', `Every step skips ${skipped.join(', ')} — switched off for analysis by the ticks in the sidebar.`));
+  }
+  parts.push(pipeElement(
+    'p',
+    'pipe-note',
+    'Two more LLM steps run from their own panels and are not counted here: scene kinds (Geo Coverage) and bucket topics (Extracted Text). Both are text-only and read the descriptions above.',
+  ));
+  els.pipeTotals.replaceChildren(...parts);
+}
+
+function categoryName(name) {
+  return name == null ? 'Unclassified' : name;
+}
+
+function renderPipeRules(rules) {
+  const library = state.library;
+  const list = pipeElement('ol', 'pipe-rule-list');
+  const nsfw = Math.round((library?.nsfwScoreThreshold ?? 0) * 100);
+  const words = library?.ocrWordThreshold ?? '—';
+  const area = Math.round((library?.ocrAreaThreshold ?? 0) * 100);
+  for (const text of [
+    'Anything you sorted by hand stays where you put it.',
+    `Explicit — the NudeNet score is ${nsfw}% or more.`,
+    'K-pop — would be Low Text, and its title, its description or a learned title says K-pop (see the K-pop cards).',
+    `Low Text — at most ${words} words and ${area}% of the image covered by text; otherwise High Text.`,
+  ]) {
+    list.append(pipeElement('li', null, text));
+  }
+
+  const moves = pipeElement('div', 'pipe-moves');
+  if (!rules.changed) {
+    moves.append(pipeElement('p', 'pipe-note', `Re-applying them now would move nothing — took ${formatDuration(rules.millis / 1000)} over ${formatCount(rules.records)} records.`));
+  } else {
+    moves.append(pipeElement('p', 'pipe-note', `Re-applying them now would move ${formatCount(rules.changed)} images (${formatDuration(rules.millis / 1000)} over ${formatCount(rules.records)} records):`));
+    const table = pipeElement('div', 'pipe-move-table');
+    for (const move of rules.moves.slice(0, 8)) {
+      table.append(
+        pipeElement('span', 'pipe-move-count', formatCount(move.count)),
+        pipeElement('span', 'pipe-move-path', `${categoryName(move.from)} → ${categoryName(move.to)}`),
+      );
+    }
+    moves.append(table);
+  }
+  const apply = pipeElement('button', 'button compact', state.rulesBusy ? 'Applying…' : 'Apply now');
+  apply.type = 'button';
+  apply.disabled = state.analyzing || state.rulesBusy || !rules.changed;
+  apply.addEventListener('click', () => void applyRulesNow());
+  els.pipeRules.replaceChildren(list, moves, apply);
+}
+
+const KPOP_REASON_ROWS = [
+  ['byTitle', 'Title band matches the rules', 'The window title as OCR read it names a K-pop act or format (MV, M/V, fancam, a music show…).'],
+  ['byLearned', 'A learned title', 'A title learned from a frame you sorted into K-pop by hand, or a name you added below.'],
+  ['byDescribed', 'Description quotes a K-pop title', 'The vision model quoted the window title, and that reading matches — it reads Hangul and the parts OCR garbled.'],
+  ['byTabStrip', 'K-pop tab + a music video on screen', 'Several tabs were open; one is K-pop and the description says the picture is a music video. Music-player tabs (Deezer, Spotify) never count.'],
+  ['byLead', 'Description says K-pop', 'No usable title, but the description opens by naming K-pop or a K-pop act ("an album cover for the K-pop group…").'],
+  ['bySameVideo', 'Same video as described K-pop frames', 'Describe samples ~10 frames per video; when they say K-pop, the video\'s other frames follow.'],
+  ['byNeighbour', 'Between two K-pop frames', 'No title of its own, captured within 2 minutes of K-pop frames on both sides.'],
+  ['handSorted', 'Sorted by hand', 'You put these in K-pop yourself.'],
+];
+
+function renderKpopReasons(kpop) {
+  if (!kpop) {
+    els.pipeKpopReasons.replaceChildren(pipeElement('p', 'pipe-note', state.pipeLoading ? 'Counting…' : 'Not counted yet.'));
+    return;
+  }
+  const peak = Math.max(1, ...KPOP_REASON_ROWS.map(([key]) => kpop[key] || 0));
+  const table = pipeElement('div', 'pipe-reasons');
+  for (const [key, label, explanation] of KPOP_REASON_ROWS) {
+    const count = kpop[key] || 0;
+    const name = pipeElement('span', 'pipe-reason-label', label);
+    name.title = explanation;
+    const bar = pipeElement('span', 'pipe-reason-bar');
+    const fill = pipeElement('span', 'pipe-reason-fill');
+    fill.style.width = `${(count / peak) * 100}%`;
+    bar.append(fill);
+    table.append(name, bar, pipeElement('span', 'pipe-reason-count', formatCount(count)));
+  }
+  const notes = [
+    `${formatCount(kpop.total)} frames in K-pop, counted the way the next save will leave them.`,
+  ];
+  if (kpop.pendingChange) {
+    notes.push(`${formatCount(kpop.pendingChange)} of them move in or out at the next scan — or now, with Apply in the rules card.`);
+  }
+  if (kpop.highTextWithKpopReading) {
+    notes.push(`${formatCount(kpop.highTextWithKpopReading)} more frames read as K-pop but stay High Text on purpose: they carry a lot of text (lyrics, comments).`);
+  }
+  notes.push(`Descriptions read for titles: ${formatCount(kpop.descriptionsRead)}.`);
+  els.pipeKpopReasons.replaceChildren(table, ...notes.map(note => pipeElement('p', 'pipe-note', note)));
+}
+
+const KPOP_SOURCE_LABEL = { ocr: 'title band', description: 'description', typed: 'typed' };
+
+function renderKpopLearned(kpop) {
+  if (!kpop) {
+    els.pipeKpopLearned.replaceChildren(pipeElement('p', 'pipe-note', state.pipeLoading ? 'Counting…' : 'Not read yet.'));
+    return;
+  }
+  const intro = pipeElement(
+    'p',
+    'pipe-note',
+    'Put a frame in K-pop by hand and its title lands here — every other frame with that title follows. '
+      + 'Remove a title to release its frames; it will not be learned again from the same frame. '
+      + 'A name you type matches any title containing it.',
+  );
+
+  const form = pipeElement('form', 'pipe-learn-form');
+  const input = pipeElement('input', 'dialog-input pipe-learn-input');
+  input.placeholder = 'Add a group, a name or a title…';
+  input.autocomplete = 'off';
+  input.disabled = state.kpopBusy;
+  const add = pipeElement('button', 'button compact', 'Add');
+  add.type = 'submit';
+  add.disabled = state.kpopBusy;
+  const openTerms = pipeElement('button', 'button compact secondary', 'Open names file');
+  openTerms.type = 'button';
+  openTerms.title = `${kpop.termsFile}\n${formatCount(kpop.extraTerms.length)} extra names in it now. One per line; read at the next scan.`;
+  openTerms.addEventListener('click', () => void openKpopTermsFile());
+  form.append(input, add, openTerms);
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (text) void addKpopTitle(text);
+  });
+
+  const parts = [intro, form];
+  if (!kpop.learned.length) {
+    parts.push(pipeElement('p', 'pipe-note', 'Nothing learned yet.'));
+  } else {
+    const table = pipeElement('div', 'pipe-learned');
+    for (const label of ['Title', 'From', 'Frames', 'Added', '']) {
+      table.append(pipeElement('span', 'pipe-learned-head', label));
+    }
+    for (const entry of kpop.learned) {
+      const title = pipeElement('span', 'pipe-learned-title', entry.title);
+      title.title = `${entry.title}\nMatched as: ${entry.key}${entry.fromPath ? `\nLearned from ${entry.fromPath}` : ''}`;
+      const source = pipeElement('span', 'pipe-learned-source', KPOP_SOURCE_LABEL[entry.source] || entry.source);
+      const frames = pipeElement('span', 'pipe-learned-frames', formatCount(entry.frames));
+      frames.title = 'K-pop frames this entry decided — ones no built-in rule had already taken';
+      const added = pipeElement('span', 'pipe-learned-added', entry.addedAt ? new Date(entry.addedAt).toLocaleDateString() : '');
+      const remove = pipeElement('button', 'category-rename-button', '✕');
+      remove.type = 'button';
+      remove.title = `Remove “${entry.title}” — its frames go back to Low Text`;
+      remove.setAttribute('aria-label', remove.title);
+      remove.disabled = state.kpopBusy;
+      remove.addEventListener('click', () => void removeKpopTitle(entry));
+      table.append(title, source, frames, added, remove);
+    }
+    parts.push(table);
+  }
+  const footer = [];
+  if (kpop.dismissed) footer.push(`${formatCount(kpop.dismissed)} removed ${kpop.dismissed === 1 ? 'title is' : 'titles are'} remembered so they are not learned again.`);
+  if (kpop.handSortedUntitled) {
+    footer.push(`${formatCount(kpop.handSortedUntitled)} of the frames you sorted by hand have no title at all to learn from — the title band read nothing and no description quoted one.`);
+  }
+  for (const note of footer) parts.push(pipeElement('p', 'pipe-note', note));
+  els.pipeKpopLearned.replaceChildren(...parts);
+}
+
+// Runs one step through the same queue the Analyze row uses, so the Stop button, the status line
+// and the rescan afterwards all behave exactly as they do there.
+async function runPipeStep(step, force) {
+  if (!state.library || state.analyzing) return;
+  const scope = currentPipeScope();
+  const count = force ? step.inScope : step.pending;
+  const secs = force ? step.allSecs : step.pendingSecs;
+  if (force || secs > PIPE_CONFIRM_SECS) {
+    const lines = [
+      `${force ? 'Redo' : 'Run'} ${step.label} on ${formatCount(count)} images in ${scopeLabel(scope)}?`,
+      `About ${formatDuration(secs)} at ${formatRate(step.secsPerItem)}${step.rateMeasured ? ' (measured on this machine)' : ' (an estimate — no run timed yet)'}.`,
+    ];
+    if (force) lines.push('This replaces what the step found before for these images.');
+    lines.push('You can stop part way; everything finished by then is kept.');
+    if (!window.confirm(lines.join('\n\n'))) return;
+  }
+  state.analysisQueue = [{ type: step.key, force, scope }];
+  setInteractionsLocked(true);
+  await runNextInQueue();
+}
+
+async function runAllPendingSteps() {
+  const pipeline = state.pipeline;
+  if (!pipeline || !state.library || state.analyzing) return;
+  const scope = currentPipeScope();
+  const steps = pipeline.steps.filter(step => step.pending > 0);
+  if (!steps.length) {
+    showToast(`Nothing pending in ${scopeLabel(scope)}.`);
+    return;
+  }
+  const secs = steps.reduce((sum, step) => sum + step.pendingSecs, 0);
+  const lines = steps.map(step => `${step.label}: ${formatCount(step.pending)} — ≈ ${formatDuration(step.pendingSecs)}`);
+  if (!window.confirm(`Run every pending step in ${scopeLabel(scope)}, in order?\n\n${lines.join('\n')}\n\nAbout ${formatDuration(secs)} in all. You can stop part way.`)) return;
+  // Pipeline order is the backend's: Explicit before Describe (which skips unscored images), titles
+  // before Describe (which reads the sample plan they build).
+  state.analysisQueue = steps.map(step => ({ type: step.key, force: false, scope }));
+  setInteractionsLocked(true);
+  await runNextInQueue();
+}
+
+// Rules and learned titles change categories on disk without a pass, so the grid is re-read after.
+async function refreshAfterCategoryChange(message) {
+  setStatus(`${message} — refreshing library…`, true);
+  await refreshLibrary();
+  render();
+  setStatus(message);
+  void loadPipeline();
+}
+
+async function applyRulesNow() {
+  const root = state.library?.root;
+  if (!root || state.analyzing || state.rulesBusy) return;
+  state.rulesBusy = true;
+  renderPipeline();
+  try {
+    const diff = await window.categorizerAPI.applyRulesNow(root);
+    state.rulesBusy = false;
+    await refreshAfterCategoryChange(`Rules applied — ${formatCount(diff.changed)} ${diff.changed === 1 ? 'image' : 'images'} moved`);
+  } catch (error) {
+    state.rulesBusy = false;
+    showToast(errorText(error), { sticky: true });
+    renderPipeline();
+  }
+}
+
+async function changeKpopLearned(action, message) {
+  const root = state.library?.root;
+  if (!root || state.kpopBusy) return;
+  state.kpopBusy = true;
+  renderPipeline();
+  const before = state.kpop?.total ?? 0;
+  try {
+    state.kpop = await action(root);
+    state.kpopBusy = false;
+    const delta = (state.kpop?.total ?? 0) - before;
+    const moved = delta === 0 ? 'no frames moved' : `${formatCount(Math.abs(delta))} ${Math.abs(delta) === 1 ? 'frame' : 'frames'} ${delta > 0 ? 'joined' : 'left'} K-pop`;
+    await refreshAfterCategoryChange(`${message} — ${moved}`);
+  } catch (error) {
+    state.kpopBusy = false;
+    showToast(errorText(error), { sticky: true });
+    renderPipeline();
+  }
+}
+
+function addKpopTitle(text) {
+  return changeKpopLearned(root => window.categorizerAPI.addKpopTitle(root, text), `Added “${text}”`);
+}
+
+function removeKpopTitle(entry) {
+  return changeKpopLearned(root => window.categorizerAPI.removeKpopTitle(root, entry.key), `Removed “${entry.title}”`);
+}
+
+async function openKpopTermsFile() {
+  const root = state.library?.root;
+  if (!root) return;
+  try {
+    await window.categorizerAPI.openKpopTermsFile(root);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+function installAnalysisPanel() {
+  els.analysisTab.addEventListener('click', selectAnalysisPanel);
+  els.pipeRefreshButton.addEventListener('click', () => void loadPipeline());
+  els.pipeRunPendingButton.addEventListener('click', () => void runAllPendingSteps());
+  els.pipeScopeKind.addEventListener('change', () => {
+    const kind = els.pipeScopeKind.value;
+    // A fresh pick starts on the first option the picker will show, so the counts never describe
+    // a scope the second select is not displaying.
+    const source = kind === 'category' ? state.pipeline?.categories : kind === 'folder' ? state.pipeline?.folders : null;
+    state.pipeScope = { kind, value: source?.[0]?.name ?? '' };
+    void loadPipeline();
+  });
+  els.pipeScopeValue.addEventListener('change', () => {
+    state.pipeScope = { ...state.pipeScope, value: els.pipeScopeValue.value };
+    void loadPipeline();
+  });
+}
 
 function selectAutomation() {
   cancelPointerDrag();
@@ -5147,6 +5768,15 @@ function renderAutoFacts() {
         ? `${auto.visionMinutes} min of GPU time per run${auto.gpuWait ? ', after the card is free' : ''}`
         : 'No limit — it runs the backlog down',
       { tone: auto.visionMinutes > 0 ? '' : 'is-warn' },
+    ));
+  }
+
+  if (auto.runTitles) {
+    els.autoFacts.append(autoFactRow(
+      'Titles limit',
+      auto.titlesMinutes > 0
+        ? `${auto.titlesMinutes} min of title reading per run; a larger backlog continues the next night`
+        : 'No limit — it reads the backlog down',
     ));
   }
 
@@ -5279,9 +5909,7 @@ function renderAutoLive() {
   els.autoLiveTrack.classList.toggle('hidden', !hasProgress);
   if (hasProgress) els.autoLiveFill.style.width = `${Math.min(100, (run.processed / run.total) * 100)}%`;
 
-  els.autoLiveLimit.textContent = run.visionDeadlineMs > 0
-    ? `${formatAutoRunClock((run.visionDeadlineMs - Date.now()) / 1000)} left of ${run.visionLimitMinutes} min`
-    : '';
+  els.autoLiveLimit.textContent = autoRunLimitText(run);
   els.autoStopButton.disabled = Boolean(run.cancelRequested);
   els.autoStopButton.textContent = run.cancelRequested ? 'Stopping…' : '■ Stop Run';
 }
