@@ -296,6 +296,8 @@ const els = {
   ocrAreaThresholdValue: document.getElementById('ocr-area-threshold-value'),
   nsfwThresholdInput: document.getElementById('nsfw-threshold-input'),
   nsfwThresholdValue: document.getElementById('nsfw-threshold-value'),
+  suggestiveThresholdInput: document.getElementById('suggestive-threshold-input'),
+  suggestiveThresholdValue: document.getElementById('suggestive-threshold-value'),
   nsfwModelHint: document.getElementById('nsfw-model-hint'),
   downloadNsfwModelButton: document.getElementById('download-nsfw-model-button'),
   nsfwModelReport: document.getElementById('nsfw-model-report'),
@@ -466,6 +468,9 @@ function syncSettingsDialog() {
   const nsfwPct = Math.round((library?.nsfwScoreThreshold ?? 0.45) * 100);
   els.nsfwThresholdInput.value = String(nsfwPct);
   els.nsfwThresholdValue.textContent = `${nsfwPct}%`;
+  const suggestivePct = Math.round((library?.suggestiveScoreThreshold ?? 0.5) * 100);
+  els.suggestiveThresholdInput.value = String(suggestivePct);
+  els.suggestiveThresholdValue.textContent = `${suggestivePct}%`;
   renderManualFolderList();
 }
 
@@ -484,7 +489,7 @@ async function syncNsfwModelHint() {
       els.downloadNsfwModelButton.disabled = false;
     }
     els.analyzeNsfwCheckLabel.title = info.exists
-      ? 'Run NudeNet explicit content detection, classifying images as Safe / Explicit'
+      ? 'Run NudeNet explicit content detection, classifying images as Safe / Suggestive / Explicit'
       : `NudeNet model not found — download 320n.onnx to: ${info.path}`;
   } catch {
     // non-fatal
@@ -1172,11 +1177,17 @@ function analysisSummary(image) {
   const lines = [];
   if (image.nsfwScore != null) {
     const threshold = state.library?.nsfwScoreThreshold ?? 0.45;
-    const status = image.nsfwScore >= threshold ? 'Explicit' : 'Below explicit threshold';
+    const suggestiveThreshold = state.library?.suggestiveScoreThreshold ?? 0.5;
+    const suggestive = image.suggestiveScore ?? 0;
+    // Mirrors `NsfwRule::verdict`: an explicit score short of Explicit counts toward Suggestive too.
+    const status = image.nsfwScore >= threshold ? 'Explicit'
+      : Math.max(image.nsfwScore, suggestive) >= suggestiveThreshold ? 'Suggestive'
+      : 'Below both thresholds';
     const labels = Array.isArray(image.nsfwLabels) && image.nsfwLabels.length
       ? image.nsfwLabels.join(' · ')
       : 'No NudeNet labels recorded';
-    lines.push(`NudeNet: ${status} (${percent(image.nsfwScore)}; threshold ${percent(threshold)})`);
+    lines.push(`NudeNet: ${status} (explicit ${percent(image.nsfwScore)} of ${percent(threshold)}; `
+      + `suggestive ${percent(suggestive)} of ${percent(suggestiveThreshold)})`);
     lines.push(labels);
   } else {
     lines.push('NudeNet: not analyzed');
@@ -1240,7 +1251,7 @@ function buildImageCard(image) {
   const folderText = image.sourceFolder ? ` · ${image.sourceFolder}` : '';
   const classifiedBy = image.classifiedBy;
   const badge = classifiedBy === 'manual' ? ' · manual'
-    : (classifiedBy === 'auto' || classifiedBy === 'auto-nsfw' || classifiedBy === 'auto-kpop') ? ' · auto'
+    : (classifiedBy === 'auto' || classifiedBy?.startsWith('auto-')) ? ' · auto'
     : '';
   const nsfwBadge = image.nsfwScore != null
     ? ` · ${Math.round(image.nsfwScore * 100)}% explicit`
@@ -3264,6 +3275,10 @@ function syncNsfwThresholdLabel() {
   els.nsfwThresholdValue.textContent = `${els.nsfwThresholdInput.value}%`;
 }
 
+function syncSuggestiveThresholdLabel() {
+  els.suggestiveThresholdValue.textContent = `${els.suggestiveThresholdInput.value}%`;
+}
+
 async function saveTextThresholds() {
   if (!state.library) return;
   const wordThreshold = Number(els.ocrWordThresholdInput.value);
@@ -3281,6 +3296,17 @@ async function saveNsfwThreshold() {
   const threshold = Number(els.nsfwThresholdInput.value) / 100;
   try {
     state.library = await window.categorizerAPI.setNsfwThreshold(state.library.root, threshold);
+    render();
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
+
+async function saveSuggestiveThreshold() {
+  if (!state.library) return;
+  const threshold = Number(els.suggestiveThresholdInput.value) / 100;
+  try {
+    state.library = await window.categorizerAPI.setSuggestiveThreshold(state.library.root, threshold);
     render();
   } catch (error) {
     showToast(errorText(error));
@@ -4127,6 +4153,8 @@ function installEvents() {
   els.ocrAreaThresholdInput.addEventListener('change', saveTextThresholds);
   els.nsfwThresholdInput.addEventListener('input', syncNsfwThresholdLabel);
   els.nsfwThresholdInput.addEventListener('change', saveNsfwThreshold);
+  els.suggestiveThresholdInput.addEventListener('input', syncSuggestiveThresholdLabel);
+  els.suggestiveThresholdInput.addEventListener('change', saveSuggestiveThreshold);
   els.downloadNsfwModelButton.addEventListener('click', downloadNsfwModel);
   els.visionEndpointInput.addEventListener('change', saveVisionSettings);
   els.visionModelInput.addEventListener('change', saveVisionSettings);
@@ -4350,16 +4378,20 @@ function installAutoRunBanner() {
 // The ones the app creates and maintains itself (`ensure_analysis_categories` in lib.rs, and K-pop
 // from the title rule in `kpop.rs`). Every other category in the library is one the user typed,
 // which is the whole distinction the "Categories you made yourself" card exists to draw.
-const BUILT_IN_CATEGORIES = new Set(['Explicit', 'Low Text', 'High Text', 'K-pop']);
+const BUILT_IN_CATEGORIES = new Set(['Explicit', 'Suggestive', 'Mosaic', 'Low Text', 'High Text', 'K-pop']);
 
 // `classified_by` as the backend stamps it. `auto` is the text pass, `auto-nsfw` the explicit one,
-// `auto-kpop` the video-title rule; `manual` is only ever written by an assignment the user made,
+// `auto-suggestive` its milder threshold, `auto-mosaic` the description rule, `auto-kpop` the
+// video-title rule; `manual` is only ever written by an assignment the user made,
 // and the auto passes are forbidden from overwriting it — which is what makes it a durable record of
 // hand-sorting rather than a snapshot of the last scan.
 const CLASSIFIER_LABELS = {
   manual: 'By hand',
   auto: 'Text pass',
   'auto-nsfw': 'Explicit pass',
+  'auto-suggestive': 'Suggestive rule',
+  'auto-mosaic': 'Mosaic rule',
+  'auto-ui': 'App/web UI rule',
   'auto-kpop': 'K-pop title rule',
   none: 'Not categorized',
 };
@@ -4393,7 +4425,7 @@ function computeDashboardStats() {
   const stats = {
     total: images.length,
     bytes: 0,
-    byClassifier: { manual: 0, auto: 0, 'auto-nsfw': 0, 'auto-kpop': 0, none: 0 },
+    byClassifier: { manual: 0, auto: 0, 'auto-nsfw': 0, 'auto-suggestive': 0, 'auto-mosaic': 0, 'auto-ui': 0, 'auto-kpop': 0, none: 0 },
     categories: new Map(),
     unclassified: 0,
     done: { nsfw: 0, words: 0, extract: 0, described: 0 },
@@ -5415,13 +5447,16 @@ function renderPipeRules(rules) {
   const library = state.library;
   const list = pipeElement('ol', 'pipe-rule-list');
   const nsfw = Math.round((library?.nsfwScoreThreshold ?? 0) * 100);
+  const suggestive = Math.round((library?.suggestiveScoreThreshold ?? 0) * 100);
   const words = library?.ocrWordThreshold ?? '—';
   const area = Math.round((library?.ocrAreaThreshold ?? 0) * 100);
   for (const text of [
     'Anything you sorted by hand stays where you put it.',
     `Explicit — the NudeNet score is ${nsfw}% or more.`,
+    'Mosaic — its description says it is made of smaller images: a grid, a collage, an image search, a feed of thumbnails.',
+    `Suggestive — a covered breast, buttocks or groin, or the explicit score, reaches ${suggestive}%.`,
     'K-pop — would be Low Text, and its title, its description or a learned title says K-pop (see the K-pop cards).',
-    `Low Text — at most ${words} words and ${area}% of the image covered by text; otherwise High Text.`,
+    `Low Text — at most ${words} words and ${area}% of the image covered by text, and its description does not call it an app or web page; otherwise High Text.`,
   ]) {
     list.append(pipeElement('li', null, text));
   }

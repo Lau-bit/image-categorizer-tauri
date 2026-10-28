@@ -53,6 +53,12 @@ mod desc_cues;
 // K-pop titles learned from frames the user sorted into K-pop by hand.
 mod kpop_learned;
 
+// Images made of smaller images, read off the same descriptions.
+mod mosaic;
+
+// App and web UI screenshots with too few words for High Text, read off the same descriptions.
+mod ui_screen;
+
 // How fast each pass runs on this machine, for the Analysis panel's time estimates.
 mod pass_timings;
 
@@ -140,6 +146,13 @@ const HIGH_TEXT_CATEGORY: &str = "High Text";
 
 const DEFAULT_NSFW_THRESHOLD: f32 = 0.45;
 const EXPLICIT_CATEGORY: &str = "Explicit";
+// Explicit but milder: covered intimate areas, or an explicit score short of Explicit. 0.50 was
+// picked against the live library (64,797 scored, 2026-10-28): 389 images, 183 of them K-pop
+// frames — stage outfits are what NudeNet's covered classes see. 0.40 doubles that to 677.
+const DEFAULT_SUGGESTIVE_THRESHOLD: f32 = 0.5;
+const SUGGESTIVE_CATEGORY: &str = "Suggestive";
+const CLASSIFIED_BY_NSFW: &str = "auto-nsfw";
+const CLASSIFIED_BY_SUGGESTIVE: &str = "auto-suggestive";
 const ROOT_SOURCE_FOLDER: &str = "Root";
 const NUDENET_MODEL_DOWNLOAD_URL: &str =
     "https://files.pythonhosted.org/packages/1c/ee/1aa02d44ba958cc77e16ff1e41a0aac5e721037db7bf62b9c9d124917f87/nudenet-3.4.2-py3-none-any.whl";
@@ -269,6 +282,11 @@ struct ImageRecord {
     nsfw_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nsfw_labels: Option<Vec<String>>,
+    // Max NudeNet score over the covered intimate classes (`nsfw::SUGGESTIVE_INDICES`). Images
+    // scored before it was stored get it read back from `nsfw_labels` at the next save (whole
+    // percents, top six classes), so the Suggestive rule never waits for a re-score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suggestive_score: Option<f32>,
     // Video-chunking: the title read from this image's top strip. `None` = title strip not scanned
     // yet (so it's pending); `Some("")` = scanned, no video marker found (a normal standalone image);
     // `Some("Driving across…")` = a confirmed video frame with that title. Mirrors the `Some(0)`
@@ -318,6 +336,8 @@ struct LibraryConfig {
     ocr_area_threshold: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nsfw_score_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suggestive_score_threshold: Option<f32>,
     #[serde(default)]
     excluded_analysis_folders: Vec<String>,
     #[serde(default)]
@@ -507,6 +527,8 @@ struct ImageView {
     ocr_text_chars: Option<u32>,
     nsfw_score: Option<f32>,
     nsfw_labels: Option<Vec<String>>,
+    // Stored or read back from the labels — whichever `suggestive_score` found.
+    suggestive_score: Option<f32>,
     // Non-empty when this frame was identified as belonging to a video of this title.
     video_title: Option<String>,
     vision_desc_chars: Option<u32>,
@@ -521,6 +543,7 @@ struct LibraryView {
     ocr_word_threshold: u32,
     ocr_area_threshold: f32,
     nsfw_score_threshold: f32,
+    suggestive_score_threshold: f32,
     source_folders: Vec<SourceFolderView>,
     categories: Vec<CategoryView>,
     unclassified_count: usize,
@@ -1226,14 +1249,15 @@ fn commit_text_results(root: &Path, results: &mut Vec<(String, u32, f32)>) -> Re
     Ok(())
 }
 
-fn commit_nsfw_results(root: &Path, results: &mut Vec<(String, f32, Vec<String>)>) -> Result<(), String> {
+fn commit_nsfw_results(root: &Path, results: &mut Vec<(String, f32, f32, Vec<String>)>) -> Result<(), String> {
     if results.is_empty() {
         return Ok(());
     }
     commit_analysis(root, |config| {
-        for (hash, score, labels) in results.iter() {
+        for (hash, score, suggestive, labels) in results.iter() {
             if let Some(record) = config.images.get_mut(hash) {
                 record.nsfw_score = Some(*score);
+                record.suggestive_score = Some(*suggestive);
                 record.nsfw_labels = Some(labels.clone());
             }
         }
@@ -1337,6 +1361,7 @@ fn ensure_category(config: &mut LibraryConfig, name: &str) {
 fn ensure_analysis_categories(config: &mut LibraryConfig) {
     if config.images.values().any(|record| record.nsfw_score.is_some()) {
         ensure_category(config, EXPLICIT_CATEGORY);
+        ensure_category(config, SUGGESTIVE_CATEGORY);
     }
     if config.images.values().any(|record| record.ocr_word_count.is_some()) {
         ensure_category(config, LOW_TEXT_CATEGORY);
@@ -1344,21 +1369,24 @@ fn ensure_analysis_categories(config: &mut LibraryConfig) {
     }
 }
 
-/// Re-applies the Explicit → K-pop → Low/High Text order to every record not sorted by hand, and
-/// returns why each K-pop frame is K-pop (the Analysis panel's breakdown; every other caller drops
-/// it).
+/// Re-applies the Explicit → Mosaic → Suggestive → K-pop → Low/High Text order to every record not
+/// sorted by hand, and returns why each K-pop frame is K-pop (the Analysis panel's breakdown; every
+/// other caller drops it).
 fn reclassify_text_categories(config: &mut LibraryConfig) -> HashMap<String, KpopReason> {
     let any_analyzed = config.images.values().any(|record| record.ocr_word_count.is_some());
     if !any_analyzed {
         return HashMap::new();
     }
 
-    let nsfw_min = nsfw_threshold(config);
+    let leading = LeadingRules::of(config);
     let (word_threshold, area_threshold) = ocr_thresholds(config);
     ensure_category(config, LOW_TEXT_CATEGORY);
     ensure_category(config, HIGH_TEXT_CATEGORY);
+    if !leading.mosaics.is_empty() {
+        ensure_category(config, mosaic::MOSAIC_CATEGORY);
+    }
 
-    let kpop = kpop_frames(config, nsfw_min, word_threshold, area_threshold);
+    let kpop = kpop_frames(config, &leading, word_threshold, area_threshold);
     if !kpop.is_empty() {
         ensure_category(config, kpop::KPOP_CATEGORY);
     }
@@ -1367,13 +1395,14 @@ fn reclassify_text_categories(config: &mut LibraryConfig) -> HashMap<String, Kpo
         if record.classified_by.as_deref() == Some("manual") {
             continue;
         }
-        if record.nsfw_score.map_or(false, |s| s >= nsfw_min) {
-            if record.category.as_deref() != Some(EXPLICIT_CATEGORY) {
-                record.category = Some(EXPLICIT_CATEGORY.to_string());
-                record.classified_by = Some("auto-nsfw".to_string());
+        if let Some((category, classified_by)) = leading.verdict(hash, record) {
+            if record.category.as_deref() != Some(category) {
+                record.category = Some(category.to_string());
+                record.classified_by = Some(classified_by.to_string());
                 record.classified_at = Some(now_iso());
             }
-            // Explicit wins over the text categories, and the `continue` below is what enforces that.
+            // Explicit, Mosaic and Suggestive win over the text categories, and the `continue` below
+            // is what enforces that.
             // This used to also null `ocr_word_count`/`ocr_text_area_ratio` here, which threw away
             // real OCR results on every single scan: the card then read "Text: not analyzed" forever,
             // and raising the NSFW threshold later released the image with no text data to classify
@@ -1385,11 +1414,14 @@ fn reclassify_text_categories(config: &mut LibraryConfig) -> HashMap<String, Kpo
             continue;
         };
         let is_low_text = word_count <= word_threshold && area_ratio <= area_threshold;
-        // K-pop sits between Explicit and the text categories, and takes only what would otherwise
+        // K-pop sits between the leading rules and the text categories, and takes only what would otherwise
         // be Low Text: a High Text frame under a K-pop title (lyrics, a scrolled comment section) is
-        // read for its text and stays High Text.
+        // read for its text and stays High Text. An app or web page is High Text however few words
+        // it has (`ui_screen`), so it is never K-pop's either.
         let (category, classified_by) = if !is_low_text {
             (HIGH_TEXT_CATEGORY, "auto")
+        } else if leading.ui_screens.contains(hash) {
+            (HIGH_TEXT_CATEGORY, ui_screen::CLASSIFIED_BY_UI)
         } else if kpop.contains_key(hash) {
             (kpop::KPOP_CATEGORY, kpop::CLASSIFIED_BY_KPOP)
         } else {
@@ -1448,7 +1480,7 @@ fn kpop_cues(config: &LibraryConfig) -> Arc<desc_cues::CueMap> {
 /// takes the old frames of that group at the next save, and one removed releases them.
 fn kpop_frames(
     config: &LibraryConfig,
-    nsfw_min: f32,
+    leading: &LeadingRules,
     word_threshold: u32,
     area_threshold: f32,
 ) -> HashMap<String, KpopReason> {
@@ -1494,7 +1526,8 @@ fn kpop_frames(
         // Headed for Low Text — the only frames K-pop can take, and so the only ones whose
         // description is worth reading here.
         let low_text_candidate = record.classified_by.as_deref() != Some("manual")
-            && !record.nsfw_score.is_some_and(|score| score >= nsfw_min)
+            && leading.verdict(hash, record).is_none()
+            && !leading.ui_screens.contains(hash.as_str())
             && record
                 .ocr_word_count
                 .zip(record.ocr_text_area_ratio)
@@ -1768,6 +1801,7 @@ fn scan_and_reconcile_cancellable(
         } else {
             unclassified_count += 1;
         }
+        let suggestive_score = suggestive_score(&record);
         image_views.push(ImageView {
             hash: image.hash.clone(),
             path: image.absolute_path.to_string_lossy().to_string(),
@@ -1785,6 +1819,7 @@ fn scan_and_reconcile_cancellable(
             ocr_text_chars: record.ocr_text_chars,
             nsfw_score: record.nsfw_score,
             nsfw_labels: record.nsfw_labels,
+            suggestive_score,
             // Surface the title only when it's a real video (non-empty); `Some("")` just means
             // "title strip scanned, not a video" and should read as blank in the UI.
             video_title: record.video_title.filter(|title| !title.is_empty()),
@@ -1841,6 +1876,7 @@ fn scan_and_reconcile_cancellable(
         ocr_word_threshold,
         ocr_area_threshold,
         nsfw_score_threshold,
+        suggestive_score_threshold: suggestive_threshold(&config),
         source_folders: source_folder_views,
         categories,
         unclassified_count,
@@ -2597,11 +2633,17 @@ fn text_dir_path(root: &Path) -> PathBuf {
 }
 
 fn indexed_categories(config: &LibraryConfig) -> Vec<String> {
+    // Mosaic rides along by default because it outranks the text rules: YouTube feeds, image
+    // searches and app grids would otherwise be High Text, and filing them under Mosaic must not
+    // drop them out of search (most mosaics read as High Text). The Low Text ones it brings in are a
+    // few hundred captions' worth of noise.
     config
         .text_index_categories
         .clone()
         .filter(|list| !list.is_empty())
-        .unwrap_or_else(|| vec![text_index::DEFAULT_TEXT_CATEGORY.to_string()])
+        .unwrap_or_else(|| {
+            vec![text_index::DEFAULT_TEXT_CATEGORY.to_string(), mosaic::MOSAIC_CATEGORY.to_string()]
+        })
 }
 
 /// The index's source list, read straight off the stored records rather than a filesystem scan. A
@@ -3567,7 +3609,8 @@ struct RulesDiff {
     millis: u64,
 }
 
-/// Re-applies the Explicit, K-pop and Low/High Text rules to `config` in place, and says what moved.
+/// Re-applies the Explicit, Mosaic, Suggestive, K-pop and Low/High Text rules to `config` in place,
+/// and says what moved.
 fn apply_rules(config: &mut LibraryConfig) -> (RulesDiff, HashMap<String, KpopReason>) {
     let started = std::time::Instant::now();
     let before: HashMap<String, Option<String>> =
@@ -3909,6 +3952,7 @@ fn get_pipeline_overview(app: AppHandle, root: String, scope: Option<RunScope>) 
         ocr_word_threshold: view.ocr_word_threshold,
         ocr_area_threshold: view.ocr_area_threshold,
         nsfw_score_threshold: view.nsfw_score_threshold,
+        suggestive_score_threshold: view.suggestive_score_threshold,
         source_folders: Vec::new(),
         categories: Vec::new(),
         unclassified_count: 0,
@@ -3961,8 +4005,8 @@ fn get_pipeline_overview(app: AppHandle, root: String, scope: Option<RunScope>) 
             "NudeNet image classifier (ONNX, on the CPU) scores each image".to_string(),
             "classifier",
             "CPU",
-            "an explicit-content score per image",
-            "the Explicit category, at the threshold in Settings",
+            "an explicit and a suggestive score per image",
+            "the Explicit and Suggestive categories, at the thresholds in Settings",
             nsfw,
             Vec::new(),
         ),
@@ -4013,7 +4057,7 @@ fn get_pipeline_overview(app: AppHandle, root: String, scope: Option<RunScope>) 
             "llm",
             "GPU",
             "a description per image",
-            "K-pop by the description's title and opening, Geo, scene kinds",
+            "K-pop by the description's title and opening, Mosaic, Geo, scene kinds",
             vision,
             vision_notes,
         ),
@@ -4467,29 +4511,124 @@ fn nsfw_threshold(config: &LibraryConfig) -> f32 {
     config.nsfw_score_threshold.unwrap_or(DEFAULT_NSFW_THRESHOLD)
 }
 
+fn suggestive_threshold(config: &LibraryConfig) -> f32 {
+    config.suggestive_score_threshold.unwrap_or(DEFAULT_SUGGESTIVE_THRESHOLD)
+}
+
+/// The record's suggestive score: stored, else read back from its labels. `None` = not scored yet.
+fn suggestive_score(record: &ImageRecord) -> Option<f32> {
+    record.nsfw_score?;
+    Some(record.suggestive_score.unwrap_or_else(|| {
+        record.nsfw_labels.as_deref().map(nsfw::suggestive_from_labels).unwrap_or(0.0)
+    }))
+}
+
+/// Both NudeNet thresholds: Explicit at the explicit one, Suggestive when the covered-area score — or
+/// an explicit score short of Explicit — reaches the suggestive one.
+#[derive(Debug, Clone, Copy)]
+struct NsfwRule {
+    explicit: f32,
+    suggestive: f32,
+}
+
+impl NsfwRule {
+    fn of(config: &LibraryConfig) -> Self {
+        Self { explicit: nsfw_threshold(config), suggestive: suggestive_threshold(config) }
+    }
+
+    fn is_explicit(&self, record: &ImageRecord) -> bool {
+        record.nsfw_score.is_some_and(|score| score >= self.explicit)
+    }
+
+    fn is_suggestive(&self, record: &ImageRecord) -> bool {
+        // `nsfw_score` first: it is already in hand, and the read-back parses labels.
+        record.nsfw_score.is_some_and(|score| score >= self.suggestive)
+            || suggestive_score(record).is_some_and(|score| score >= self.suggestive)
+    }
+}
+
+/// The categories that win over K-pop and the text rules, in precedence order — Explicit, Mosaic,
+/// Suggestive — and the one place that order is written down. Explicit stays first: a grid with an
+/// explicit tile is still explicit. Mosaic outranks Suggestive because a grid of the library's own
+/// screenshots is a grid first, whatever NudeNet finds in one of its tiles.
+struct LeadingRules {
+    nsfw: NsfwRule,
+    /// Images whose description says they are made of smaller images. Worked out once per call
+    /// rather than per record question: ~51,000 leads, and the K-pop rule asks again for each.
+    mosaics: HashSet<String>,
+    /// Images whose description says they are an app or web page (`ui_screen`). Not a leading
+    /// category — they only decide the Low/High Text split — but read off the same leads, once.
+    ui_screens: HashSet<String>,
+}
+
+impl LeadingRules {
+    fn of(config: &LibraryConfig) -> Self {
+        let cues = kpop_cues(config);
+        let mosaics = cues
+            .iter()
+            .filter(|(hash, cue)| {
+                config.images.get(*hash).is_some_and(|record| !mosaic::is_whole_desktop(&record.last_known_path))
+                    && mosaic::describes_mosaic(&cue.lead)
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        let ui_screens = cues
+            .iter()
+            .filter(|(_, cue)| ui_screen::describes_ui(&cue.lead))
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        Self { nsfw: NsfwRule::of(config), mosaics, ui_screens }
+    }
+
+    /// The category and `classified_by` these rules put this record in, if any.
+    fn verdict(&self, hash: &str, record: &ImageRecord) -> Option<(&'static str, &'static str)> {
+        if self.nsfw.is_explicit(record) {
+            Some((EXPLICIT_CATEGORY, CLASSIFIED_BY_NSFW))
+        } else if self.mosaics.contains(hash) {
+            Some((mosaic::MOSAIC_CATEGORY, mosaic::CLASSIFIED_BY_MOSAIC))
+        } else if self.nsfw.is_suggestive(record) {
+            Some((SUGGESTIVE_CATEGORY, CLASSIFIED_BY_SUGGESTIVE))
+        } else {
+            None
+        }
+    }
+}
+
 fn reclassify_nsfw_categories(config: &mut LibraryConfig) {
-    let any_analyzed = config.images.values().any(|r| r.nsfw_score.is_some());
-    if !any_analyzed {
+    let any_scored = config.images.values().any(|r| r.nsfw_score.is_some());
+    let rules = LeadingRules::of(config);
+    if !any_scored && rules.mosaics.is_empty() {
         return;
     }
-    let threshold = nsfw_threshold(config);
-    ensure_category(config, EXPLICIT_CATEGORY);
+    if any_scored {
+        ensure_category(config, EXPLICIT_CATEGORY);
+        ensure_category(config, SUGGESTIVE_CATEGORY);
+    }
+    if !rules.mosaics.is_empty() {
+        ensure_category(config, mosaic::MOSAIC_CATEGORY);
+    }
 
-    for record in config.images.values_mut() {
+    for (hash, record) in config.images.iter_mut() {
+        // Read the score back from the labels once and keep it, rather than on every save: this runs
+        // at every checkpoint, and the K-pop and text rules after it ask again.
+        if record.suggestive_score.is_none() {
+            record.suggestive_score = suggestive_score(record);
+        }
         if record.classified_by.as_deref() == Some("manual") {
             continue;
         }
-        let Some(score) = record.nsfw_score else {
-            continue;
-        };
-        if score >= threshold {
-            if record.category.as_deref() != Some(EXPLICIT_CATEGORY) {
-                record.category = Some(EXPLICIT_CATEGORY.to_string());
-                record.classified_by = Some("auto-nsfw".to_string());
+        if let Some((category, classified_by)) = rules.verdict(hash, record) {
+            if record.category.as_deref() != Some(category) {
+                record.category = Some(category.to_string());
+                record.classified_by = Some(classified_by.to_string());
                 record.classified_at = Some(now_iso());
             }
-        } else if record.classified_by.as_deref() == Some("auto-nsfw") {
-            // Threshold was raised and image is now below it — release back to auto pipeline
+        } else if matches!(
+            record.classified_by.as_deref(),
+            Some(CLASSIFIED_BY_NSFW | CLASSIFIED_BY_SUGGESTIVE | mosaic::CLASSIFIED_BY_MOSAIC)
+        ) {
+            // A threshold was raised, or a re-describe no longer reads as a mosaic — release back to
+            // the auto pipeline.
             record.category = None;
             record.classified_by = None;
             record.classified_at = None;
@@ -4528,7 +4667,7 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunS
 
         let total = pending.len();
         let mut cancelled = false;
-        let mut results: Vec<(String, f32, Vec<String>)> = Vec::new();
+        let mut results: Vec<(String, f32, f32, Vec<String>)> = Vec::new();
         let started = std::time::Instant::now();
         let mut done = 0usize;
 
@@ -4542,9 +4681,9 @@ fn run_nsfw_analysis(app: &AppHandle, root_buf: &Path, force: bool, scope: &RunS
             // between-items check already answers a Stop faster than a user can notice, and the
             // `Session` would have to be moved in and out of a worker thread for every image.
             match analyze_image_nsfw(&mut session, Path::new(path)) {
-                Ok(stats) => results.push((hash.clone(), stats.score, stats.labels)),
+                Ok(stats) => results.push((hash.clone(), stats.score, stats.suggestive, stats.labels)),
                 Err(e) => {
-                    results.push((hash.clone(), 0.0, vec![format!("NSFW analysis error: {e}")]));
+                    results.push((hash.clone(), 0.0, 0.0, vec![format!("NSFW analysis error: {e}")]));
                     eprintln!("NSFW analysis failed for {path}: {e}");
                 }
             }
@@ -4621,6 +4760,18 @@ fn set_nsfw_threshold(root: String, threshold: f32) -> Result<LibraryView, Strin
     let _sidecar_lock = SidecarLock::acquire(&root_buf);
     let mut config = load_library_config(&root_buf);
     config.nsfw_score_threshold = Some(threshold.clamp(0.0, 1.0));
+    reclassify_nsfw_categories(&mut config);
+    reclassify_text_categories(&mut config);
+    save_library_config(&root_buf, &config)?;
+    scan_and_reconcile(&root_buf)
+}
+
+#[tauri::command]
+fn set_suggestive_threshold(root: String, threshold: f32) -> Result<LibraryView, String> {
+    let root_buf = root_path(&root)?;
+    let _sidecar_lock = SidecarLock::acquire(&root_buf);
+    let mut config = load_library_config(&root_buf);
+    config.suggestive_score_threshold = Some(threshold.clamp(0.0, 1.0));
     reclassify_nsfw_categories(&mut config);
     reclassify_text_categories(&mut config);
     save_library_config(&root_buf, &config)?;
@@ -5043,6 +5194,7 @@ fn library_view_from_records(root: &Path, config: &LibraryConfig) -> LibraryView
             ocr_text_chars: record.ocr_text_chars,
             nsfw_score: record.nsfw_score,
             nsfw_labels: record.nsfw_labels.clone(),
+            suggestive_score: suggestive_score(record),
             video_title: record.video_title.clone().filter(|title| !title.is_empty()),
             vision_desc_chars: record.vision_desc_chars,
         });
@@ -5068,6 +5220,7 @@ fn library_view_from_records(root: &Path, config: &LibraryConfig) -> LibraryView
         ocr_word_threshold,
         ocr_area_threshold,
         nsfw_score_threshold: nsfw_threshold(config),
+        suggestive_score_threshold: suggestive_threshold(config),
         source_folders,
         categories: Vec::new(),
         unclassified_count: 0,
@@ -7834,6 +7987,7 @@ mod pending_selection_tests {
             ocr_text_chars: None,
             nsfw_score: None,
             nsfw_labels: None,
+            suggestive_score: None,
             video_title: None,
             vision_desc_chars: None,
         }
@@ -7847,6 +8001,7 @@ mod pending_selection_tests {
             ocr_word_threshold: 20,
             ocr_area_threshold: 0.1,
             nsfw_score_threshold: DEFAULT_NSFW_THRESHOLD,
+            suggestive_score_threshold: DEFAULT_SUGGESTIVE_THRESHOLD,
             source_folders: folders
                 .iter()
                 .map(|name| SourceFolderView {
@@ -8226,6 +8381,59 @@ mod kpop_classification_tests {
         assert!(config.categories.iter().any(|name| name == "K-pop"));
     }
 
+    // Suggestive sits right under Explicit: it takes K-pop and High Text frames as Explicit does,
+    // yields to a hand sort and to Explicit, and reads scores stored before the field existed back
+    // out of the labels.
+    #[test]
+    fn suggestive_sits_between_explicit_and_kpop() {
+        let mv = Some("(1) aespa 'LEMONADE MV");
+        let mut config = LibraryConfig::default();
+        let mut covered = frame(0, true, mv);
+        covered.suggestive_score = Some(0.62);
+        config.images.insert("covered".into(), covered);
+        let mut high = frame(1, false, None);
+        high.suggestive_score = Some(0.7);
+        config.images.insert("high".into(), high);
+        let mut legacy = frame(2, true, None);
+        legacy.nsfw_labels = Some(vec!["top FACE_FEMALE 90%".into(), "top BUTTOCKS_COVERED 55%".into()]);
+        config.images.insert("legacy".into(), legacy);
+        let mut weak_explicit = frame(3, true, None);
+        weak_explicit.nsfw_score = Some(0.3);
+        config.images.insert("weak".into(), weak_explicit);
+        let mut both = frame(4, true, None);
+        both.nsfw_score = Some(0.99);
+        both.suggestive_score = Some(0.9);
+        config.images.insert("both".into(), both);
+        let mut manual = frame(5, true, None);
+        manual.suggestive_score = Some(0.9);
+        manual.category = Some("Previously pinned".into());
+        manual.classified_by = Some("manual".into());
+        config.images.insert("manual".into(), manual);
+        config.images.insert("kpop".into(), frame(6, true, mv));
+        config.suggestive_score_threshold = Some(0.3);
+
+        reclassify_nsfw_categories(&mut config);
+        reclassify_text_categories(&mut config);
+
+        let suggestive = (Some(SUGGESTIVE_CATEGORY.to_string()), Some(CLASSIFIED_BY_SUGGESTIVE.to_string()));
+        assert_eq!(category(&config, "covered"), suggestive, "over K-pop");
+        assert_eq!(category(&config, "high"), suggestive, "over High Text");
+        assert_eq!(category(&config, "legacy"), suggestive, "read back from the labels");
+        assert_eq!(category(&config, "weak"), suggestive, "an explicit score short of Explicit");
+        assert_eq!(category(&config, "both").0.as_deref(), Some(EXPLICIT_CATEGORY));
+        assert_eq!(category(&config, "manual").0.as_deref(), Some("Previously pinned"));
+        assert_eq!(category(&config, "kpop").0.as_deref(), Some("K-pop"));
+
+        // Raised past every score: each Suggestive image goes back to the text rules.
+        config.suggestive_score_threshold = Some(0.95);
+        reclassify_nsfw_categories(&mut config);
+        reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "covered").0.as_deref(), Some("K-pop"));
+        assert_eq!(category(&config, "high").0.as_deref(), Some(HIGH_TEXT_CATEGORY));
+        assert_eq!(category(&config, "legacy").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert!(config.categories.iter().any(|name| name == SUGGESTIVE_CATEGORY));
+    }
+
     #[test]
     fn untitled_frames_between_kpop_frames_are_filled_once() {
         let mv = Some("IVE 'XOXZ' MV");
@@ -8269,6 +8477,76 @@ mod kpop_classification_tests {
 
     fn cues(entries: &[(&str, &str)]) -> Arc<desc_cues::CueMap> {
         Arc::new(entries.iter().map(|(hash, text)| (hash.to_string(), desc_cues::parse(text))).collect())
+    }
+
+    // An app or web page with too few words for High Text is High Text anyway, and a picture of
+    // footage is not, whatever window it sits in.
+    #[test]
+    fn ui_screens_are_high_text_however_few_words() {
+        let mut config = LibraryConfig::default();
+        config.images.insert("chat".into(), frame(0, true, None));
+        config.images.insert("video".into(), frame(1, true, None));
+        config.images.insert("plain".into(), frame(2, true, None));
+        config.desc_cues = Some(cues(&[
+            ("chat", "This is a screenshot of the Grok Chat application interface. The main chat area is empty."),
+            ("video", "This is a screenshot of a web browser playing a driving video on a highway."),
+        ]));
+        reclassify_text_categories(&mut config);
+        assert_eq!(
+            category(&config, "chat"),
+            (Some(HIGH_TEXT_CATEGORY.into()), Some(ui_screen::CLASSIFIED_BY_UI.into()))
+        );
+        assert_eq!(category(&config, "video").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert_eq!(category(&config, "plain").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+    }
+
+    // Mosaic sits under Explicit and over Suggestive, K-pop and both text categories, and lets go
+    // when a re-describe no longer reads as one.
+    #[test]
+    fn mosaic_sits_under_explicit_and_over_the_rest() {
+        let grid = "This image is a 4x4 grid collage consisting of sixteen different images.";
+        let mv = Some("(1) aespa 'LEMONADE MV");
+        let mut config = LibraryConfig::default();
+        config.images.insert("low".into(), frame(0, true, None));
+        config.images.insert("high".into(), frame(1, false, None));
+        config.images.insert("kpop".into(), frame(2, true, mv));
+        let mut suggestive = frame(3, true, None);
+        suggestive.suggestive_score = Some(0.9);
+        config.images.insert("suggestive".into(), suggestive);
+        let mut explicit = frame(4, true, None);
+        explicit.nsfw_score = Some(0.99);
+        config.images.insert("explicit".into(), explicit);
+        let mut manual = frame(5, true, None);
+        manual.category = Some("Previously pinned".into());
+        manual.classified_by = Some("manual".into());
+        config.images.insert("manual".into(), manual);
+        config.images.insert("plain".into(), frame(6, true, None));
+        let hashes = ["low", "high", "kpop", "suggestive", "explicit", "manual"];
+        let mut entries: Vec<(&str, &str)> = hashes.iter().map(|hash| (*hash, grid)).collect();
+        entries.push(("plain", "This is a screenshot of a YouTube video featuring two distinct scenes."));
+        config.desc_cues = Some(cues(&entries));
+
+        reclassify_nsfw_categories(&mut config);
+        reclassify_text_categories(&mut config);
+
+        let mosaic = (Some(mosaic::MOSAIC_CATEGORY.to_string()), Some(mosaic::CLASSIFIED_BY_MOSAIC.to_string()));
+        for hash in ["low", "high", "kpop", "suggestive"] {
+            assert_eq!(category(&config, hash), mosaic, "{hash}");
+        }
+        assert_eq!(category(&config, "explicit").0.as_deref(), Some(EXPLICIT_CATEGORY));
+        assert_eq!(category(&config, "manual").0.as_deref(), Some("Previously pinned"));
+        assert_eq!(category(&config, "plain").0.as_deref(), Some(LOW_TEXT_CATEGORY), "two scenes is not a mosaic");
+        assert!(config.categories.iter().any(|name| name == mosaic::MOSAIC_CATEGORY));
+
+        // Re-described as a single picture: each one goes back to what the other rules say.
+        let single = "This is a video still from a music video featuring four women dancing.";
+        config.desc_cues = Some(cues(&hashes.iter().map(|hash| (*hash, single)).collect::<Vec<_>>()));
+        reclassify_nsfw_categories(&mut config);
+        reclassify_text_categories(&mut config);
+        assert_eq!(category(&config, "low").0.as_deref(), Some(LOW_TEXT_CATEGORY));
+        assert_eq!(category(&config, "high").0.as_deref(), Some(HIGH_TEXT_CATEGORY));
+        assert_eq!(category(&config, "kpop").0.as_deref(), Some("K-pop"));
+        assert_eq!(category(&config, "suggestive").0.as_deref(), Some(SUGGESTIVE_CATEGORY));
     }
 
     #[test]
@@ -8404,8 +8682,8 @@ mod kpop_classification_tests {
 
         // What each reason newly took, with the readings behind it — the list to read for false
         // positives before trusting a rule change.
-        let (nsfw_min, (words, area)) = (nsfw_threshold(&config), ocr_thresholds(&config));
-        let reasons = kpop_frames(&config, nsfw_min, words, area);
+        let (leading, (words, area)) = (LeadingRules::of(&config), ocr_thresholds(&config));
+        let reasons = kpop_frames(&config, &leading, words, area);
         let cues = kpop_cues(&config);
         let mut joined: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         for (hash, record) in &config.images {
@@ -9405,6 +9683,7 @@ pub fn run() {
             set_category_analysis_included,
             set_geo_override,
             set_nsfw_threshold,
+            set_suggestive_threshold,
             set_source_pattern,
             set_text_index_folder_included,
             set_text_thresholds,

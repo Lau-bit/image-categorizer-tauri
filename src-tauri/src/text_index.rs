@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 pub const TEXT_INDEX_FILE_NAME: &str = ".image-categorizer-text-index.json";
 pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 1;
 
-/// The category the index covers unless the library config names others.
+/// The category the index covers unless the library config names others. `indexed_categories` in
+/// lib.rs adds Mosaic beside it, which takes images that would otherwise be High Text.
 pub const DEFAULT_TEXT_CATEGORY: &str = "High Text";
 
 /// Default bucket width. Two calendar days, so a session that crosses midnight stays one item.

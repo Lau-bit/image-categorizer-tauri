@@ -29,7 +29,8 @@ pub const CUES_FILE_NAME: &str = ".image-categorizer-desc-cues.json";
 
 /// Bump when [`parse`] changes what it extracts: every stored entry is then discarded and re-read,
 /// because two parsers' output in one file would be indistinguishable afterwards.
-const CUES_VERSION: u32 = 1;
+/// 2: "No title-bar text present." and "Content type: …" are no title (`not_a_title`).
+const CUES_VERSION: u32 = 2;
 
 /// How much of the description proper is kept. The K-pop rule reads only the opening ("This is a
 /// video still from a music video featuring…"); further down the model lists thumbnails and
@@ -90,6 +91,22 @@ fn sentence_like() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^(?:A|An|The|This)\s+[a-z][^\n]*\.$").expect("sentence regex"))
 }
 
+/// The model saying there is no title, or labelling the picture instead of quoting one: "No
+/// title-bar text present.", "No title bar text is present in the image.", "Content type: video
+/// still". 106 descriptions in the live library open like this (2026-10-28). Taken as a title, it
+/// counts as evidence the session moved on from a K-pop run — and a frame hand-sorted into K-pop
+/// taught it to the learned-titles list, which then pulled in 45 unrelated frames described the
+/// same way.
+fn not_a_title() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:no\s+(?:visible\s+)?(?:title|window|tab)|there\s+(?:is|are)\s+no\s+(?:visible\s+)?(?:title|window|tab)|content(?:\s+type)?\s*[:：])",
+        )
+        .expect("not-a-title regex")
+    })
+}
+
 fn title_label() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -124,6 +141,7 @@ pub fn parse(description: &str) -> Cue {
     // A bare address bar says nothing about what the video is; as a "title" it would count as
     // evidence that the session had moved on from a K-pop run.
     let title = if title.starts_with("http") && !title.contains(' ') { String::new() } else { title };
+    let title = if not_a_title().is_match(&title) { String::new() } else { title };
     let tab_strip = !title.is_empty() && is_tab_strip(&title);
 
     let body: Vec<&str> = lines[body_from.min(lines.len())..]
@@ -400,6 +418,22 @@ mod tests {
         let located = parse("Location: Espoo\n\nThis is a screenshot of a desktop.");
         assert!(located.title.is_empty());
         assert_eq!(located.lead, "This is a screenshot of a desktop.");
+    }
+
+    #[test]
+    fn saying_there_is_no_title_is_not_a_title() {
+        for text in [
+            "No title-bar text present.\n\nThis is a video still of five women dancing.",
+            "No title bar text is present in the image.\n\nThis is a video still of five women dancing.",
+            "Title-bar text: No title bar text present.\n\nThis is a video still of five women dancing.",
+            "Content type: video still\n\nThis is a video still of five women dancing.",
+        ] {
+            let cue = parse(text);
+            assert!(cue.title.is_empty(), "{text}");
+            assert_eq!(cue.lead, "This is a video still of five women dancing.", "{text}");
+        }
+        // A real title that merely starts with "No" is still a title.
+        assert_eq!(parse("\"NO DOUBT - YouTube\"\n\nThis is a video still.").title, "NO DOUBT - YouTube");
     }
 
     #[test]

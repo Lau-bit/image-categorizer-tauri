@@ -187,7 +187,7 @@
                 <input type="checkbox" id="analyze-text-check" checked>
                 <span>Text</span>
               </label>
-              <label class="analysis-type-check" id="analyze-nsfw-check-label" title="Run NudeNet explicit content detection, classifying images as Safe / Explicit">
+              <label class="analysis-type-check" id="analyze-nsfw-check-label" title="Run NudeNet explicit content detection, classifying images as Safe / Suggestive / Explicit">
                 <input type="checkbox" id="analyze-nsfw-check" checked>
                 <span>Explicit</span>
               </label>
@@ -836,12 +836,22 @@
           <span class="settings-label">Explicit Analysis Threshold</span>
           <p class="dialog-hint">
             Images whose max explicit-content confidence score meets or exceeds this value are
-            classified "Explicit"; all others become "Safe". Lower = more sensitive.
+            classified "Explicit"; the rest go on to the Suggestive threshold below. Lower = more sensitive.
             Re-classify without re-running by moving the slider — no inference needed.
           </p>
           <div class="range-row">
             <input id="nsfw-threshold-input" type="range" min="15" max="90" step="5">
             <span id="nsfw-threshold-value"></span>
+          </div>
+          <span class="settings-label">Suggestive Threshold</span>
+          <p class="dialog-hint">
+            Explicit but milder. An image short of Explicit is classified "Suggestive" when NudeNet's
+            score for a covered breast, buttocks or groin (lingerie, swimwear, a tight outfit) — or its
+            explicit score — meets this value. Same scan as Explicit; moving the slider re-classifies.
+          </p>
+          <div class="range-row">
+            <input id="suggestive-threshold-input" type="range" min="15" max="90" step="5">
+            <span id="suggestive-threshold-value"></span>
           </div>
           <div class="model-row">
             <p class="dialog-hint" id="nsfw-model-hint"></p>

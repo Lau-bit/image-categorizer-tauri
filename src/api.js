@@ -118,6 +118,7 @@ window.categorizerAPI = {
   analyzeNsfw: (root, force, scope = null) => invoke('analyze_nsfw', { root, force, scope }),
   cancelNsfwAnalysis: () => invoke('cancel_nsfw_analysis'),
   setNsfwThreshold: (root, threshold) => invoke('set_nsfw_threshold', { root, threshold }),
+  setSuggestiveThreshold: (root, threshold) => invoke('set_suggestive_threshold', { root, threshold }),
   getNsfwModelInfo: () => invoke('get_nsfw_model_info'),
   downloadNsfwModel: () => invoke('download_nsfw_model'),
   onNsfwAnalysisProgress: callback => event.listen('nsfw-analysis-progress', message => callback(message.payload)),

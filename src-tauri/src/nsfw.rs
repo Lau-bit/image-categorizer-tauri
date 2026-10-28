@@ -33,9 +33,35 @@ pub const CLASS_NAMES: &[&str] = &[
 // Indices treated as sexually explicit content
 const EXPLICIT_INDICES: &[usize] = &[2, 3, 4, 5, 6, 14];
 
+// Indices treated as suggestive: the same intimate areas, covered — lingerie, swimwear, a tight
+// outfit. Not belly, armpits or feet, covered or not: those fire on any beach photo.
+const SUGGESTIVE_INDICES: &[usize] = &[0, 15, 16, 17];
+
 pub struct NsfwStats {
     pub score: f32,
+    /// Max over `SUGGESTIVE_INDICES`. The explicit `score` is kept apart: the Suggestive rule
+    /// reads both, at its own threshold.
+    pub suggestive: f32,
     pub labels: Vec<String>,
+}
+
+/// The suggestive score recovered from a record's stored labels, for images scored before the
+/// score itself was stored. Labels name the top six classes at whole percents, so a covered class
+/// that is missing ranked below six others — read as 0, which only matters if six classes beat a
+/// threshold it would have met.
+pub fn suggestive_from_labels(labels: &[String]) -> f32 {
+    labels
+        .iter()
+        .filter_map(|label| {
+            let rest = label.strip_prefix("top ").or_else(|| label.strip_prefix("suggestive "))?;
+            let (class, pct) = rest.rsplit_once(' ')?;
+            let index = CLASS_NAMES.iter().position(|name| *name == class)?;
+            if !SUGGESTIVE_INDICES.contains(&index) {
+                return None;
+            }
+            pct.strip_suffix('%')?.parse::<f32>().ok().map(|pct| pct / 100.0)
+        })
+        .fold(0.0f32, f32::max)
 }
 
 pub fn create_session(model_path: &Path) -> Result<Session, String> {
@@ -91,6 +117,10 @@ pub fn analyze_image_nsfw(session: &mut Session, path: &Path) -> Result<NsfwStat
         .iter()
         .map(|&i| per_class_max[i])
         .fold(0.0f32, f32::max);
+    let suggestive = SUGGESTIVE_INDICES
+        .iter()
+        .map(|&i| per_class_max[i])
+        .fold(0.0f32, f32::max);
 
     let mut top_classes: Vec<(usize, f32)> = per_class_max
         .iter()
@@ -105,6 +135,12 @@ pub fn analyze_image_nsfw(session: &mut Session, path: &Path) -> Result<NsfwStat
         .map(|&i| format!("explicit {} {:.0}%", CLASS_NAMES[i], per_class_max[i] * 100.0))
         .collect();
     labels.extend(
+        SUGGESTIVE_INDICES
+            .iter()
+            .filter(|&&i| per_class_max[i] >= DETECTION_MIN_CONFIDENCE)
+            .map(|&i| format!("suggestive {} {:.0}%", CLASS_NAMES[i], per_class_max[i] * 100.0)),
+    );
+    labels.extend(
         top_classes
             .into_iter()
             .take(6)
@@ -115,7 +151,7 @@ pub fn analyze_image_nsfw(session: &mut Session, path: &Path) -> Result<NsfwStat
         labels.push("No NudeNet class reached 1% confidence.".to_string());
     }
 
-    Ok(NsfwStats { score, labels })
+    Ok(NsfwStats { score, suggestive, labels })
 }
 
 fn letterbox_to_tensor(img: &RgbImage) -> Array4<f32> {
@@ -140,4 +176,26 @@ fn letterbox_to_tensor(img: &RgbImage) -> Array4<f32> {
         }
     }
     tensor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestive_is_read_back_from_covered_classes_only() {
+        let labels: Vec<String> = [
+            "explicit BUTTOCKS_EXPOSED 31%",
+            "top FACE_FEMALE 88%",
+            "top FEMALE_BREAST_COVERED 62%",
+            "top BELLY_COVERED 70%",
+            "top BUTTOCKS_COVERED 40%",
+        ]
+        .iter()
+        .map(|label| label.to_string())
+        .collect();
+        assert!((suggestive_from_labels(&labels) - 0.62).abs() < 1e-6);
+        assert_eq!(suggestive_from_labels(&["No NudeNet class reached 1% confidence.".to_string()]), 0.0);
+        assert_eq!(suggestive_from_labels(&["NSFW analysis error: Cannot open image".to_string()]), 0.0);
+    }
 }
